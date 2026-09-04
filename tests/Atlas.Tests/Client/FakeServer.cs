@@ -149,14 +149,14 @@ internal sealed class TcpTestTransport : ITransport
         }
     }
 
-    public ValueTask<(Header Header, byte[] Body)> ReadFrameAsync(CancellationToken token)
+    public ValueTask<(Header Header, byte[] Body)> ReadFrameAsync(int maxBodySize, CancellationToken token)
     {
-        return FrameIO.ReadFrameAsync(_stream, FrameConst.MaxBodySize, token);
+        return FrameIO.ReadFrameAsync(_stream, maxBodySize, token);
     }
 
-    public Task WriteFrameAsync(Header header, byte[] body, CancellationToken token)
+    public Task WriteFrameAsync(Header header, byte[] body, int maxBodySize, CancellationToken token)
     {
-        return FrameIO.WriteFrameAsync(_stream, header, body, FrameConst.MaxBodySize, token).AsTask();
+        return FrameIO.WriteFrameAsync(_stream, header, body, maxBodySize, token).AsTask();
     }
 
     public Task CloseAsync()

@@ -62,7 +62,11 @@ public sealed partial class Channel
                 Version = (byte)_options.Serializer.Version,
                 Seq = request.Key.Sequence,
             };
-            await request.Transport.WriteFrameAsync(header, body, cancellationToken);
+            await request.Transport.WriteFrameAsync(
+                header,
+                body,
+                _options.MaxBodySize,
+                cancellationToken);
         }
         catch (ProtocolException)
         {
@@ -94,12 +98,24 @@ public sealed partial class Channel
             return await request.Inflight.Completion.Task;
         }
 
-        RemoveInflight(request.Key, request.Inflight);
+        // 只有成功删除 key 的路径才拥有超时/取消结果；若响应或断连已先认领，
+        // 必须等待同一个 Completion，避免「key 已删但 TCS 尚未置位」时误报超时。
+        if (!RemoveInflight(request.Key, request.Inflight))
+        {
+            return await request.Inflight.Completion.Task;
+        }
+
         if (cancellationToken.IsCancellationRequested)
         {
-            throw new NetworkException("调用已取消", new OperationCanceledException(cancellationToken));
+            request.Inflight.Completion.TrySetException(
+                new NetworkException("调用已取消", new OperationCanceledException(cancellationToken)));
         }
-        throw new AtlasTimeoutException($"调用 {request.Key.Sequence} 超时（{_options.InvokeTimeoutMs}ms）");
+        else
+        {
+            request.Inflight.Completion.TrySetException(
+                new AtlasTimeoutException($"调用 {request.Key.Sequence} 超时（{_options.InvokeTimeoutMs}ms）"));
+        }
+        return await request.Inflight.Completion.Task;
     }
 
     private static byte[] ToPayload(ReplyData reply)
@@ -122,8 +138,10 @@ public sealed partial class Channel
         {
             while (!_closed.IsCancellationRequested)
             {
-                var (header, body) = await transport.ReadFrameAsync(_closed.Token);
-                DispatchFrame(epoch, header, body);
+                var (header, body) = await transport.ReadFrameAsync(
+                    _options.MaxBodySize,
+                    _closed.Token);
+                await DispatchFrameAsync(epoch, header, body);
             }
             cause = new NetworkException("通道已关闭");
         }
@@ -140,7 +158,7 @@ public sealed partial class Channel
         await CloseTransportAsync(transport);
     }
 
-    private void DispatchFrame(uint epoch, Header header, byte[] body)
+    private async Task DispatchFrameAsync(uint epoch, Header header, byte[] body)
     {
         if (header.Type == MsgType.Notify)
         {
@@ -157,15 +175,29 @@ public sealed partial class Channel
 
         var reply = Reply.DecodeReply(body);
         var key = new InflightKey(epoch, header.Seq);
-        Inflight? inflight = null;
+        var inflight = TakeInflight(key);
+        if (inflight == null)
+        {
+            return;
+        }
+        if (BeforeInflightCompletion != null)
+        {
+            await BeforeInflightCompletion();
+        }
+        inflight.Completion.TrySetResult(reply);
+    }
+
+    private Inflight? TakeInflight(InflightKey key)
+    {
         lock (_gate)
         {
-            if (_inflight.TryGetValue(key, out inflight))
+            if (!_inflight.TryGetValue(key, out var inflight))
             {
-                _inflight.Remove(key);
+                return null;
             }
+            _inflight.Remove(key);
+            return inflight;
         }
-        inflight?.Completion.TrySetResult(reply);
     }
 
     private void FailGeneration(uint epoch, Exception cause)
@@ -210,14 +242,16 @@ public sealed partial class Channel
         }
     }
 
-    private void RemoveInflight(InflightKey key, Inflight inflight)
+    private bool RemoveInflight(InflightKey key, Inflight inflight)
     {
         lock (_gate)
         {
             if (_inflight.TryGetValue(key, out var current) && ReferenceEquals(current, inflight))
             {
                 _inflight.Remove(key);
+                return true;
             }
+            return false;
         }
     }
 

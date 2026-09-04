@@ -26,6 +26,12 @@ public sealed partial class Channel : IAsyncDisposable
     private int _state = (int)ClientState.Disconnected;
     private bool _isClosed;
 
+    // 仅供 Atlas.Tests 构造确定性并发窗口，不对 SDK 使用方公开。
+    internal Func<Task>? BeforeInflightCompletion { get; set; }
+
+    // 仅供 Atlas.Tests 验证 Connect/Close 串行化。
+    internal Func<Task>? AfterTransportInstalled { get; set; }
+
     public Channel(Func<CancellationToken, Task<ITransport>> dial, ChannelOptions options)
     {
         _dial = dial ?? throw new ArgumentNullException(nameof(dial));
@@ -54,6 +60,10 @@ public sealed partial class Channel : IAsyncDisposable
                 ThrowIfClosed();
             }
 
+            if (AfterTransportInstalled != null)
+            {
+                await AfterTransportInstalled();
+            }
             SetState(ClientState.Connected);
             _readLoop = Task.Run(() => ReadLoopAsync(transport, epoch));
         }
@@ -65,16 +75,26 @@ public sealed partial class Channel : IAsyncDisposable
 
     public async Task CloseAsync()
     {
-        var (transport, readLoop) = BeginClose();
-        _closed.Cancel();
-        FailAllInflight(new NetworkException("通道已关闭"));
-        if (transport != null)
+        await _connectLock.WaitAsync();
+        (ITransport? transport, Task? readLoop) closing;
+        try
         {
-            await CloseTransportAsync(transport);
+            closing = BeginClose();
+            _closed.Cancel();
         }
-        if (readLoop != null)
+        finally
         {
-            await IgnoreReadLoopAsync(readLoop);
+            _connectLock.Release();
+        }
+
+        FailAllInflight(new NetworkException("通道已关闭"));
+        if (closing.transport != null)
+        {
+            await CloseTransportAsync(closing.transport);
+        }
+        if (closing.readLoop != null)
+        {
+            await IgnoreReadLoopAsync(closing.readLoop);
         }
     }
 
