@@ -2,7 +2,6 @@ using System;
 using System.Threading;
 using System.Threading.Tasks;
 using Atlas.Errors;
-using Atlas.Transport;
 
 namespace Atlas.Client;
 
@@ -13,16 +12,13 @@ public sealed partial class Channel
     public const string HeartbeatOperation = "/atlas.internal.Heartbeat/Ping";
 
     // 心跳周期循环：按 HeartbeatIntervalMs 周期发 Ping（failFast 直通路径）。
-    // 连续失败 HeartbeatFailures 次判定死链：关闭当前代连接触发 readLoop 退出
-    //（M4 接重连；M2-4 关闭连接即由 readLoop 收尾结算 in-flight 与状态）。
+    // 绑定代（epoch）：代 token 被取消（换代/关闭）即退出——旧代心跳不会继续在
+    // 新连接上运行（M4 评审 P1：旧代心跳不得误杀新代连接）。
+    // 连续失败 HeartbeatFailures 次判定死链：关闭本代连接触发读循环退出与重连。
     // 业务拒绝不计死链——往返完成即链路存活（对标 Go heartbeatLoop：
     // BusinessError 失败计数归零，仅网络类失败计死链）。
-    private async Task HeartbeatLoopAsync(CancellationToken token)
+    private async Task HeartbeatLoopAsync(uint epoch, CancellationToken token)
     {
-        if (_options.HeartbeatIntervalMs <= 0)
-        {
-            return; // 非正周期 = 关闭传输心跳。
-        }
         var failures = 0;
         while (!token.IsCancellationRequested)
         {
@@ -56,26 +52,12 @@ public sealed partial class Channel
                 failures++;
                 if (failures >= _options.HeartbeatFailures)
                 {
-                    // 死链：关闭当前代连接。readLoop 的 ReadFrameAsync 随之抛出并
-                    // 退出，由 FailGeneration 结算 in-flight 与状态（对标 Go g.tr.Close()）。
-                    await CloseCurrentTransportAsync();
+                    // 死链：关闭本代连接（换代已发生则跳过，不误杀新连接）。
+                    // readLoop 的 ReadFrameAsync 随之退出，驱动自动重连。
+                    await CloseGenerationTransportAsync(epoch);
                     return;
                 }
             }
-        }
-    }
-
-    // CloseCurrentTransportAsync 关闭当前代连接（死链触发 readLoop 收尾）。
-    private async Task CloseCurrentTransportAsync()
-    {
-        ITransport? transport;
-        lock (_gate)
-        {
-            transport = _transport;
-        }
-        if (transport != null)
-        {
-            await CloseTransportAsync(transport);
         }
     }
 }

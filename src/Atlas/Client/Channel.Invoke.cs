@@ -12,7 +12,60 @@ namespace Atlas.Client;
 public sealed partial class Channel
 {
     // InvokeRawAsync 发送原始 payload；payload 为 null 时只发送 operation，用于 Ping 等空请求。
-    public async Task<byte[]> InvokeRawAsync(string operation, byte[]? payload, CancellationToken cancellationToken)
+    // 重连期间（State=Reconnecting）默认排队等待重连成功后重发；可用 InvokeRawFailFastAsync
+    // 跳过排队立即失败（如心跳的 failFast 直通路径）。
+    public Task<byte[]> InvokeRawAsync(string operation, byte[]? payload, CancellationToken cancellationToken)
+    {
+        return InvokeRawCoreAsync(operation, payload, cancellationToken, failFast: false);
+    }
+
+    // InvokeRawFailFastAsync 重连期间不排队、立即失败（对齐 Go WithFailFast）。
+    internal Task<byte[]> InvokeRawFailFastAsync(string operation, byte[]? payload, CancellationToken cancellationToken)
+    {
+        return InvokeRawCoreAsync(operation, payload, cancellationToken, failFast: true);
+    }
+
+    private async Task<byte[]> InvokeRawCoreAsync(
+        string operation,
+        byte[]? payload,
+        CancellationToken cancellationToken,
+        bool failFast)
+    {
+        // 排队判定与入队在 _gate 临界区原子完成：drain 与入队互斥，
+        // 不存在「drain 空队列后请求才入队」的永久遗留窗口（对齐 Go B4 修复）。
+        QueuedInvoke? queued = null;
+        lock (_gate)
+        {
+            if (_isClosed)
+            {
+                throw new NetworkException("通道已关闭");
+            }
+            var reconnecting = State == ClientState.Reconnecting;
+            if (reconnecting && !failFast)
+            {
+                if (_queue.Count >= _options.QueueSize)
+                {
+                    throw new NetworkException($"重连排队已满（{_options.QueueSize}）");
+                }
+                queued = new QueuedInvoke(
+                    operation,
+                    payload,
+                    new TaskCompletionSource<byte[]>(
+                        TaskCreationOptions.RunContinuationsAsynchronously));
+                _queue.Enqueue(queued);
+            }
+        }
+        if (queued != null)
+        {
+            return await queued.Completion.Task;
+        }
+        return await InvokeOnceAsync(operation, payload, cancellationToken);
+    }
+
+    private async Task<byte[]> InvokeOnceAsync(
+        string operation,
+        byte[]? payload,
+        CancellationToken cancellationToken)
     {
         var body = Body.BuildRequestBody(operation, payload);
         var request = RegisterInflight();
@@ -155,7 +208,34 @@ public sealed partial class Channel
         }
 
         FailGeneration(epoch, cause);
+
+        // M4：网络错误退出（非协议致命、非主动关闭）驱动自动重连。
+        // 协议级致命错误（ProtocolException：版本不匹配/帧非法）直接终止、不重连
+        //（对标 Go：不可重试、连接已断；ChannelTest.ResponseVersionMismatch 依赖此语义）。
+        //
+        // 置 Reconnecting 与判定同临界区、在 FailGeneration 结算后立即完成（其间无
+        // await 间隙）：踢线后 in-flight 被结算（kick Invoke 返回 NetworkException），
+        // 若此刻状态仍是 Disconnected 且到置 Reconnecting 前有异步间隙（关闭旧连接等），
+        // 紧接发出的 Invoke 会看到 Disconnected 而不排队、直接打向已断连接。提前到锁内
+        // 置位消除该窗口——对标 Go supervisor：<-g.done 后立即置 StateReconnecting 再重连。
+        var shouldReconnect = false;
+        lock (_gate)
+        {
+            shouldReconnect = !_isClosed
+                && _options.AutoReconnect
+                && cause is not ProtocolException
+                && !_reconnecting;
+            if (shouldReconnect)
+            {
+                _reconnecting = true;
+                SetState(ClientState.Reconnecting);
+            }
+        }
         await CloseTransportAsync(transport);
+        if (shouldReconnect)
+        {
+            await RunReconnectLoopAsync();
+        }
     }
 
     private async Task DispatchFrameAsync(uint epoch, Header header, byte[] body)

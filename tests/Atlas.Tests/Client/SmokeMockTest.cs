@@ -210,43 +210,43 @@ internal sealed class MockGatewayServer : IAsyncDisposable
                 await WriteReplyAsync(stream, header.Seq, Array.Empty<byte>(), _stop.Token);
                 return;
             case opRegister:
-            {
-                var req = (RegisterRequest)_serializer.Deserialize(payload, typeof(RegisterRequest));
-                Assert.False(string.IsNullOrEmpty(req.Account), "注册请求缺 account");
-                await WriteReplyAsync(stream, header.Seq, _serializer.Serialize(new RegisterReply { PlayerId = req.Account }), _stop.Token);
-                return;
-            }
+                {
+                    var req = (RegisterRequest)_serializer.Deserialize(payload, typeof(RegisterRequest));
+                    Assert.False(string.IsNullOrEmpty(req.Account), "注册请求缺 account");
+                    await WriteReplyAsync(stream, header.Seq, _serializer.Serialize(new RegisterReply { PlayerId = req.Account }), _stop.Token);
+                    return;
+                }
             case opLogin:
-            {
-                var req = (LoginRequest)_serializer.Deserialize(payload, typeof(LoginRequest));
-                Assert.False(string.IsNullOrEmpty(req.PlayerId), "登录请求缺 player_id");
-                await WriteReplyAsync(
-                    stream,
-                    header.Seq,
-                    _serializer.Serialize(new LoginReply
-                    {
-                        Token = "tok-" + req.PlayerId,
-                        PlayerId = req.PlayerId,
-                        ServerTimeUnixMs = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds(),
-                    }),
-                    _stop.Token);
-                return;
-            }
+                {
+                    var req = (LoginRequest)_serializer.Deserialize(payload, typeof(LoginRequest));
+                    Assert.False(string.IsNullOrEmpty(req.PlayerId), "登录请求缺 player_id");
+                    await WriteReplyAsync(
+                        stream,
+                        header.Seq,
+                        _serializer.Serialize(new LoginReply
+                        {
+                            Token = "tok-" + req.PlayerId,
+                            PlayerId = req.PlayerId,
+                            ServerTimeUnixMs = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds(),
+                        }),
+                        _stop.Token);
+                    return;
+                }
             case opHeartbeat:
-            {
-                var req = (HeartbeatRequest)_serializer.Deserialize(payload, typeof(HeartbeatRequest));
-                Assert.False(string.IsNullOrEmpty(req.Token), "业务心跳缺 token");
-                await WriteReplyAsync(
-                    stream,
-                    header.Seq,
-                    _serializer.Serialize(new HeartbeatReply
-                    {
-                        Ts = req.Ts,
-                        ServerTimeUnixMs = (ulong)DateTimeOffset.UtcNow.ToUnixTimeMilliseconds(),
-                    }),
-                    _stop.Token);
-                return;
-            }
+                {
+                    var req = (HeartbeatRequest)_serializer.Deserialize(payload, typeof(HeartbeatRequest));
+                    Assert.False(string.IsNullOrEmpty(req.Token), "业务心跳缺 token");
+                    await WriteReplyAsync(
+                        stream,
+                        header.Seq,
+                        _serializer.Serialize(new HeartbeatReply
+                        {
+                            Ts = req.Ts,
+                            ServerTimeUnixMs = (ulong)DateTimeOffset.UtcNow.ToUnixTimeMilliseconds(),
+                        }),
+                        _stop.Token);
+                    return;
+                }
             default:
                 throw new ProtocolException($"mock 网关不支持 operation: {operation}");
         }

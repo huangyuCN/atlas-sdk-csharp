@@ -46,13 +46,13 @@ public static class ChannelDial
                     options);
                 break;
             case "ws":
-            {
-                var url = WsTransport.NormalizeUrl(host + ":" + port, wsPath);
-                channel = new Channel(
-                    token => WsTransport.ConnectAsync(url, token),
-                    options);
-                break;
-            }
+                {
+                    var url = WsTransport.NormalizeUrl(host + ":" + port, wsPath);
+                    channel = new Channel(
+                        token => WsTransport.ConnectAsync(url, token),
+                        options);
+                    break;
+                }
             case "kcp":
                 channel = new Channel(
                     token => KcpTransport.ConnectAsync(host, port, token),

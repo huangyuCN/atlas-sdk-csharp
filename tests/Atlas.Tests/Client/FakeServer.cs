@@ -22,11 +22,12 @@ internal sealed class FakeServer : IAsyncDisposable
     private readonly object _pushGate = new();
     private Stream? _stream;
     private Task? _serveTask;
+    private int _accepted;
 
     public FakeServer()
     {
         _listener.Start();
-        _serveTask = AcceptAsync();
+        _serveTask = AcceptLoopAsync();
     }
 
     public int Port => ((IPEndPoint)_listener.LocalEndpoint).Port;
@@ -35,6 +36,18 @@ internal sealed class FakeServer : IAsyncDisposable
 
     // OperationNames 返回服务端收到的全部 operation（按到达顺序）。
     public string[] OperationNames => _operations.ToArray();
+
+    // AcceptedConnections 返回服务端接受的连接总数（重连观测用）。
+    public int AcceptedConnections
+    {
+        get
+        {
+            lock (_pushGate)
+            {
+                return _accepted;
+            }
+        }
+    }
 
     public int PingCount
     {
@@ -96,12 +109,40 @@ internal sealed class FakeServer : IAsyncDisposable
         _stop.Dispose();
     }
 
-    private async Task AcceptAsync()
+    // AcceptLoopAsync 循环 accept：每次新连接独立 Serve（重连客户端重拨后仍能接入）。
+    private async Task AcceptLoopAsync()
+    {
+        while (!_stop.IsCancellationRequested)
+        {
+            TcpClient client;
+            try
+            {
+                client = await _listener.AcceptTcpClientAsync(_stop.Token);
+            }
+            catch (OperationCanceledException) when (_stop.IsCancellationRequested)
+            {
+                return;
+            }
+            catch (ObjectDisposedException) when (_stop.IsCancellationRequested)
+            {
+                return;
+            }
+            lock (_pushGate)
+            {
+                _accepted++;
+            }
+            _ = ServeOneAsync(client);
+        }
+    }
+
+    private async Task ServeOneAsync(TcpClient client)
     {
         try
         {
-            using var client = await _listener.AcceptTcpClientAsync(_stop.Token);
-            await ServeAsync(client.GetStream());
+            using (client)
+            {
+                await ServeAsync(client.GetStream());
+            }
         }
         catch (OperationCanceledException) when (_stop.IsCancellationRequested)
         {
@@ -109,7 +150,11 @@ internal sealed class FakeServer : IAsyncDisposable
         catch (ObjectDisposedException) when (_stop.IsCancellationRequested)
         {
         }
+        catch (IOException)
+        {
+        }
     }
+
 
     private async Task ServeAsync(Stream stream)
     {

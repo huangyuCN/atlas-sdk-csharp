@@ -9,7 +9,11 @@ using AtlasTimeoutException = Atlas.Errors.TimeoutException;
 
 namespace Atlas.Client;
 
-// Channel 管理一条传输连接的请求-响应匹配；M4 在此基础上增加重连与排队。
+// Channel 管理一条传输连接的请求-响应匹配、心跳与自动重连（M4）。
+// 生命周期：ConnectAsync 建立首连并启动读循环/心跳；读循环因网络错误退出后
+// （非协议致命、非主动关闭）进入指数退避自动重连；重连期间 Invoke 排队，
+// 重连成功后按序重发（FIFO）。协议级致命错误（版本不匹配/帧非法）直接终止，
+// 不重连（对标 Go：ProtocolError 不可重试、连接已断）。
 public sealed partial class Channel : IAsyncDisposable
 {
     private readonly Func<CancellationToken, Task<ITransport>> _dial;
@@ -18,16 +22,23 @@ public sealed partial class Channel : IAsyncDisposable
     private readonly SemaphoreSlim _connectLock = new(1, 1);
     private readonly SemaphoreSlim _writeLock = new(1, 1);
     private readonly Dictionary<InflightKey, Inflight> _inflight = new();
-    private readonly CancellationTokenSource _closed = new();
     private readonly object _notifyGate = new();
     private readonly Dictionary<string, List<NotifyEntry>> _notifies = new();
-    private Task? _heartbeatTask;
+    private readonly CancellationTokenSource _closed = new();
+    private readonly Queue<QueuedInvoke> _queue = new();
+
+    // 当前代（epoch）的取消源：换代时 Cancel 旧代以停止该代心跳；新建下一代的
+    // 源。读循环不依赖此源（连接读错误自然退出），心跳依赖它以随代退出
+    // （M4 评审 P1：旧代心跳不得继续在新连接上运行/误杀新连接）。
+    private CancellationTokenSource _generationCts = new();
     private ITransport? _transport;
     private Task? _readLoop;
+    private Task? _heartbeatTask;
     private uint _epoch;
     private uint _sequence;
     private int _state = (int)ClientState.Disconnected;
     private bool _isClosed;
+    private bool _reconnecting;
 
     // 仅供 Atlas.Tests 构造确定性并发窗口，不对 SDK 使用方公开。
     internal Func<Task>? BeforeInflightCompletion { get; set; }
@@ -47,6 +58,7 @@ public sealed partial class Channel : IAsyncDisposable
     // On 订阅本通道的 Notify 帧（按 operation 分发），返回退订句柄。
     // 幂等语义：同一 (op, handler)（delegate 引用相等）重复注册只保留一份，
     // 重复退订安全。handler 在线程池执行、异常隔离，不影响其他分发（对标 Go on）。
+    // 订阅挂在 Channel 层（不随连接代际丢失），重连成功后新连接天然继续收到推送。
     public NotifySubscription On(string op, NotifyHandler handler)
     {
         if (handler == null)
@@ -110,12 +122,10 @@ public sealed partial class Channel : IAsyncDisposable
                 await AfterTransportInstalled();
             }
             SetState(ClientState.Connected);
+            // 读循环是该代的生命周期管理者：网络错误退出后自行驱动自动重连
+            //（RunReconnectLoopAsync 在其中）；协议致命/主动关闭则直接结束。
             _readLoop = Task.Run(() => ReadLoopAsync(transport, epoch));
-            // 传输心跳随连接启动；CloseAsync 通过 _closed 取消停止。
-            if (_options.HeartbeatIntervalMs > 0)
-            {
-                _heartbeatTask = Task.Run(() => HeartbeatLoopAsync(_closed.Token));
-            }
+            StartGenerationHeartbeat(epoch);
         }
         finally
         {
@@ -131,6 +141,7 @@ public sealed partial class Channel : IAsyncDisposable
         {
             closing = BeginClose();
             _closed.Cancel();
+            CancelGeneration(); // 停当前代心跳。
         }
         finally
         {
@@ -138,6 +149,7 @@ public sealed partial class Channel : IAsyncDisposable
         }
 
         FailAllInflight(new NetworkException("通道已关闭"));
+        FailAllQueued();
         if (closing.transport != null)
         {
             await CloseTransportAsync(closing.transport);
@@ -163,6 +175,7 @@ public sealed partial class Channel : IAsyncDisposable
     {
         await CloseAsync();
         _closed.Dispose();
+        _generationCts.Dispose();
         _connectLock.Dispose();
         _writeLock.Dispose();
     }
@@ -278,6 +291,67 @@ public sealed partial class Channel : IAsyncDisposable
         }
         catch (Exception)
         {
+        }
+    }
+
+    // CancelGeneration 取消当前代心跳（换代时由重连循环调用；关闭时由 CloseAsync 调用）。
+    private void CancelGeneration()
+    {
+        CancellationTokenSource old;
+        lock (_gate)
+        {
+            old = _generationCts;
+            _generationCts = new CancellationTokenSource();
+        }
+        try
+        {
+            old.Cancel();
+        }
+        finally
+        {
+            old.Dispose();
+        }
+    }
+
+    // StartGenerationHeartbeat 启动当前代传输心跳。心跳绑定代：换代时 CancelGeneration
+    // 停旧代心跳（旧心跳不会继续在新连接上发 Ping 或误杀新连接——M4 评审 P1）。
+    private void StartGenerationHeartbeat(uint epoch)
+    {
+        if (_options.HeartbeatIntervalMs <= 0)
+        {
+            return; // 非正周期 = 关闭传输心跳。
+        }
+        CancellationTokenSource cts;
+        lock (_gate)
+        {
+            if (_isClosed || _epoch != epoch)
+            {
+                return; // 已换代或已关闭：不启动过期代心跳。
+            }
+            cts = _generationCts;
+        }
+        _heartbeatTask = Task.Run(() => HeartbeatLoopAsync(epoch, cts.Token));
+    }
+
+    // 心跳死链后关闭的应是「心跳所属代」的连接。若期间换代（旧心跳延迟退出），
+    // 关闭前核对代：只关自己那一代，不误杀新代连接（M4 评审 P1）。
+    private async Task CloseGenerationTransportAsync(uint epoch)
+    {
+        ITransport? transport;
+        lock (_gate)
+        {
+            if (_epoch == epoch)
+            {
+                transport = _transport;
+            }
+            else
+            {
+                transport = null; // 已换代：旧心跳不得关闭新连接。
+            }
+        }
+        if (transport != null)
+        {
+            await CloseTransportAsync(transport);
         }
     }
 }
