@@ -20,6 +20,13 @@ public sealed class ChannelConfig
     // Options 是本通道配置（心跳/重连/排队/serializer 等）。
     public ChannelOptions Options { get; set; } = new();
 
+    // ReconnectHook 是本通道重连成功后的会话钩子（对标 Go WithOnReconnected）：
+    // 业务通道在此重登（更新 token 并回调业务）；战斗通道在此执行重绑（Join 语义
+    // 替身，如战斗通道传输心跳往返）。业务通道钩子成功后，若本 Client 含战斗通道
+    // 且其已 Connected，SDK 自动链式触发战斗钩子（对齐 Go DialDual 链式重绑——
+    // 规范 §5.2）；战斗未就绪则跳过本轮（战斗自身重连成功后执行自己的钩子）。
+    public Func<Task>? ReconnectHook { get; set; }
+
     public ChannelConfig()
     {
     }
@@ -57,17 +64,53 @@ public sealed class AtlasClient : IAsyncDisposable
             {
                 throw new ArgumentException("通道配置缺少拨号工厂", nameof(configs));
             }
-            var channel = new Channel(config.Kind, config.Dial, config.Options);
             if (_channels.ContainsKey(config.Kind))
             {
                 throw new ArgumentException($"重复的通道角色 {config.Kind}", nameof(configs));
             }
+            var channel = new Channel(config.Kind, config.Dial, config.Options)
+            {
+                OnRelogin = config.ReconnectHook,
+            };
             _channels[config.Kind] = channel;
         }
         if (!_channels.TryGetValue(ChannelKind.Business, out _business!))
         {
             throw new ArgumentException("业务通道必须存在（单通道形态即业务）", nameof(configs));
         }
+        // 链式重绑（对齐 Go DialDual）：业务通道钩子成功后自动触发战斗通道钩子。
+        // 仅当业务与战斗通道都配置了 ReconnectHook 时链式——业务钩子是触发点
+        //（战斗自身重连成功后也会执行自己的钩子，二者不互斥）。
+        LinkBattleRebindHook();
+    }
+
+    // LinkBattleRebindHook 做 dual 链式包装：若本 Client 含业务通道钩子与战斗通道
+    // 钩子，把战斗钩子链入业务钩子之后（业务重登成功 → 战斗重绑；战斗未 Connected
+    // 则跳过本轮——对齐 Go DialDual 实现，业务通道重连不因战斗未就绪而失败）。
+    private void LinkBattleRebindHook()
+    {
+        if (!_channels.TryGetValue(ChannelKind.Battle, out var battle))
+        {
+            return;
+        }
+        if (_business.OnRelogin == null || battle.OnRelogin == null)
+        {
+            return;
+        }
+        var businessHook = _business.OnRelogin;
+        var battleHook = battle.OnRelogin;
+        _business.OnRelogin = async () =>
+        {
+            await businessHook();
+            // 战斗通道可能还在自身重连中（双通道同时断线、战斗恢复较慢）：
+            // 跳过本次重绑——战斗自身重连成功后会执行自己的钩子，避免业务
+            // 钩子因「战斗未就绪」失败而拖累业务通道反复重连（评审 v0.4 语义）。
+            if (battle.State != ClientState.Connected)
+            {
+                return;
+            }
+            await battleHook();
+        };
     }
 
     // ConnectAsync 连接全部通道（顺序连接；任一失败即整体失败并回滚已建通道——
