@@ -6,6 +6,7 @@
   </PropertyGroup>
   <ItemGroup>
     <PackageReference Include="Google.Protobuf" Version="3.27.1" />
+    <PackageReference Include="KcpSharp" Version="0.8.8" />
     <!-- ClientWebSocket 在 netstandard2.1 需显式引用（.NET Standard 2.1 不含 WS 客户端实现）。 -->
     <PackageReference Include="System.Net.WebSockets.Client" Version="4.3.2" />
   </ItemGroup>
