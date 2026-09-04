@@ -11,6 +11,7 @@
   </ItemGroup>
   <ItemGroup>
     <ProjectReference Include="../../src/Atlas/Atlas.csproj" />
+    <ProjectReference Include="..\..\src\Atlas.Unity\Atlas.Unity.csproj" />
   </ItemGroup>
   <ItemGroup>
     <Compile Include="../../examples/Smoke/Proto/gen/Auth.cs" Link="Generated/Auth.cs" />

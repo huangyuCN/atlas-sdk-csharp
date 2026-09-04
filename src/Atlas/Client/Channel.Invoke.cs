@@ -4,6 +4,7 @@ using System.Threading;
 using System.Threading.Tasks;
 using Atlas.Errors;
 using Atlas.Frame;
+using Atlas.Scheduling;
 using Atlas.Transport;
 using AtlasTimeoutException = Atlas.Errors.TimeoutException;
 
@@ -352,16 +353,18 @@ public sealed partial class Channel
         }
         foreach (var handler in handlers)
         {
-            _ = SafeNotifyAsync(handler, op, payload);
+            // handler 经 AtlasScheduler 发布（默认线程池；Unity 注入主线程
+            // SynchronizationContext 后在主线程执行）——SafeNotify 内捕获异常。
+            AtlasScheduler.Post(() => SafeNotify(handler, op, payload));
         }
     }
 
-    // SafeNotifyAsync 单 handler 的保护执行：异常被捕获，不影响其他分发或读循环。
-    private static async Task SafeNotifyAsync(NotifyHandler handler, string op, byte[] payload)
+    // SafeNotify 单 handler 的保护执行：异常被捕获，不影响其他分发或读循环
+    //（对标 Go safeNotify 的 recover）。在 AtlasScheduler 发布的回调内同步执行。
+    private static void SafeNotify(NotifyHandler handler, string op, byte[] payload)
     {
         try
         {
-            await Task.Yield();
             handler(op, payload);
         }
         catch (Exception)
