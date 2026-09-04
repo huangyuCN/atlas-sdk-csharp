@@ -36,7 +36,9 @@ public sealed partial class Channel
             }
             try
             {
-                await InvokeRawAsync(HeartbeatOperation, null, token);
+                // failFast：死链期间进入重连排队无意义，心跳自身的失败计数就是
+                // 重连触发器（对齐 Go heartbeatLoop 的 WithFailFast 语义）。
+                await InvokeRawFailFastAsync(HeartbeatOperation, null, token);
                 failures = 0;
             }
             catch (BusinessException)

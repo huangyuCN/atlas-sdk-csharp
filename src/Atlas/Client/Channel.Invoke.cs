@@ -47,19 +47,42 @@ public sealed partial class Channel
                 {
                     throw new NetworkException($"重连排队已满（{_options.QueueSize}）");
                 }
+                // 排队期限 = 单次超时（invokeTimeout）：到点未 drain 则由看护认领
+                // 超时失败——排队阶段计入超时（对齐 Go enqueueLocked：不再无限等待重连）。
+                var deadline = DateTime.UtcNow.AddMilliseconds(_options.InvokeTimeoutMs);
                 queued = new QueuedInvoke(
                     operation,
                     payload,
                     new TaskCompletionSource<byte[]>(
-                        TaskCreationOptions.RunContinuationsAsynchronously));
+                        TaskCreationOptions.RunContinuationsAsynchronously),
+                    deadline);
                 _queue.Enqueue(queued);
             }
         }
         if (queued != null)
         {
+            StartQueueDeadlineWatch(queued);
             return await queued.Completion.Task;
         }
         return await InvokeOnceAsync(operation, payload, cancellationToken);
+    }
+
+    // StartQueueDeadlineWatch 启动排队超时看护：到点后原子认领并发送超时结果
+    //（恰好一次语义——若已被 drain 认领则跳过；对齐 Go queueDeadlineWatch）。
+    private static async void StartQueueDeadlineWatch(QueuedInvoke queued)
+    {
+        var delay = queued.Deadline - DateTime.UtcNow;
+        if (delay > TimeSpan.Zero)
+        {
+            await Task.Delay(delay);
+        }
+        // 认领失败 = 已被 drain 重发消费（drain 忽略过期请求）。
+        if (!queued.TryClaim())
+        {
+            return;
+        }
+        queued.Completion.TrySetException(
+            new AtlasTimeoutException($"排队超时（{queued.Operation}）"));
     }
 
     private async Task<byte[]> InvokeOnceAsync(

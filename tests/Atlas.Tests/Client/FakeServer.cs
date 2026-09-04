@@ -1,5 +1,6 @@
 using System;
 using System.Collections.Concurrent;
+using System.Collections.Generic;
 using System.IO;
 using System.Net;
 using System.Net.Sockets;
@@ -23,6 +24,15 @@ internal sealed class FakeServer : IAsyncDisposable
     private Stream? _stream;
     private Task? _serveTask;
     private int _accepted;
+
+    // PingBusinessError 为 true 时对传输心跳（Ping）回业务拒绝包络：
+    // 模拟网关 UDP 通道未注册内置 Ping 的服务端形态——往返完成但业务拒绝
+    //（验证「心跳业务拒绝不计死链」用，对齐 Go fakeServer.hbBusinessErr）。
+    public bool PingBusinessError { get; set; }
+
+    // DropPings 为 true 时静默丢弃传输心跳（不响应也不断开）：客户端 invoke
+    // 等响应超时（无往返）——模拟网络类失败计死链（验证死链触发重连用）。
+    public bool DropPings { get; set; }
 
     public FakeServer()
     {
@@ -177,6 +187,15 @@ internal sealed class FakeServer : IAsyncDisposable
             {
                 return;
             }
+            if (operation == Channel.HeartbeatOperation && PingBusinessError)
+            {
+                await WriteBusinessErrorReplyAsync(stream, header.Seq, header.Version, _stop.Token);
+                continue;
+            }
+            if (operation == Channel.HeartbeatOperation && DropPings)
+            {
+                continue; // 静默丢弃 Ping：客户端 invoke 超时（网络类失败）。
+            }
 
             var version = operation == "bad-version" ? FrameConst.Version2 : header.Version;
             await WriteReplyAsync(stream, header.Seq, version, payload, _stop.Token);
@@ -189,6 +208,31 @@ internal sealed class FakeServer : IAsyncDisposable
         reply[0] = 0;
         WriteUInt32(reply, 1, (uint)payload.Length);
         Array.Copy(payload, 0, reply, 5, payload.Length);
+        var header = new Header { Type = MsgType.Response, Version = version, Seq = sequence };
+        await FrameIO.WriteFrameAsync(stream, header, reply, FrameConst.MaxBodySize, token);
+    }
+
+    // WriteBusinessErrorReplyAsync 回业务拒绝包络：
+    // [1][statusLen:u32][Status wire][dataLen:u32][data]
+    // Status 含 code=1（int32 varint）与 message=3（string），reason 空——
+    // 对齐 Go testStatus(500, "", "engine: not registered") 形态。
+    private static async Task WriteBusinessErrorReplyAsync(
+        Stream stream, uint sequence, byte version, CancellationToken token)
+    {
+        // Status wire：field1=code(500) varint + field3=message(string)。
+        // 0x08 <varint 500=0xF4 0x03> 0x1A <len> "engine: not registered"
+        var message = System.Text.Encoding.UTF8.GetBytes("engine: not registered");
+        var status = new List<byte>
+        {
+            0x08, 0xF4, 0x03,
+            0x1A, (byte)message.Length,
+        };
+        status.AddRange(message);
+        var reply = new byte[1 + 4 + status.Count + 4];
+        reply[0] = 1;
+        WriteUInt32(reply, 1, (uint)status.Count);
+        status.CopyTo(reply, 5);
+        WriteUInt32(reply, 5 + status.Count, 0); // dataLen=0
         var header = new Header { Type = MsgType.Response, Version = version, Seq = sequence };
         await FrameIO.WriteFrameAsync(stream, header, reply, FrameConst.MaxBodySize, token);
     }

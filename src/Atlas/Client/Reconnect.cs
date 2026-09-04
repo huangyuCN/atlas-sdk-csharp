@@ -16,11 +16,13 @@ internal sealed class QueuedInvoke
     public QueuedInvoke(
         string operation,
         byte[]? payload,
-        TaskCompletionSource<byte[]> completion)
+        TaskCompletionSource<byte[]> completion,
+        DateTime deadline)
     {
         Operation = operation;
         Payload = payload;
         Completion = completion;
+        Deadline = deadline;
     }
 
     public string Operation { get; }
@@ -29,6 +31,19 @@ internal sealed class QueuedInvoke
 
     // 完成源：drain 重发成功后置结果；关闭时置 NetworkException。
     public TaskCompletionSource<byte[]> Completion { get; }
+
+    // Deadline 是排队期限：到点未 drain 则由看护认领并超时失败（对齐 Go
+    // queueDeadlineWatch——排队阶段计入超时，不无限期悬挂）。
+    public DateTime Deadline { get; }
+
+    private int _claimed;
+
+    // TryClaim 原子认领（CAS）：成功表示本路径拥有结算权（drain 重发或看护
+    // 超时，二选一，恰好一次）；失败表示已被另一方认领，调用方须放弃。
+    public bool TryClaim()
+    {
+        return Interlocked.CompareExchange(ref _claimed, 1, 0) == 0;
+    }
 }
 
 public sealed partial class Channel
@@ -173,8 +188,14 @@ public sealed partial class Channel
     }
 
     // ReplayQueuedAsync 重发一条排队请求（fire-and-forget：结果经 Completion 结算）。
+    // 开头原子认领：已被看护（排队超时）认领的过期请求跳过重发——避免执行
+    // 调用方已放弃的有副作用请求（对齐 Go drainQueue 跳过 q.claimed）。
     private async Task ReplayQueuedAsync(QueuedInvoke queued)
     {
+        if (!queued.TryClaim())
+        {
+            return; // 已被看护认领（排队超时），结果已由看护投递。
+        }
         try
         {
             var body = Body.BuildRequestBody(queued.Operation, queued.Payload);
@@ -209,7 +230,11 @@ public sealed partial class Channel
         }
         foreach (var queued in all)
         {
-            queued.Completion.TrySetException(new NetworkException("通道已关闭"));
+            // 认领后结算：与看护（排队超时）互斥，恰好一次。
+            if (queued.TryClaim())
+            {
+                queued.Completion.TrySetException(new NetworkException("通道已关闭"));
+            }
         }
     }
 }
