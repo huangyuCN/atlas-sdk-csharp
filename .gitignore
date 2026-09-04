@@ -1,0 +1,20 @@
+# .NET 构建产物
+bin/
+obj/
+*.user
+
+# IDE
+.vs/
+.idea/
+*.suo
+
+# NuGet
+*.nupkg
+packages/
+
+# 测试产物
+TestResults/
+*.coverage
+
+# 系统杂项
+.DS_Store
