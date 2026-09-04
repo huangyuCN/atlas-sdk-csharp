@@ -12,10 +12,19 @@ public abstract class AtlasException : Exception
     {
     }
 
-    // IsBusinessError 按业务 Reason 判断错误类型；Code 与 Metadata 不参与判定。
+    // IsBusinessError 按业务 Reason 判断错误类型；沿 InnerException 链查找包装的业务错误，
+    // 与 Go errors.As 语义对齐。Code 与 Metadata 不参与判定。
     public static bool IsBusinessError(Exception exception, string reason)
     {
-        return exception is BusinessException business && business.Reason == reason;
+        for (Exception? current = exception; current != null; current = current.InnerException)
+        {
+            if (current is BusinessException business)
+            {
+                return business.Reason == reason;
+            }
+        }
+
+        return false;
     }
 }
 

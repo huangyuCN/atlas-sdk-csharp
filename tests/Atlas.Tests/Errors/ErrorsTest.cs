@@ -19,6 +19,17 @@ public sealed class ErrorsTest
     }
 
     [Fact]
+    public void IsBusinessError_FindsWrappedBusinessException()
+    {
+        Exception exception = new InvalidOperationException(
+            "包装错误",
+            new BusinessException(5, "PLAYER_NOT_FOUND", "玩家不存在", null));
+
+        Assert.True(AtlasException.IsBusinessError(exception, "PLAYER_NOT_FOUND"));
+        Assert.False(AtlasException.IsBusinessError(exception, "OTHER"));
+    }
+
+    [Fact]
     public void ProtocolException_InheritsAtlasExceptionAndPreservesInnerException()
     {
         var cause = new InvalidOperationException("底层错误");
