@@ -4,4 +4,7 @@
     <RootNamespace>Atlas</RootNamespace>
     <AssemblyName>Atlas</AssemblyName>
   </PropertyGroup>
+  <ItemGroup>
+    <PackageReference Include="Google.Protobuf" Version="3.27.1" />
+  </ItemGroup>
 </Project>

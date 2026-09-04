@@ -3,7 +3,7 @@ using System;
 namespace Atlas.Errors;
 
 // 帧协议错误（规范 §7：ProtocolError 不可重试，连接已断）。
-public sealed class ProtocolException : Exception
+public sealed class ProtocolException : AtlasException
 {
     public ProtocolException(string message) : base(message)
     {
