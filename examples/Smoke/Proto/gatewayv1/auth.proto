@@ -2,10 +2,15 @@ syntax = "proto3";
 
 package gateway.v1;
 
+// gatewayv1 是 SDK 真机冒烟用的最小 gateway 认证协议子集（字段与
+// atlas-game-layout api/gateway/v1/auth.proto 对齐；去掉跨包 PlayerSummary
+// 引用——LoginReply 仅取 player_id/token，服务端多余字段由解码端忽略）。
+
 // 注册。
 message RegisterRequest {
-  string player_id = 1;
+  string account = 1;
   string password = 2;
+  string nickname = 3;
 }
 
 message RegisterReply {
@@ -19,8 +24,8 @@ message LoginRequest {
 }
 
 message LoginReply {
-  string token = 1;
-  string player_id = 2;
+  string player_id = 1;
+  string token = 2;
   int64 server_time_unix_ms = 3;
 }
 
@@ -34,4 +39,16 @@ message HeartbeatRequest {
 message HeartbeatReply {
   int64 ts = 1;
   uint64 server_time_unix_ms = 2;
+}
+
+// JoinBattle 战斗绑定（UDP/KCP 战斗通道 op；模板 D6 战斗协议）。
+message JoinBattleRequest {
+  string token = 1;
+  string player_id = 2;
+  string battle_id = 3;
+}
+
+message JoinBattleReply {
+  bool ok = 1;
+  string message = 2;
 }

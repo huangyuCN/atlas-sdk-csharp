@@ -26,15 +26,15 @@ public sealed class SmokeMockTest
         await using var channel = await ConnectAsync(gateway, 500);
         var serializer = new JsonSerializer();
 
-        // 注册：player_id + password → 回执 player_id。
-        var registerReq = new RegisterRequest { PlayerId = "p1", Password = "pw-1" };
+        // 注册：account + password → 回执 player_id。
+        var registerReq = new RegisterRequest { Account = "p1", Password = "pw-1" };
         var registerBytes = serializer.Serialize(registerReq);
         var registerResp = await channel.InvokeRawAsync(opRegister, registerBytes, CancellationToken.None);
         var registerReply = (RegisterReply)serializer.Deserialize(registerResp, typeof(RegisterReply));
         Assert.Equal("p1", registerReply.PlayerId);
 
-        // 登录：player_id + password → token + player_id + server_time。
-        var loginReq = new LoginRequest { PlayerId = "p1", Password = "pw-1" };
+        // 登录：player_id（注册返回）+ password → token + player_id + server_time。
+        var loginReq = new LoginRequest { PlayerId = registerReply.PlayerId, Password = "pw-1" };
         var loginBytes = serializer.Serialize(loginReq);
         var loginResp = await channel.InvokeRawAsync(opLogin, loginBytes, CancellationToken.None);
         var loginReply = (LoginReply)serializer.Deserialize(loginResp, typeof(LoginReply));
@@ -212,8 +212,8 @@ internal sealed class MockGatewayServer : IAsyncDisposable
             case opRegister:
             {
                 var req = (RegisterRequest)_serializer.Deserialize(payload, typeof(RegisterRequest));
-                Assert.False(string.IsNullOrEmpty(req.PlayerId), "注册请求缺 player_id");
-                await WriteReplyAsync(stream, header.Seq, _serializer.Serialize(new RegisterReply { PlayerId = req.PlayerId }), _stop.Token);
+                Assert.False(string.IsNullOrEmpty(req.Account), "注册请求缺 account");
+                await WriteReplyAsync(stream, header.Seq, _serializer.Serialize(new RegisterReply { PlayerId = req.Account }), _stop.Token);
                 return;
             }
             case opLogin:
