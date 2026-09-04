@@ -64,8 +64,8 @@ public struct Header
         return header;
     }
 
-    // Check 校验 magic、版本白名单、类型、seq 和长度；seq=0 对所有帧类型均非法，
-    // 与 atlas-sdk-go 的 Header.Check 及 golden frame-bad-seq-zero 保持一致。
+    // Check 按 Go Header.Check 的顺序校验 magic、seq、类型、版本白名单和长度；
+    // seq=0 对所有帧类型均非法，与 golden frame-bad-seq-zero 保持一致。
     internal static void Check(Header header, int maxBodySize)
     {
         var limit = NormalizeMaxBodySize(maxBodySize);
@@ -77,13 +77,13 @@ public struct Header
         {
             throw new ProtocolException("非法 seq: 0");
         }
-        if (header.Version != FrameConst.Version && header.Version != FrameConst.Version2)
-        {
-            throw new ProtocolException($"非法 version: {header.Version}（白名单 {{1,2}}）");
-        }
         if (header.Type != MsgType.Request && header.Type != MsgType.Response && header.Type != MsgType.Notify)
         {
             throw new ProtocolException($"非法 type: {(byte)header.Type}");
+        }
+        if (header.Version != FrameConst.Version && header.Version != FrameConst.Version2)
+        {
+            throw new ProtocolException($"非法 version: {header.Version}（白名单 {{1,2}}）");
         }
         if (header.Length > (uint)limit)
         {

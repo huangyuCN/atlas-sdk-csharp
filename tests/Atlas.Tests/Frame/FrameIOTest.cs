@@ -34,6 +34,95 @@ public sealed class FrameIOTest
     }
 
     [Fact]
+    public void Header_Encode_UsesFixedBigEndianLayout()
+    {
+        var header = new Header
+        {
+            Magic = FrameConst.Magic,
+            Version = FrameConst.Version,
+            Type = MsgType.Request,
+            Seq = 0x01020304,
+            Length = 0x0A0B0C0D,
+        };
+
+        Assert.Equal(new byte[]
+        {
+            0x41, 0x54, 0x4C, 0x53, 0x01, 0x01, 0x00, 0x00,
+            0x01, 0x02, 0x03, 0x04, 0x0A, 0x0B, 0x0C, 0x0D,
+        }, header.Encode());
+    }
+
+    [Fact]
+    public void Decode_InvalidType_ThrowsProtocol()
+    {
+        var header = new Header
+        {
+            Magic = FrameConst.Magic,
+            Version = FrameConst.Version,
+            Type = (MsgType)4,
+            Seq = 1,
+            Length = 0,
+        };
+
+        Assert.Throws<ProtocolException>(() => Header.Decode(header.Encode()));
+    }
+
+    [Fact]
+    public void Decode_InvalidType_PrecedesInvalidVersion()
+    {
+        var header = new Header
+        {
+            Magic = FrameConst.Magic,
+            Version = 3,
+            Type = (MsgType)4,
+            Seq = 1,
+            Length = 0,
+        };
+
+        var exception = Assert.Throws<ProtocolException>(() => Header.Decode(header.Encode()));
+
+        Assert.Contains("type", exception.Message);
+    }
+
+    [Fact]
+    public void Decode_DefaultMaxBodySize_RejectsOversizeLength()
+    {
+        var header = new Header
+        {
+            Magic = FrameConst.Magic,
+            Version = FrameConst.Version,
+            Type = MsgType.Request,
+            Seq = 1,
+            Length = (uint)FrameConst.MaxBodySize + 1,
+        };
+
+        Assert.Throws<ProtocolException>(() => Header.Decode(header.Encode()));
+    }
+
+    [Fact]
+    public async Task ReadFrame_SegmentedWrite_ReadsFullFrame()
+    {
+        var header = new Header
+        {
+            Magic = FrameConst.Magic,
+            Version = FrameConst.Version,
+            Type = MsgType.Request,
+            Seq = 1,
+            Length = 2,
+        };
+        await using var wire = new MemoryStream();
+        await FrameIO.WriteFrameAsync(wire, header, new byte[] { 7, 8 }, FrameConst.MaxBodySize, CancellationToken.None);
+        var bytes = wire.ToArray();
+
+        await using var stream = new SegmentedReadStream(bytes);
+
+        var actual = await FrameIO.ReadFrameAsync(stream, FrameConst.MaxBodySize, CancellationToken.None);
+
+        Assert.Equal((uint)1, actual.Header.Seq);
+        Assert.Equal(new byte[] { 7, 8 }, actual.Body);
+    }
+
+    [Fact]
     public void Decode_InvalidMagic_ThrowsProtocol()
     {
         var bytes = new byte[FrameConst.HeaderSize];
@@ -145,5 +234,28 @@ public sealed class FrameIOTest
 
         await Assert.ThrowsAsync<ProtocolException>(async () =>
             await FrameIO.ReadFrameAsync(stream, 2, CancellationToken.None));
+    }
+
+    // 分段读取流：首个 ReadAsync 只交付 1 字节，延迟后才交付余下数据，模拟对端分段写入。
+    private sealed class SegmentedReadStream : MemoryStream
+    {
+        private bool firstRead = true;
+
+        public SegmentedReadStream(byte[] bytes)
+            : base(bytes)
+        {
+        }
+
+        public override async ValueTask<int> ReadAsync(Memory<byte> buffer, CancellationToken cancellationToken = default)
+        {
+            if (firstRead)
+            {
+                firstRead = false;
+                return await base.ReadAsync(buffer.Slice(0, 1), cancellationToken);
+            }
+
+            await Task.Delay(10, cancellationToken);
+            return await base.ReadAsync(buffer, cancellationToken);
+        }
     }
 }
