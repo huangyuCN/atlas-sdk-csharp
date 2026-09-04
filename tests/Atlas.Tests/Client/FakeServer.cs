@@ -30,6 +30,11 @@ internal sealed class FakeServer : IAsyncDisposable
     //（验证「心跳业务拒绝不计死链」用，对齐 Go fakeServer.hbBusinessErr）。
     public bool PingBusinessError { get; set; }
 
+    // BusinessErrorOps 是收到即回业务拒绝包络的 operation 集合（如会话心跳的
+    // 业务 Heartbeat 模拟会话过期拒绝）：命中时回业务错误 Status——验证会话心跳
+    // 业务错误触发重登钩子用（对齐 Go echoService 的 boom op）。
+    public System.Collections.Generic.HashSet<string> BusinessErrorOps { get; } = new();
+
     // DropPings 为 true 时静默丢弃传输心跳（不响应也不断开）：客户端 invoke
     // 等响应超时（无往返）——模拟网络类失败计死链（验证死链触发重连用）。
     public bool DropPings { get; set; }
@@ -188,6 +193,11 @@ internal sealed class FakeServer : IAsyncDisposable
                 return;
             }
             if (operation == Channel.HeartbeatOperation && PingBusinessError)
+            {
+                await WriteBusinessErrorReplyAsync(stream, header.Seq, header.Version, _stop.Token);
+                continue;
+            }
+            if (BusinessErrorOps.Contains(operation))
             {
                 await WriteBusinessErrorReplyAsync(stream, header.Seq, header.Version, _stop.Token);
                 continue;

@@ -27,6 +27,9 @@ public sealed partial class Channel : IAsyncDisposable
     private readonly CancellationTokenSource _closed = new();
     private readonly Queue<QueuedInvoke> _queue = new();
 
+    // 会话心跳单飞标记（triggerReloginHook 用，对齐 Go sessionHookBusy atomic.Bool）。
+    private int _sessionHookBusy;
+
     // 当前代（epoch）的取消源：换代时 Cancel 旧代以停止该代心跳；新建下一代的
     // 源。读循环不依赖此源（连接读错误自然退出），心跳依赖它以随代退出
     // （M4 评审 P1：旧代心跳不得继续在新连接上运行/误杀新连接）。
@@ -34,6 +37,7 @@ public sealed partial class Channel : IAsyncDisposable
     private ITransport? _transport;
     private Task? _readLoop;
     private Task? _heartbeatTask;
+    private Task? _sessionHeartbeatTask;
     private uint _epoch;
     private uint _sequence;
     private int _state = (int)ClientState.Disconnected;
@@ -45,6 +49,12 @@ public sealed partial class Channel : IAsyncDisposable
 
     // 仅供 Atlas.Tests 验证 Connect/Close 串行化。
     internal Func<Task>? AfterTransportInstalled { get; set; }
+
+    // OnRelogin 注册会话重登回调：会话心跳收到业务拒绝（会话过期）时单飞触发
+    //（同一时刻至多一次未返回）；由业务方在此决定重登或下线——SDK 不擅自用旧
+    // token 自动重登（规范 §5.2：会话失效回调业务方）。对标 Go WithOnReconnected
+    // 钩子（会话心跳路径的触发器；重连成功路径的钩子由 M4-4 编排接入）。
+    public Func<Task>? OnRelogin { get; set; }
 
     public Channel(Func<CancellationToken, Task<ITransport>> dial, ChannelOptions options)
     {
@@ -167,6 +177,17 @@ public sealed partial class Channel : IAsyncDisposable
             catch (Exception)
             {
                 // 心跳退出异常在关闭路径忽略。
+            }
+        }
+        if (_sessionHeartbeatTask != null)
+        {
+            try
+            {
+                await _sessionHeartbeatTask;
+            }
+            catch (Exception)
+            {
+                // 会话心跳退出异常在关闭路径忽略。
             }
         }
     }
@@ -313,13 +334,14 @@ public sealed partial class Channel : IAsyncDisposable
         }
     }
 
-    // StartGenerationHeartbeat 启动当前代传输心跳。心跳绑定代：换代时 CancelGeneration
-    // 停旧代心跳（旧心跳不会继续在新连接上发 Ping 或误杀新连接——M4 评审 P1）。
+    // StartGenerationHeartbeat 启动当前代传输心跳与会话心跳。心跳绑定代：换代时
+    // CancelGeneration 停旧代心跳（旧心跳不会继续在新连接上发 Ping 或误杀新连接
+    // ——M4 评审 P1）。会话心跳（若配置）同代启动、同代退出。
     private void StartGenerationHeartbeat(uint epoch)
     {
-        if (_options.HeartbeatIntervalMs <= 0)
+        if (_options.HeartbeatIntervalMs <= 0 && _options.SessionHeartbeatIntervalMs <= 0)
         {
-            return; // 非正周期 = 关闭传输心跳。
+            return; // 传输心跳与会话心跳均未配置（非正周期 = 关闭）。
         }
         CancellationTokenSource cts;
         lock (_gate)
@@ -330,7 +352,14 @@ public sealed partial class Channel : IAsyncDisposable
             }
             cts = _generationCts;
         }
-        _heartbeatTask = Task.Run(() => HeartbeatLoopAsync(epoch, cts.Token));
+        if (_options.HeartbeatIntervalMs > 0)
+        {
+            _heartbeatTask = Task.Run(() => HeartbeatLoopAsync(epoch, cts.Token));
+        }
+        if (_options.SessionHeartbeatIntervalMs > 0 && _options.SessionHeartbeatOpFactory != null)
+        {
+            _sessionHeartbeatTask = Task.Run(() => SessionHeartbeatLoopAsync(epoch, cts.Token));
+        }
     }
 
     // 心跳死链后关闭的应是「心跳所属代」的连接。若期间换代（旧心跳延迟退出），
