@@ -1,4 +1,5 @@
 using System;
+using System.Collections.Generic;
 using System.Text;
 using Atlas.Errors;
 using Atlas.Frame;
@@ -18,6 +19,33 @@ public sealed class ReplyTest
 
         Assert.Equal("/gateway.v1.GatewayAuth/Login", operation);
         Assert.Equal(payload, actualPayload);
+    }
+
+    [Fact]
+    public void BuildBody_UsesBigEndianOperationLength()
+    {
+        var actual = Body.BuildRequestBody("/a", new byte[] { 0x01, 0x02 });
+
+        Assert.Equal(new byte[] { 0x00, 0x02, 0x2F, 0x61, 0x01, 0x02 }, actual);
+    }
+
+    [Fact]
+    public void BuildBody_NullPayload_UsesEmptyPayload()
+    {
+        var actual = Body.BuildRequestBody("/a", null!);
+
+        Assert.Equal(new byte[] { 0x00, 0x02, 0x2F, 0x61 }, actual);
+    }
+
+    [Fact]
+    public void BuildBody_OperationLengthBoundary()
+    {
+        var maximum = new string('a', FrameConst.MaxOperationLen);
+
+        var actual = Body.BuildRequestBody(maximum, Array.Empty<byte>());
+
+        Assert.Equal(FrameConst.MaxOperationLen + 2, actual.Length);
+        Assert.Throws<ProtocolException>(() => Body.BuildRequestBody(maximum + "a", Array.Empty<byte>()));
     }
 
     [Fact]
@@ -42,6 +70,21 @@ public sealed class ReplyTest
 
         Assert.Null(reply.Status);
         Assert.Equal(data, reply.Data);
+    }
+
+    [Theory]
+    [MemberData(nameof(TruncatedReplyBodies))]
+    public void DecodeReply_TruncatedBody_ThrowsProtocol(byte[] body)
+    {
+        Assert.Throws<ProtocolException>(() => Reply.DecodeReply(body));
+    }
+
+    [Fact]
+    public void DecodeReply_LengthAboveInt32Max_ThrowsProtocol()
+    {
+        var body = new byte[] { 0, 0x80, 0x00, 0x00, 0x00 };
+
+        Assert.Throws<ProtocolException>(() => Reply.DecodeReply(body));
     }
 
     [Fact]
@@ -117,6 +160,37 @@ public sealed class ReplyTest
         var actual = StatusWire.Decode(status);
 
         Assert.Equal("x", actual.Reason);
+    }
+
+    [Fact]
+    public void DecodeStatus_UnknownBytesField_IsIgnored()
+    {
+        var status = new byte[] { 0x32, 0x01, 0x7F, 0x12, 0x01, (byte)'x' };
+
+        var actual = StatusWire.Decode(status);
+
+        Assert.Equal("x", actual.Reason);
+    }
+
+    [Theory]
+    [MemberData(nameof(InvalidStatusWires))]
+    public void DecodeStatus_TruncatedWire_ThrowsProtocol(byte[] wire)
+    {
+        Assert.Throws<ProtocolException>(() => StatusWire.Decode(wire));
+    }
+
+    public static IEnumerable<object[]> TruncatedReplyBodies()
+    {
+        yield return new object[] { new byte[] { 0, 0, 0, 0, 1 } };
+        yield return new object[] { new byte[] { 1, 0, 0, 0, 1 } };
+        yield return new object[] { new byte[] { 1, 0, 0, 0, 0, 0, 0, 0 } };
+        yield return new object[] { new byte[] { 1, 0, 0, 0, 0, 0, 0, 0, 1 } };
+    }
+
+    public static IEnumerable<object[]> InvalidStatusWires()
+    {
+        yield return new object[] { new byte[] { 0x12, 0x02, (byte)'x' } };
+        yield return new object[] { Concat(new byte[] { 0x08 }, Repeat(0x80, 10)) };
     }
 
     private static byte[] ReplySuccess(byte[] data)

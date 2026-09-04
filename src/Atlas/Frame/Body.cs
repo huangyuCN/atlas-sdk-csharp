@@ -7,7 +7,7 @@ namespace Atlas.Frame;
 public static class Body
 {
     // [opLen:u16 大端][operation][payload]；与服务端 BuildRawBody 一致。
-    public static byte[] BuildRequestBody(string operation, byte[] payload)
+    public static byte[] BuildRequestBody(string operation, byte[]? payload)
     {
         if (string.IsNullOrEmpty(operation))
         {
@@ -20,11 +20,16 @@ public static class Body
             throw new ProtocolException($"operation 长度 {operationBytes.Length} 超上限 {FrameConst.MaxOperationLen}");
         }
 
-        var body = new byte[2 + operationBytes.Length + payload.Length];
+        var payloadLength = payload?.Length ?? 0;
+        var body = new byte[2 + operationBytes.Length + payloadLength];
         body[0] = (byte)(operationBytes.Length >> 8);
         body[1] = (byte)operationBytes.Length;
         Buffer.BlockCopy(operationBytes, 0, body, 2, operationBytes.Length);
-        Buffer.BlockCopy(payload, 0, body, 2 + operationBytes.Length, payload.Length);
+        if (payloadLength > 0)
+        {
+            Buffer.BlockCopy(payload!, 0, body, 2 + operationBytes.Length, payloadLength);
+        }
+
         return body;
     }
 
