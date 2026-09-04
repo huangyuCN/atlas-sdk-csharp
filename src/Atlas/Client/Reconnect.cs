@@ -58,6 +58,11 @@ public sealed partial class Channel
     // 调用方（ReadLoopAsync）已在锁内原子置 _reconnecting=true + Reconnecting
     //（消除 Disconnected 悬置窗口，见 ReadLoopAsync）；本方法直接进入退避循环，
     // 退出时（成功/关闭/放弃）由 finally 清 _reconnecting。
+    //
+    // 代死亡复核（M4-4 评审 P1 修复）：_reconnecting==true 会吞掉新代读循环自身的
+    // shouldReconnect 驱动（见 ReadLoopAsync），故 TrySettleGenerationAsync 在置
+    // Connected 前核对 _generationFault（本代读循环退出原因）——网络类死亡则退避
+    // 重试不置 Connected（避免 zombie）；协议致命则终止不重拨。
     private async Task RunReconnectLoopAsync()
     {
         var backoff = Math.Max(_options.BackoffBaseMs, 1);
@@ -77,23 +82,14 @@ public sealed partial class Channel
                     continue; // 拨号失败：退避后下一轮。
                 }
 
-                if (!InstallTransport(transport, out var epoch))
+                // 换代 + settle（钩子）+ 处置。返回 true = 本轮终结（Connected / 已关闭 /
+                // 协议致命 terminate）——直接退出；false = 本代在 settle 期间死亡（网络类）
+                // ——退避后重试（不置 Connected，避免 zombie，M4-4 评审 P1）。
+                if (await TrySettleGenerationAsync(transport))
                 {
-                    await CloseTransportAsync(transport);
                     return;
                 }
-                if (!StartGenerationCore(transport, epoch))
-                {
-                    return; // 已关闭。
-                }
-
-                // settle：重连钩子同步执行（若有）直至成功，然后置 Connected + drain。
-                if (!await SettleHookWithRetryAsync(epoch)
-                    || !CompleteReconnect())
-                {
-                    return; // 已关闭（Close 打断钩子/退避）。
-                }
-                return;
+                backoff = NextBackoff(backoff);
             }
         }
         finally
@@ -107,6 +103,46 @@ public sealed partial class Channel
                 }
             }
         }
+    }
+
+    // TrySettleGenerationAsync 拨号成功后完成换代 + settle（重连钩子同步执行直至
+    // 成功）+ 置 Connected/drain，并区分处置结果。返回 true = 本轮重连终结——调用方
+    // 退出；false = 本代在 settle 期间/之后死亡（网络类，FailGeneration 已置
+    // Disconnected + 记录 _generationFault）——调用方退避后重试，绝不置 Connected
+    //（否则 zombie：Connected 但无连接/读循环/重连循环，M4-4 评审 P1）。
+    private async Task<bool> TrySettleGenerationAsync(ITransport transport)
+    {
+        if (!InstallTransport(transport, out var epoch))
+        {
+            await CloseTransportAsync(transport);
+            return true; // 已关闭。
+        }
+        if (!StartGenerationCore(transport, epoch))
+        {
+            return true; // 已关闭。
+        }
+
+        // settle：钩子同步执行直至成功。Settle 返回 false = 已关闭，或本代在钩子
+        // 执行中因协议致命而死（terminate 不再重拨，P1 派生影响）。
+        if (!await SettleHookWithRetryAsync(epoch))
+        {
+            return true;
+        }
+        if (CompleteReconnect())
+        {
+            return true; // 置 Connected + drain 成功，重连完成。
+        }
+        // CompleteReconnect false：已关闭，或本代在 settle 后死亡（读循环退出 +
+        // FailGeneration 置 Disconnected）。区分处置：
+        if (_isClosed)
+        {
+            return true;
+        }
+        if (IsProtocolFatalFault())
+        {
+            return true; // 本代协议致命：terminate 不重连（状态已 Disconnected）。
+        }
+        return false; // 网络类：调用方退避后重试。
     }
 
     // DialOneAttemptAsync 执行一轮退避睡眠 + 拨号。返回 null = 拨号失败或通道已
@@ -152,8 +188,10 @@ public sealed partial class Channel
     }
 
     // CompleteReconnect 钩子成功后置 Connected + drain 排队队列（同临界区：排队
-    // 请求严格先于新请求，对齐 Go settleGeneration 的 genMu 临界区）。返回 false =
-    // 通道已关闭（调用方退出）。
+    // 请求严格先于新请求，对齐 Go settleGeneration 的 genMu 临界区）。
+    // 返回 false = 通道已关闭，或本代已死（settle 期间新代读循环退出——FailGeneration
+    // 已记录 _generationFault 并置 Disconnected）——此时绝不置 Connected，否则成 zombie
+    //（Connected 但无连接/读循环/重连循环，M4-4 评审 P1）。调用方区分处置。
     private bool CompleteReconnect()
     {
         lock (_gate)
@@ -162,9 +200,25 @@ public sealed partial class Channel
             {
                 return false;
             }
+            if (_generationFault != null || _transport == null)
+            {
+                // 本代已死（读循环退出 + FailGeneration 置 Disconnected）：不得置
+                // Connected——回到外层重连循环继续退避（或按致命原因终止）。
+                return false;
+            }
             SetState(ClientState.Connected);
             DrainQueueLocked();
             return true;
+        }
+    }
+
+    // IsProtocolFatalFault 返回当前代是否因协议致命错误而死（帧非法/版本不匹配等，
+    // 不可重试；对齐 Go ProtocolError 不重连语义）。锁内读 _generationFault。
+    private bool IsProtocolFatalFault()
+    {
+        lock (_gate)
+        {
+            return _generationFault is ProtocolException;
         }
     }
 
@@ -193,8 +247,16 @@ public sealed partial class Channel
             {
                 return false; // Close 打断：退出。
             }
+            if (IsProtocolFatalFault())
+            {
+                // 本代在钩子执行中因协议致命而死（如钩子 invoke 收到版本不匹配）：
+                // terminate 不再重拨——否则 Abandon→Redial 会无限重拨（对齐 Go 协议
+                // 致命不重连语义；M4-4 评审 P1 派生影响）。
+                return false;
+            }
 
-            // 钩子失败：弃用本代连接（保留排队请求、未重发）、退避重连后再试。
+            // 钩子失败（业务拒绝/超时/网络）：弃用本代连接（保留排队请求、未重发）、
+            // 退避重连后再试。
             if (!await AbandonGenerationAfterHookFailureAsync())
             {
                 return false;
@@ -223,6 +285,7 @@ public sealed partial class Channel
             stale = _transport;
             _transport = null;
             _epoch = NextNonZero(_epoch); // 换代：旧代读循环 FailGeneration 失效。
+            _generationFault = null; // 弃用旧代：清除其退出原因记录（新代即将到来）。
             CancelGenerationLocked();
             _readLoop = null;
             SetState(ClientState.Reconnecting);

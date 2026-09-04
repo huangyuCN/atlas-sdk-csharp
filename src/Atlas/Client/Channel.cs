@@ -49,6 +49,13 @@ public sealed partial class Channel : IAsyncDisposable
     private bool _isClosed;
     private bool _reconnecting;
 
+    // 当前代读循环的退出原因（null = 存活/未记录；仅 _gate 内读写）。
+    // settle（CompleteReconnect）前核对：新代读循环可能在本代安装后立即死亡
+    //（网络错误——FailGeneration 置 Disconnected；或协议致命）——若此时仍置
+    // Connected 则成 zombie（Connected 但无连接/读循环/重连循环，M4-4 评审 P1）。
+    // 记录后由 RunReconnectLoopAsync 区分处置：网络类继续退避重连、协议致命终止。
+    private Exception? _generationFault;
+
     // 仅供 Atlas.Tests 构造确定性并发窗口，不对 SDK 使用方公开。
     internal Func<Task>? BeforeInflightCompletion { get; set; }
 
@@ -253,6 +260,7 @@ public sealed partial class Channel : IAsyncDisposable
 
             _epoch = NextNonZero(_epoch);
             _transport = transport;
+            _generationFault = null; // 新代起点：清除上一代的退出原因记录。
             epoch = _epoch;
             return true;
         }

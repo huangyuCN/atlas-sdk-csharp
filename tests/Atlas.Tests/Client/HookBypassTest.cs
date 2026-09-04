@@ -187,10 +187,12 @@ public sealed class HookBypassTest
         Assert.Equal(ClientState.Disconnected, channel.State);
     }
 
-    // 会话心跳业务错误在 hookBypass（重连钩子执行中）期间跳过重登触发
-    //（对齐 Go triggerReloginHook 的 hookBypass 检查）——避免并发重登竞态。
+    // 会话心跳业务错误触发重登钩子后，钩子未返回期间再次业务错误不重复触发
+    //（CAS 单飞：Interlocked.CompareExchange on _sessionHookBusy——上一轮触发未完成
+    // 则跳过）。本用例挂起的是会话心跳路径的异步重登钩子（RunReloginHookAsync），
+    // 非重连 settle 的同步钩子窗口（hookBypass）——见下一用例的区分。
     [Fact]
-    public async Task SessionHeartbeat_BusinessError_DuringHookBypass_SkipsTrigger()
+    public async Task SessionHeartbeat_BusinessError_WhileReloginInFlight_NoDuplicate()
     {
         await using var server = new FakeServer();
         server.BusinessErrorOps.Add("session-heartbeat");
@@ -211,18 +213,99 @@ public sealed class HookBypassTest
             {
                 reloginCalls++;
                 reloginStarted.TrySetResult(true);
-                return release.Task; // 挂起钩子：模拟 hookBypass 窗口。
+                return release.Task; // 挂起重登钩子：CAS 单飞窗口。
             };
 
-            // 触发首次会话心跳重登（业务错误路径）。FakeServer 需对 session-heartbeat 回业务拒绝。
+            // 触发首次会话心跳重登（业务错误路径）。FakeServer 对 session-heartbeat 回业务拒绝。
             await reloginStarted.Task.WaitAsync(TimeSpan.FromSeconds(2));
             var callsAfterFirst = reloginCalls;
 
-            // 挂起期间（hookBypass 窗口）再触发几轮会话心跳——重登应被跳过。
+            // 挂起期间（重登钩子未返回）再触发几轮会话心跳——重登应被 CAS 单飞跳过。
             await Task.Delay(60);
             Assert.Equal(callsAfterFirst, reloginCalls); // 挂起期间不重复触发。
 
             release.TrySetResult(true);
+        }
+    }
+
+    // 会话心跳业务错误在「重连 settle 的同步钩子窗口」（hookBypass=true）期间跳过
+    // 重登触发（对齐 Go triggerReloginHook 的 hookBypass 检查）——避免与重连钩子
+    // 并发重登造成 Login 竞态。真实构造：kick 断连 → 重连 settle 进入 OnRelogin
+    // 挂起（hookBypass 置位）→ 新代会话心跳收到业务拒绝 → 应跳过（不重复调用
+    // OnRelogin）。区别于上一用例：上一例挂起的是会话心跳触发的异步钩子，本例
+    // 挂起的是重连 settle 同步钩子（hookBypass 窗口）。
+    [Fact]
+    public async Task SessionHeartbeat_BusinessError_DuringReconnectHookBypass_SkipsTrigger()
+    {
+        await using var server = new FakeServer();
+        var options = FastOptions();
+        options.SessionHeartbeatIntervalMs = 10;
+        options.SessionHeartbeatOpFactory = () => new SessionHeartbeatRequest("session-heartbeat", new byte[] { 1 });
+        var channel = await StartChannelAsync(
+            token => TcpTestTransport.ConnectAsync(server.Port, token),
+            options);
+        await using (channel)
+        {
+            var reloginCalls = 0;
+            var reloginStarted = new TaskCompletionSource<bool>(
+                TaskCreationOptions.RunContinuationsAsynchronously);
+            var release = new TaskCompletionSource<bool>(
+                TaskCreationOptions.RunContinuationsAsynchronously);
+            channel.OnRelogin = () =>
+            {
+                reloginCalls++;
+                if (reloginCalls == 1)
+                {
+                    reloginStarted.TrySetResult(true);
+                    return release.Task; // 首次 = 重连 settle 钩子：挂起以持住 hookBypass 窗口。
+                }
+                return Task.CompletedTask;
+            };
+
+            // 首连往返正常（会话心跳回显不触发钩子）。
+            await channel.InvokeRawAsync("echo", new byte[] { 1 }, CancellationToken.None);
+
+            // kick 断连触发重连；断连后才让服务端对 session-heartbeat 回业务拒绝
+            //（旧代已随断连取消，只有重连后新代会话心跳受影响）。
+            await Assert.ThrowsAsync<NetworkException>(
+                () => channel.InvokeRawAsync("kick", Array.Empty<byte>(), CancellationToken.None));
+            server.BusinessErrorOps.Add("session-heartbeat");
+
+            // 重连 settle 进入 OnRelogin（hookBypass 窗口）并挂起。
+            await reloginStarted.Task.WaitAsync(TimeSpan.FromSeconds(2));
+
+            // 等新代会话心跳在窗口内至少跑一轮（业务拒绝已生效）——若 TriggerReloginHook
+            // 的 hookBypass 跳过失效，reloginCalls 将变 2（RunReloginHookAsync 再触发）。
+            var heartbeatSeen = 0;
+            for (var attempt = 0; attempt < 200; attempt++)
+            {
+                foreach (var op in server.OperationNames)
+                {
+                    if (op == "session-heartbeat")
+                    {
+                        heartbeatSeen++;
+                    }
+                }
+                if (heartbeatSeen >= 1)
+                {
+                    break;
+                }
+                await Task.Delay(10);
+            }
+            Assert.True(heartbeatSeen >= 1, "新代会话心跳未在 hookBypass 窗口内运行");
+
+            // 钩子挂起期间会话心跳业务拒绝被 hookBypass 跳过：仅 1 次（settle 那次）。
+            await Task.Delay(50);
+            Assert.Equal(1, reloginCalls);
+
+            release.TrySetResult(true);
+            // 释放后重连完成：Connected。
+            var deadline = DateTime.UtcNow.AddSeconds(2);
+            while (channel.State != ClientState.Connected && DateTime.UtcNow < deadline)
+            {
+                await Task.Delay(10);
+            }
+            Assert.Equal(ClientState.Connected, channel.State);
         }
     }
 }

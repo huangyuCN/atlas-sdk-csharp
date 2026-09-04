@@ -389,6 +389,7 @@ public sealed partial class Channel
             if (_epoch == epoch)
             {
                 _transport = null;
+                _generationFault = cause; // 本代已死：记录退出原因（settle 前核对用）。
                 SetState(ClientState.Disconnected);
             }
         }
