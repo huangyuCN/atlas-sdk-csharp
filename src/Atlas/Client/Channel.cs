@@ -19,6 +19,9 @@ public sealed partial class Channel : IAsyncDisposable
     private readonly SemaphoreSlim _writeLock = new(1, 1);
     private readonly Dictionary<InflightKey, Inflight> _inflight = new();
     private readonly CancellationTokenSource _closed = new();
+    private readonly object _notifyGate = new();
+    private readonly Dictionary<string, List<NotifyEntry>> _notifies = new();
+    private Task? _heartbeatTask;
     private ITransport? _transport;
     private Task? _readLoop;
     private uint _epoch;
@@ -40,6 +43,48 @@ public sealed partial class Channel : IAsyncDisposable
     }
 
     public ClientState State => (ClientState)Volatile.Read(ref _state);
+
+    // On 订阅本通道的 Notify 帧（按 operation 分发），返回退订句柄。
+    // 幂等语义：同一 (op, handler)（delegate 引用相等）重复注册只保留一份，
+    // 重复退订安全。handler 在线程池执行、异常隔离，不影响其他分发（对标 Go on）。
+    public NotifySubscription On(string op, NotifyHandler handler)
+    {
+        if (handler == null)
+        {
+            throw new ArgumentNullException(nameof(handler));
+        }
+        if (string.IsNullOrEmpty(op))
+        {
+            throw new ArgumentException("operation 不能为空", nameof(op));
+        }
+        lock (_notifyGate)
+        {
+            if (!_notifies.TryGetValue(op, out var entries))
+            {
+                entries = new List<NotifyEntry>();
+                _notifies[op] = entries;
+            }
+            var existing = entries.Find(e => ReferenceEquals(e.Handler, handler));
+            if (existing == null)
+            {
+                entries.Add(new NotifyEntry(handler));
+            }
+        }
+        return new NotifySubscription(() =>
+        {
+            lock (_notifyGate)
+            {
+                if (_notifies.TryGetValue(op, out var list))
+                {
+                    list.RemoveAll(e => ReferenceEquals(e.Handler, handler));
+                    if (list.Count == 0)
+                    {
+                        _notifies.Remove(op);
+                    }
+                }
+            }
+        });
+    }
 
     public async Task ConnectAsync(CancellationToken cancellationToken)
     {
@@ -66,6 +111,11 @@ public sealed partial class Channel : IAsyncDisposable
             }
             SetState(ClientState.Connected);
             _readLoop = Task.Run(() => ReadLoopAsync(transport, epoch));
+            // 传输心跳随连接启动；CloseAsync 通过 _closed 取消停止。
+            if (_options.HeartbeatIntervalMs > 0)
+            {
+                _heartbeatTask = Task.Run(() => HeartbeatLoopAsync(_closed.Token));
+            }
         }
         finally
         {
@@ -95,6 +145,17 @@ public sealed partial class Channel : IAsyncDisposable
         if (closing.readLoop != null)
         {
             await IgnoreReadLoopAsync(closing.readLoop);
+        }
+        if (_heartbeatTask != null)
+        {
+            try
+            {
+                await _heartbeatTask;
+            }
+            catch (Exception)
+            {
+                // 心跳退出异常在关闭路径忽略。
+            }
         }
     }
 

@@ -162,7 +162,8 @@ public sealed partial class Channel
     {
         if (header.Type == MsgType.Notify)
         {
-            return; // M2-4 接入 Notify 订阅分发。
+            DispatchNotify(body);
+            return;
         }
         if (header.Type != MsgType.Response)
         {
@@ -197,6 +198,54 @@ public sealed partial class Channel
             }
             _inflight.Remove(key);
             return inflight;
+        }
+    }
+
+    // DispatchNotify 解析 Notify 帧并分发到全部订阅者。帧体解析失败静默丢弃：
+    // 推送非请求-响应匹配路径，坏帧不影响连接（对标 Go dispatchNotify）。
+    // handler 在独立 Task 执行且异常被隔离，单 handler 崩溃不影响其他分发。
+    private void DispatchNotify(byte[] body)
+    {
+        string op;
+        byte[] payload;
+        NotifyHandler[] handlers;
+        try
+        {
+            (op, payload) = Body.ParseRequestBody(body);
+        }
+        catch (ProtocolException)
+        {
+            return; // 帧体解析失败静默丢弃（推送非匹配路径，坏帧不影响连接）。
+        }
+        lock (_notifyGate)
+        {
+            if (!_notifies.TryGetValue(op, out var entries))
+            {
+                return;
+            }
+            handlers = new NotifyHandler[entries.Count];
+            for (var i = 0; i < entries.Count; i++)
+            {
+                handlers[i] = entries[i].Handler;
+            }
+        }
+        foreach (var handler in handlers)
+        {
+            _ = SafeNotifyAsync(handler, op, payload);
+        }
+    }
+
+    // SafeNotifyAsync 单 handler 的保护执行：异常被捕获，不影响其他分发或读循环。
+    private static async Task SafeNotifyAsync(NotifyHandler handler, string op, byte[] payload)
+    {
+        try
+        {
+            await Task.Yield();
+            handler(op, payload);
+        }
+        catch (Exception)
+        {
+            // 单 handler 异常隔离（对标 Go safeNotify 的 recover）。
         }
     }
 

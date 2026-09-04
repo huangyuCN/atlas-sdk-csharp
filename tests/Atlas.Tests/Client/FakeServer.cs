@@ -5,6 +5,7 @@ using System.Net;
 using System.Net.Sockets;
 using System.Threading;
 using System.Threading.Tasks;
+using Atlas.Client;
 using Atlas.Frame;
 using Atlas.Transport;
 
@@ -17,6 +18,9 @@ internal sealed class FakeServer : IAsyncDisposable
     private readonly TaskCompletionSource<bool> _holdSeen = NewSignal();
     private readonly TaskCompletionSource<bool> _releaseHold = NewSignal();
     private readonly ConcurrentQueue<uint> _sequences = new();
+    private readonly ConcurrentQueue<string> _operations = new();
+    private readonly object _pushGate = new();
+    private Stream? _stream;
     private Task? _serveTask;
 
     public FakeServer()
@@ -28,6 +32,53 @@ internal sealed class FakeServer : IAsyncDisposable
     public int Port => ((IPEndPoint)_listener.LocalEndpoint).Port;
 
     public uint[] Sequences => _sequences.ToArray();
+
+    // OperationNames 返回服务端收到的全部 operation（按到达顺序）。
+    public string[] OperationNames => _operations.ToArray();
+
+    public int PingCount
+    {
+        get
+        {
+            var count = 0;
+            foreach (var op in _operations)
+            {
+                if (op == Channel.HeartbeatOperation)
+                {
+                    count++;
+                }
+            }
+            return count;
+        }
+    }
+
+    public async Task PushNotifyAsync(string operation, byte[] payload)
+    {
+        var stream = await WaitForStreamAsync();
+        var body = Body.BuildRequestBody(operation, payload);
+        var header = new Header { Type = MsgType.Notify, Version = FrameConst.Version, Seq = 1 };
+        await FrameIO.WriteFrameAsync(stream, header, body, FrameConst.MaxBodySize, _stop.Token);
+    }
+
+    // WaitForStreamAsync 等待服务端 accept 并保存连接流（PushNotify 前置）。
+    private async Task<Stream> WaitForStreamAsync()
+    {
+        var deadline = DateTime.UtcNow + TimeSpan.FromSeconds(2);
+        while (DateTime.UtcNow < deadline)
+        {
+            Stream? stream;
+            lock (_pushGate)
+            {
+                stream = _stream;
+            }
+            if (stream != null)
+            {
+                return stream;
+            }
+            await Task.Delay(5);
+        }
+        throw new InvalidOperationException("服务端尚无活动连接");
+    }
 
     public Task WaitForHoldAsync() => _holdSeen.Task;
 
@@ -62,11 +113,16 @@ internal sealed class FakeServer : IAsyncDisposable
 
     private async Task ServeAsync(Stream stream)
     {
+        lock (_pushGate)
+        {
+            _stream = stream;
+        }
         while (!_stop.IsCancellationRequested)
         {
             var (header, body) = await FrameIO.ReadFrameAsync(stream, FrameConst.MaxBodySize, _stop.Token);
             var (operation, payload) = Body.ParseRequestBody(body);
             _sequences.Enqueue(header.Seq);
+            _operations.Enqueue(operation);
             if (operation == "hold")
             {
                 _holdSeen.TrySetResult(true);
