@@ -22,6 +22,12 @@ namespace Atlas.Transport;
 // KcpSharp StreamMode——kcp-go 侧为消息模式，开流模式破坏互通。
 public sealed class KcpTransport : ITransport
 {
+    // 写超时兜底（对齐 Go client/transport_kcp.go kcpWriteTimeout）：KCP 无连接
+    // 关闭通知，死链（对端消失）后发送窗口堆满 SendAsync 会永久等待并持有上层
+    // 写锁——心跳死链检测被阻塞绕过，重连卡死。每次写设 10s 兜底超时（对齐 Go）。
+    // internal 可变以便测试注入短值验证超时路径（默认 10000 对齐 Go）。
+    internal static int KcpWriteTimeoutMs = 10000;
+
     private readonly KcpConversation _conversation;
     private readonly Socket _socket;
     private readonly IKcpTransport<KcpConversation>? _transport;
@@ -163,6 +169,9 @@ public sealed class KcpTransport : ITransport
         return buf;
     }
 
+    // WriteFrameAsync 写帧：头消息 + body 消息两次发送。每次写设 10s 兜底超时
+    //（KcpWriteTimeoutMs，对齐 Go kcpWriteTimeout）——死链窗口满时 SendAsync
+    // 无限等待会持有上层写锁，必须超时返回让上层判死链重连。
     public async Task WriteFrameAsync(Header header, byte[] body, int maxBodySize, CancellationToken cancellationToken)
     {
         if (body.Length > maxBodySize)
@@ -182,20 +191,35 @@ public sealed class KcpTransport : ITransport
         }
         h.Length = (uint)body.Length;
 
-        // 头消息 + body 消息两次发送（消息模式互通关键）。SendAsync 返回
-        // true = 成功入队；false = 传输已关闭（KcpSharp 语义）。
-        bool ok = await _conversation.SendAsync(h.Encode(), cancellationToken).ConfigureAwait(false);
-        if (!ok)
+        using var writeTimeout = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
+        writeTimeout.CancelAfter(KcpWriteTimeoutMs);
+        var token = writeTimeout.Token;
+        try
         {
-            throw new EndOfStreamException("KCP 传输已关闭：发帧头失败");
-        }
-        if (body.Length > 0)
-        {
-            ok = await _conversation.SendAsync(body, cancellationToken).ConfigureAwait(false);
+            // 头消息 + body 消息两次发送（消息模式互通关键）。SendAsync 返回
+            // true = 成功入队；false = 传输已关闭（KcpSharp 语义）。
+            bool ok = await _conversation.SendAsync(h.Encode(), token).ConfigureAwait(false);
             if (!ok)
             {
-                throw new EndOfStreamException("KCP 传输已关闭：发 body 失败");
+                throw new EndOfStreamException("KCP 传输已关闭：发帧头失败");
             }
+            if (body.Length > 0)
+            {
+                ok = await _conversation.SendAsync(body, token).ConfigureAwait(false);
+                if (!ok)
+                {
+                    throw new EndOfStreamException("KCP 传输已关闭：发 body 失败");
+                }
+            }
+        }
+        catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
+        {
+            throw; // 调用方主动取消：原样透传。
+        }
+        catch (OperationCanceledException oce)
+        {
+            // 写超时兜底（死链）：转网络错误，上层按死链处理（心跳失败计数）。
+            throw new NetworkException($"KCP 写帧超时（{KcpWriteTimeoutMs}ms），判定死链", oce);
         }
     }
 
