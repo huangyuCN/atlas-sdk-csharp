@@ -31,6 +31,15 @@ public sealed partial class Channel
         CancellationToken cancellationToken,
         bool failFast)
     {
+        // 会话钩子同步执行期间（hookBypass，对齐 Go invoke.go）直通当前代连接：
+        // 钩子的重登/重绑请求不排队（队列要等钩子成功后才 drain），传输心跳亦经此
+        // 路径保活。已文档化的语义：该窗口内外部并发 Invoke 同样直写当前代连接（连接
+        // 可用但可能尚未完成重登，调用方需自行容忍；窗口上限 = HookTimeoutMs）——
+        // 无法按调用方区分钩子内外（对齐 Go 公开 API 约束下的既定取舍）。
+        if (IsHookBypass())
+        {
+            return await InvokeOnceAsync(operation, payload, cancellationToken);
+        }
         // 排队判定与入队在 _gate 临界区原子完成：drain 与入队互斥，
         // 不存在「drain 空队列后请求才入队」的永久遗留窗口（对齐 Go B4 修复）。
         QueuedInvoke? queued = null;
@@ -109,8 +118,17 @@ public sealed partial class Channel
     {
         lock (_gate)
         {
-            if (_isClosed || State != ClientState.Connected || _transport == null)
+            // Reconnecting 期间不注册 in-flight（写死连接无意义，等完整超时）。
+            // 例外：会话钩子执行期间（hookBypass，对齐 Go invokeOnce）放行——
+            // 钩子的重登请求正是为建立会话，必须直通当前代连接。
+            if (_isClosed || _transport == null)
             {
+                throw new NetworkException("通道未连接");
+            }
+            if (!IsHookBypass() && State != ClientState.Connected)
+            {
+                // 非钩子窗口：仅 Connected 可注册（Connecting/Reconnecting/Disconnected
+                // 均拒绝——Reconnecting 由排队层拦截，failFast 在此失败）。
                 throw new NetworkException("通道未连接");
             }
 

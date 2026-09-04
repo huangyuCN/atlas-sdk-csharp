@@ -62,11 +62,15 @@ public sealed partial class Channel
     }
 
     // TriggerReloginHook 单飞触发会话重登钩子（会话心跳业务错误路径，对标 Go
-    // triggerReloginHook）：重连钩子同步执行期间（hookBypass，M4-4 接入）或上一轮
+    // triggerReloginHook）：重连钩子同步执行期间（hookBypass，对齐 Go）或上一轮
     // 触发未完成时跳过——避免并发重登造成 Login 竞态与 token 抖动；失败静默，
     // 下一轮会话心跳再触发。钩子异步执行，SDK 不等待其完成（业务方决定重登/下线）。
     private void TriggerReloginHook()
     {
+        if (IsHookBypass())
+        {
+            return; // 重连钩子同步执行中（hookBypass 窗口）：本轮跳过（对齐 Go）。
+        }
         if (Interlocked.CompareExchange(ref _sessionHookBusy, 1, 0) != 0)
         {
             return; // 上一轮触发的钩子未返回：本轮跳过（CAS 单飞）。

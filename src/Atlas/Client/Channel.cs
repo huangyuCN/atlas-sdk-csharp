@@ -30,6 +30,11 @@ public sealed partial class Channel : IAsyncDisposable
     // 会话心跳单飞标记（triggerReloginHook 用，对齐 Go sessionHookBusy atomic.Bool）。
     private int _sessionHookBusy;
 
+    // 重连钩子同步执行标记（hookBypass，对齐 Go hookBypass atomic.Bool）：置位期间
+    // Invoke 直通当前代连接——钩子的重登请求与传输心跳不排队（队列要等钩子成功后才
+    // drain；对齐 Go invoke.go hookBypass 文档）。窗口上限 = HookTimeoutMs。
+    private int _hookBypass;
+
     // 当前代（epoch）的取消源：换代时 Cancel 旧代以停止该代心跳；新建下一代的
     // 源。读循环不依赖此源（连接读错误自然退出），心跳依赖它以随代退出
     // （M4 评审 P1：旧代心跳不得继续在新连接上运行/误杀新连接）。
@@ -50,18 +55,35 @@ public sealed partial class Channel : IAsyncDisposable
     // 仅供 Atlas.Tests 验证 Connect/Close 串行化。
     internal Func<Task>? AfterTransportInstalled { get; set; }
 
-    // OnRelogin 注册会话重登回调：会话心跳收到业务拒绝（会话过期）时单飞触发
-    //（同一时刻至多一次未返回）；由业务方在此决定重登或下线——SDK 不擅自用旧
-    // token 自动重登（规范 §5.2：会话失效回调业务方）。对标 Go WithOnReconnected
-    // 钩子（会话心跳路径的触发器；重连成功路径的钩子由 M4-4 编排接入）。
+    // OnRelogin 注册会话重登回调（= Go onReconnected 重连钩子）：两条路径触发——
+    // ① 重连成功后由重连编排器同步执行（settle，M4-4）：期间 hookBypass 直通窗口，
+    //    钩子的重登请求直写新连接；失败（错误/超时）弃用连接继续退避重连，成功才
+    //    drain 排队队列；
+    // ② 会话心跳收到业务拒绝（会话过期）时 CAS 单飞触发（异步，业务方自决重登/下线）——
+    //    hookBypass 期间跳过，避免并发重登（规范 §5.2）。SDK 不擅自用旧 token 自动重登。
+    // 对标 Go WithOnReconnected 钩子（重连路径 runHookSync + 会话心跳 triggerReloginHook
+    // 共用同一回调）。
     public Func<Task>? OnRelogin { get; set; }
 
     public Channel(Func<CancellationToken, Task<ITransport>> dial, ChannelOptions options)
+        : this(ChannelKind.Business, dial, options)
     {
+    }
+
+    // Channel 构造：kind 标定通道角色（业务/战斗；dual 编排用，M4-5）。
+    public Channel(
+        ChannelKind kind,
+        Func<CancellationToken, Task<ITransport>> dial,
+        ChannelOptions options)
+    {
+        Kind = kind;
         _dial = dial ?? throw new ArgumentNullException(nameof(dial));
         _options = options ?? throw new ArgumentNullException(nameof(options));
         ValidateOptions(_options);
     }
+
+    // Kind 是本通道角色（dual 形态区分业务/战斗；会话心跳仅业务通道生效的门控依据）。
+    public ChannelKind Kind { get; }
 
     public ClientState State => (ClientState)Volatile.Read(ref _state);
 
@@ -281,6 +303,19 @@ public sealed partial class Channel : IAsyncDisposable
         }
     }
 
+    // SetHookBypass 置位/清除重连钩子直通窗口标记（由 RunReconnectLoopAsync 在
+    // 钩子同步执行期间管理；对齐 Go hookBypass.Store）。
+    private void SetHookBypass(bool bypass)
+    {
+        Volatile.Write(ref _hookBypass, bypass ? 1 : 0);
+    }
+
+    // IsHookBypass 返回是否处于重连钩子同步执行窗口（Invoke 直通判定用）。
+    private bool IsHookBypass()
+    {
+        return Volatile.Read(ref _hookBypass) != 0;
+    }
+
     private void SetState(ClientState state)
     {
         Volatile.Write(ref _state, (int)state);
@@ -356,7 +391,11 @@ public sealed partial class Channel : IAsyncDisposable
         {
             _heartbeatTask = Task.Run(() => HeartbeatLoopAsync(epoch, cts.Token));
         }
-        if (_options.SessionHeartbeatIntervalMs > 0 && _options.SessionHeartbeatOpFactory != null)
+        // 会话心跳仅业务通道生效（规范 §5.2：会话绑定业务通道，战斗通道不续租——
+        // 战斗通道无会话概念；对标 Go 实现按通道角色强制）。
+        if (Kind == ChannelKind.Business
+            && _options.SessionHeartbeatIntervalMs > 0
+            && _options.SessionHeartbeatOpFactory != null)
         {
             _sessionHeartbeatTask = Task.Run(() => SessionHeartbeatLoopAsync(epoch, cts.Token));
         }
