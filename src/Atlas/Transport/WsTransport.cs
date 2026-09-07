@@ -18,6 +18,10 @@ public sealed class WsTransport : ITransport
     private static readonly TimeSpan DefaultHandshakeTimeout = TimeSpan.FromSeconds(10);
 
     private readonly ClientWebSocket _socket;
+    // 写互斥（对齐 Go wsTransport 的 writeMu）：ClientWebSocket.SendAsync 要求单写者，
+    // 多线程并发写会抛 InvalidOperationException。上层 Channel 已用写锁串行化，但
+    // transport 自身也须内建互斥——直接持 transport 多线程写时保安全（评审补强）。
+    private readonly SemaphoreSlim _writeLock = new(1, 1);
 
     private WsTransport(ClientWebSocket socket)
     {
@@ -107,7 +111,7 @@ public sealed class WsTransport : ITransport
         return FrameIO.DecodeMessage(received.ToArray(), maxBodySize);
     }
 
-    public Task WriteFrameAsync(Header header, byte[] body, int maxBodySize, CancellationToken cancellationToken)
+    public async Task WriteFrameAsync(Header header, byte[] body, int maxBodySize, CancellationToken cancellationToken)
     {
         byte[] message;
         try
@@ -122,7 +126,15 @@ public sealed class WsTransport : ITransport
         {
             throw new ProtocolException($"WebSocket 帧编码失败: {exception.Message}");
         }
-        return _socket.SendAsync(message, WebSocketMessageType.Binary, true, cancellationToken);
+        await _writeLock.WaitAsync(cancellationToken);
+        try
+        {
+            await _socket.SendAsync(message, WebSocketMessageType.Binary, true, cancellationToken);
+        }
+        finally
+        {
+            _writeLock.Release();
+        }
     }
 
     public async Task CloseAsync()

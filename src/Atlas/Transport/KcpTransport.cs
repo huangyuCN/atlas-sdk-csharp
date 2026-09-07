@@ -47,46 +47,14 @@ public sealed class KcpTransport : ITransport
             throw new ArgumentException("host 不能为空", nameof(host));
         }
 
-        // 解析服务端地址（DNS 或字面量；KcpSharp 需 EndPoint）。
-        IPAddress address;
-        if (!IPAddress.TryParse(host, out address!))
-        {
-            var resolved = await Dns.GetHostAddressesAsync(host).ConfigureAwait(false);
-            if (resolved.Length == 0)
-            {
-                throw new ArgumentException($"无法解析主机 {host}", nameof(host));
-            }
-            address = resolved[0];
-        }
+        var address = await ResolveAddressAsync(host).ConfigureAwait(false);
         cancellationToken.ThrowIfCancellationRequested();
 
-        var socket = new Socket(SocketType.Dgram, ProtocolType.Udp);
+        var socket = CreateBoundSocket();
         try
         {
-            // 绑定本地回环/任意端口（不指定则系统分配）。netstandard2.1 无
-            // Socket(Bind) 双栈简化——绑定 IPv4 任意端口即可（服务端为 IPv4）。
-            socket.Bind(new IPEndPoint(IPAddress.Any, 0));
-
-            var options = new KcpConversationOptions
-            {
-                NoDelay = false,              // kcp-go nodelay=0
-                UpdateInterval = 40,          // kcp-go interval=40（毫秒）
-                FastResend = 0,               // kcp-go resend=0
-                DisableCongestionControl = false, // kcp-go nc=0
-                SendWindow = 128,             // kcp-go sndWnd
-                ReceiveWindow = 128,          // kcp-go rcvWnd
-                RemoteReceiveWindow = 128,    // 对端窗口（kcp-go 默认 128）
-                Mtu = 1400,                   // kcp-go mtu
-                StreamMode = false,           // 消息模式（kcp-go 默认，互通关键）
-            };
-
-            // 随机 conv（0x10000000..0x7FFFFFFF），与服务端按 conv 匹配对话
-            //（kcp-go 客户端 DialWithOptions 亦用随机 conv）。
-            int conv = unchecked((int)(uint)new Random().Next(0x10000000, 0x7FFFFFFF));
-            var transport = KcpSocketTransport.CreateConversation(
-                socket, new IPEndPoint(address, port), conv, options);
-            transport.Start();
-            return new KcpTransport(socket, transport, transport.Connection);
+            var (transport, conversation) = CreateConversation(socket, address, port);
+            return new KcpTransport(socket, transport, conversation);
         }
         catch
         {
@@ -95,8 +63,59 @@ public sealed class KcpTransport : ITransport
         }
     }
 
+    // ResolveAddressAsync 解析服务端地址（DNS 或字面量；KcpSharp 需 EndPoint）。
+    private static async Task<IPAddress> ResolveAddressAsync(string host)
+    {
+        if (IPAddress.TryParse(host, out var literal))
+        {
+            return literal;
+        }
+        var resolved = await Dns.GetHostAddressesAsync(host).ConfigureAwait(false);
+        if (resolved.Length == 0)
+        {
+            throw new ArgumentException($"无法解析主机 {host}", nameof(host));
+        }
+        return resolved[0];
+    }
+
+    // CreateBoundSocket 创建并绑定本地 UDP socket（不指定则系统分配；服务端为 IPv4）。
+    private static Socket CreateBoundSocket()
+    {
+        var socket = new Socket(SocketType.Dgram, ProtocolType.Udp);
+        socket.Bind(new IPEndPoint(IPAddress.Any, 0));
+        return socket;
+    }
+
+    // CreateConversation 构造 KCP 会话（参数对齐服务端 kcp-go 默认基线）。
+    private static (IKcpTransport<KcpConversation> Transport, KcpConversation Conversation)
+        CreateConversation(Socket socket, IPAddress address, int port)
+    {
+        var options = new KcpConversationOptions
+        {
+            NoDelay = false,              // kcp-go nodelay=0
+            UpdateInterval = 40,          // kcp-go interval=40（毫秒）
+            FastResend = 0,               // kcp-go resend=0
+            DisableCongestionControl = false, // kcp-go nc=0
+            SendWindow = 128,             // kcp-go sndWnd
+            ReceiveWindow = 128,          // kcp-go rcvWnd
+            RemoteReceiveWindow = 128,    // 对端窗口（kcp-go 默认 128）
+            Mtu = 1400,                   // kcp-go mtu
+            StreamMode = false,           // 消息模式（kcp-go 默认，互通关键）
+        };
+
+        // 随机 conv（0x10000000..0x7FFFFFFF），与服务端按 conv 匹配对话
+        //（kcp-go 客户端 DialWithOptions 亦用随机 conv）。
+        int conv = unchecked((int)(uint)new Random().Next(0x10000000, 0x7FFFFFFF));
+        var transport = KcpSocketTransport.CreateConversation(
+            socket, new IPEndPoint(address, port), conv, options);
+        // Connection 在 Start 后才可用（KcpSocketTransport 状态机要求）。
+        transport.Start();
+        return (transport, transport.Connection);
+    }
+
     public async ValueTask<(Header Header, byte[] Body)> ReadFrameAsync(int maxBodySize, CancellationToken cancellationToken)
     {
+        maxBodySize = Header.NormalizeMaxBodySize(maxBodySize);
         // 收头消息（16B）。
         var headerMessage = await ReceiveMessageAsync(FrameConst.HeaderSize, cancellationToken).ConfigureAwait(false);
         if (headerMessage.Length != FrameConst.HeaderSize)
@@ -174,12 +193,14 @@ public sealed class KcpTransport : ITransport
     // 无限等待会持有上层写锁，必须超时返回让上层判死链重连。
     public async Task WriteFrameAsync(Header header, byte[] body, int maxBodySize, CancellationToken cancellationToken)
     {
-        if (body.Length > maxBodySize)
+        if (body == null)
         {
-            throw new ProtocolException($"body 过长: {body.Length} > {maxBodySize}");
+            throw new ArgumentNullException(nameof(body));
         }
+        maxBodySize = Header.NormalizeMaxBodySize(maxBodySize);
 
-        // 帧头强制填充默认值（对齐 Go frame.Write：magic/version 零值按默认补齐）。
+        // 帧头强制填充默认值并校验（对齐 Go frame.Write：magic/version 零值按默认
+        // 补齐、type/seq/version/长度经 Header.Check——非法头在出站即拦截）。
         var h = header;
         if (h.Magic == 0)
         {
@@ -190,15 +211,23 @@ public sealed class KcpTransport : ITransport
             h.Version = FrameConst.Version;
         }
         h.Length = (uint)body.Length;
+        Header.Check(h, maxBodySize);
 
+        await SendHeaderAndBodyAsync(h, body, cancellationToken).ConfigureAwait(false);
+    }
+
+    // SendHeaderAndBodyAsync 头消息 + body 消息两次发送（消息模式互通关键），每次
+    // 写设 10s 兜底超时——死链窗口满时 SendAsync 无限等待会持有上层写锁，必须超时
+    // 返回让上层判死链重连（对齐 Go kcpWriteTimeout）。
+    private async Task SendHeaderAndBodyAsync(Header header, byte[] body, CancellationToken cancellationToken)
+    {
         using var writeTimeout = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
         writeTimeout.CancelAfter(KcpWriteTimeoutMs);
         var token = writeTimeout.Token;
         try
         {
-            // 头消息 + body 消息两次发送（消息模式互通关键）。SendAsync 返回
-            // true = 成功入队；false = 传输已关闭（KcpSharp 语义）。
-            bool ok = await _conversation.SendAsync(h.Encode(), token).ConfigureAwait(false);
+            // SendAsync 返回 true = 成功入队；false = 传输已关闭（KcpSharp 语义）。
+            bool ok = await _conversation.SendAsync(header.Encode(), token).ConfigureAwait(false);
             if (!ok)
             {
                 throw new EndOfStreamException("KCP 传输已关闭：发帧头失败");
@@ -228,6 +257,16 @@ public sealed class KcpTransport : ITransport
         try
         {
             _conversation.Dispose();
+        }
+        catch (ObjectDisposedException)
+        {
+            // 已释放则忽略。
+        }
+        // 释放接收泵（KcpSocketTransport），避免其计时器/队列残留到进程退出
+        //（评审修复：此前仅 Dispose conversation 与 socket，接收泵未收尾）。
+        try
+        {
+            _transport?.Dispose();
         }
         catch (ObjectDisposedException)
         {

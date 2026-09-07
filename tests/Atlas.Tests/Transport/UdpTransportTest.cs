@@ -141,6 +141,79 @@ public sealed class UdpTransportTest
             FrameConst.MaxBodySize, CancellationToken.None);
         Assert.Equal(requestBody, responseBody);
     }
+
+    [Fact]
+    public async Task BadMagicOver16Bytes_IsSilentlyDropped()
+    {
+        // ≥16B 坏包（完整帧头大小但非法 magic）应被静默丢弃（评审 P3 修复：此前
+        // 只覆盖 <16B 短包——≥16B 的头校验失败分支无测试）。
+        var (server, port) = StartServer();
+        await using var transport = await UdpTransport.ConnectAsync("127.0.0.1", port, CancellationToken.None);
+        await using var _ = server;
+
+        // 16B 头 + 2B body，但 magic 非法（全零——非 ATLS）。
+        var badDatagram = new byte[FrameConst.HeaderSize + 2];
+        using (var sender = new UdpClient())
+        {
+            await sender.SendAsync(badDatagram, badDatagram.Length, "127.0.0.1", port);
+        }
+
+        // 合法请求随后仍可往返（非法 magic 的 ≥16B 包已丢弃）
+        var requestBody = new byte[] { 0x66 };
+        var requestHeader = new Header
+        {
+            Magic = FrameConst.Magic,
+            Version = FrameConst.Version,
+            Type = MsgType.Request,
+            Seq = 4,
+        };
+        await transport.WriteFrameAsync(requestHeader, requestBody, FrameConst.MaxBodySize, CancellationToken.None);
+        var (_, responseBody) = await transport.ReadFrameAsync(
+            FrameConst.MaxBodySize, CancellationToken.None);
+        Assert.Equal(requestBody, responseBody);
+    }
+
+    [Fact]
+    public async Task BadLengthMismatch_IsSilentlyDropped_AndNextValidReceived()
+    {
+        // 头 bodyLen 与数据报实际长度不一致的 ≥16B 坏包应静默丢弃，且同一读循环
+        // 继续处理后续合法响应（评审 P3 修复：坏包断言弱时序强化——经 server 在
+        // 同一往返内先回显坏包再回显合法响应，证明读循环不因坏包失败）。
+        var (server, port) = StartServer();
+        await using var transport = await UdpTransport.ConnectAsync("127.0.0.1", port, CancellationToken.None);
+        await using var _ = server;
+
+        // 构造：头 bodyLen=100（声明 100 字节 body）但数据报实际无 body（16B 头）。
+        var mismatchHeader = new Header
+        {
+            Magic = FrameConst.Magic,
+            Version = FrameConst.Version,
+            Type = MsgType.Request,
+            Seq = 5,
+            Length = 100,
+        };
+        var mismatch = mismatchHeader.Encode(); // 仅 16B 头，声明 bodyLen=100 但无 body
+
+        // 让 server 先收到坏包回显，再发合法请求——同一读循环需先丢弃坏包再收合法响应。
+        using (var sender = new UdpClient())
+        {
+            await sender.SendAsync(mismatch, mismatch.Length, "127.0.0.1", port);
+        }
+        await Task.Delay(20); // 保证坏包先被 server 处理并回显到 transport
+
+        var requestBody = new byte[] { 0x77 };
+        var requestHeader = new Header
+        {
+            Magic = FrameConst.Magic,
+            Version = FrameConst.Version,
+            Type = MsgType.Request,
+            Seq = 6,
+        };
+        await transport.WriteFrameAsync(requestHeader, requestBody, FrameConst.MaxBodySize, CancellationToken.None);
+        var (_, responseBody) = await transport.ReadFrameAsync(
+            FrameConst.MaxBodySize, CancellationToken.None);
+        Assert.Equal(requestBody, responseBody);
+    }
 }
 
 // UdpEchoServer：绑定回环随机端口，收到数据报后原样回显（模拟网关 UDP 通道）。

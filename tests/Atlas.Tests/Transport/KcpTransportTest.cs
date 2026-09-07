@@ -75,6 +75,90 @@ public sealed class KcpTransportTest
             () => KcpTransport.ConnectAsync("", 1, CancellationToken.None));
     }
 
+    [Fact]
+    public async Task Write_InvalidHeaderType_ThrowsProtocol_OutboundIntercept()
+    {
+        var server = new KcpEchoServer();
+        await using var _ = server;
+        await using var transport = await KcpTransport.ConnectAsync("127.0.0.1", server.Port, CancellationToken.None);
+
+        // 出站非法头（type=4、seq=0、非法 version）应在写侧即拦截（Header.Check），
+        // 而非发出后由对端丢弃——对齐 FrameIO.WriteFrameAsync 语义。
+        var badType = new Header
+        {
+            Magic = FrameConst.Magic,
+            Version = FrameConst.Version,
+            Type = (MsgType)4,
+            Seq = 1,
+        };
+        await Assert.ThrowsAsync<ProtocolException>(() =>
+            transport.WriteFrameAsync(badType, Array.Empty<byte>(), FrameConst.MaxBodySize, CancellationToken.None));
+
+        var zeroSeq = new Header
+        {
+            Magic = FrameConst.Magic,
+            Version = FrameConst.Version,
+            Type = MsgType.Request,
+            Seq = 0,
+        };
+        await Assert.ThrowsAsync<ProtocolException>(() =>
+            transport.WriteFrameAsync(zeroSeq, Array.Empty<byte>(), FrameConst.MaxBodySize, CancellationToken.None));
+
+        var badVersion = new Header
+        {
+            Magic = FrameConst.Magic,
+            Version = 3,
+            Type = MsgType.Request,
+            Seq = 1,
+        };
+        await Assert.ThrowsAsync<ProtocolException>(() =>
+            transport.WriteFrameAsync(badVersion, Array.Empty<byte>(), FrameConst.MaxBodySize, CancellationToken.None));
+    }
+
+    [Fact]
+    public async Task Write_NullBody_ThrowsArgumentNull()
+    {
+        var server = new KcpEchoServer();
+        await using var _ = server;
+        await using var transport = await KcpTransport.ConnectAsync("127.0.0.1", server.Port, CancellationToken.None);
+
+        var header = new Header
+        {
+            Magic = FrameConst.Magic,
+            Version = FrameConst.Version,
+            Type = MsgType.Request,
+            Seq = 1,
+        };
+        await Assert.ThrowsAsync<ArgumentNullException>(() =>
+            transport.WriteFrameAsync(header, null!, FrameConst.MaxBodySize, CancellationToken.None));
+    }
+
+    [Fact]
+    public async Task Write_MaxBodySizeZero_DefaultsToAbsoluteLimit()
+    {
+        // maxBodySize<=0 应归一化为绝对上限（对齐 Header.NormalizeMaxBodySize）：
+        // 小 body 在 maxBodySize=0 下不被误判超限（评审 P3 修复）。
+        var server = new KcpEchoServer();
+        await using var _ = server;
+        await using var transport = await KcpTransport.ConnectAsync("127.0.0.1", server.Port, CancellationToken.None);
+
+        var header = new Header
+        {
+            Magic = FrameConst.Magic,
+            Version = FrameConst.Version,
+            Type = MsgType.Request,
+            Seq = 11,
+        };
+        var body = new byte[] { 1, 2, 3 };
+        await transport.WriteFrameAsync(header, body, 0, CancellationToken.None);
+
+        using var cts = new CancellationTokenSource(5000);
+        var (responseHeader, responseBody) = await transport.ReadFrameAsync(0, cts.Token);
+        Assert.Equal(MsgType.Response, responseHeader.Type);
+        Assert.Equal(11u, responseHeader.Seq);
+        Assert.Equal(body, responseBody);
+    }
+
     // 死链写超时兜底（评审 P2-1 修复验证）：对端（黑洞 UDP 端点）存在但不回
     // 任何 ack，持续写填满发送窗口后 SendAsync 阻塞——KcpWriteTimeoutMs 兜底
     // 超时返回 NetworkException 而非无限挂起（对齐 Go kcpWriteTimeout=10s）。

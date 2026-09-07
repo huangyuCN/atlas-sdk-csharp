@@ -21,6 +21,9 @@ public sealed class UdpTransport : ITransport
     public const int MaxDatagramSize = 64 * 1024;
 
     private readonly Socket _socket;
+    // 读缓冲复用（对齐 Go transport_udp.go readBuf）：readLoop 单线程读，每次
+    // ReadFrameAsync 复用同一 64KiB 缓冲——避免高频帧下每帧一次分配（评审 P3）。
+    private readonly byte[] _readBuffer = new byte[MaxDatagramSize];
 
     private UdpTransport(Socket socket)
     {
@@ -64,7 +67,6 @@ public sealed class UdpTransport : ITransport
     public async ValueTask<(Header Header, byte[] Body)> ReadFrameAsync(
         int maxBodySize, CancellationToken cancellationToken)
     {
-        var buffer = new byte[MaxDatagramSize];
         while (true)
         {
             cancellationToken.ThrowIfCancellationRequested();
@@ -72,7 +74,7 @@ public sealed class UdpTransport : ITransport
             try
             {
                 received = await _socket.ReceiveAsync(
-                    new ArraySegment<byte>(buffer), SocketFlags.None, cancellationToken);
+                    new ArraySegment<byte>(_readBuffer), SocketFlags.None, cancellationToken);
             }
             catch (ObjectDisposedException) when (cancellationToken.IsCancellationRequested)
             {
@@ -85,7 +87,7 @@ public sealed class UdpTransport : ITransport
             }
 
             var datagram = new byte[received];
-            Array.Copy(buffer, datagram, received);
+            Array.Copy(_readBuffer, datagram, received);
             try
             {
                 // 数据报应恰为完整帧（16B 头 + body）；任何解码失败 = 坏包丢弃。

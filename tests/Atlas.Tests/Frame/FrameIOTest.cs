@@ -258,4 +258,82 @@ public sealed class FrameIOTest
             return await base.ReadAsync(buffer, cancellationToken);
         }
     }
+
+    // ---- EncodeMessage / DecodeMessage 负向单测（评审补强：此前仅经 WS 间接覆盖） ----
+
+    [Fact]
+    public void EncodeMessage_BodyOverLimit_ThrowsProtocol()
+    {
+        var header = new Header
+        {
+            Magic = FrameConst.Magic,
+            Version = FrameConst.Version,
+            Type = MsgType.Request,
+            Seq = 1,
+        };
+        var oversized = new byte[3];
+        // maxBodySize=2 时 body 超限应抛 ProtocolException。
+        Assert.Throws<ProtocolException>(() => FrameIO.EncodeMessage(header, oversized, 2));
+    }
+
+    [Fact]
+    public void EncodeMessage_NullBody_ThrowsArgumentNull()
+    {
+        var header = new Header
+        {
+            Magic = FrameConst.Magic,
+            Version = FrameConst.Version,
+            Type = MsgType.Request,
+            Seq = 1,
+        };
+        Assert.Throws<ArgumentNullException>(() => FrameIO.EncodeMessage(header, null!, FrameConst.MaxBodySize));
+    }
+
+    [Fact]
+    public void DecodeMessage_ShorterThanHeader_ThrowsProtocol()
+    {
+        Assert.Throws<ProtocolException>(() => FrameIO.DecodeMessage(new byte[] { 1, 2, 3 }, FrameConst.MaxBodySize));
+    }
+
+    [Fact]
+    public void DecodeMessage_LengthMismatch_ThrowsProtocol()
+    {
+        // 头 bodyLen=3 但消息只有 2B body——长度不一致即协议非法（消息边界下失步）。
+        var header = new Header
+        {
+            Magic = FrameConst.Magic,
+            Version = FrameConst.Version,
+            Type = MsgType.Request,
+            Seq = 1,
+            Length = 3,
+        };
+        var message = new byte[FrameConst.HeaderSize + 2];
+        var headerBytes = header.Encode();
+        Array.Copy(headerBytes, message, FrameConst.HeaderSize);
+        Assert.Throws<ProtocolException>(() => FrameIO.DecodeMessage(message, FrameConst.MaxBodySize));
+    }
+
+    [Fact]
+    public void DecodeMessage_BadMagic_ThrowsProtocol()
+    {
+        // ≥16B 但 magic 非法（全零）——头校验失败。
+        var message = new byte[FrameConst.HeaderSize + 2];
+        Assert.Throws<ProtocolException>(() => FrameIO.DecodeMessage(message, FrameConst.MaxBodySize));
+    }
+
+    [Fact]
+    public void DecodeMessage_ValidMessage_Roundtrip()
+    {
+        var header = new Header
+        {
+            Magic = FrameConst.Magic,
+            Version = FrameConst.Version,
+            Type = MsgType.Request,
+            Seq = 9,
+        };
+        var message = FrameIO.EncodeMessage(header, new byte[] { 7, 8 }, FrameConst.MaxBodySize);
+        var (decodedHeader, body) = FrameIO.DecodeMessage(message, FrameConst.MaxBodySize);
+        Assert.Equal(9u, decodedHeader.Seq);
+        Assert.Equal(new byte[] { 7, 8 }, body);
+    }
 }

@@ -1,4 +1,5 @@
 using System;
+using System.Collections.Generic;
 using System.Net;
 using System.Net.Sockets;
 using System.Threading;
@@ -86,6 +87,44 @@ public sealed class TransportTest
         Assert.Equal("ws://127.0.0.1:9002/custom", WsTransport.NormalizeUrl("127.0.0.1:9002", "custom"));
         Assert.Equal("wss://host/game", WsTransport.NormalizeUrl("wss://host/game", "ignored"));
         Assert.Equal("ws://host:9002", WsTransport.NormalizeUrl("ws://host:9002", "ignored"));
+    }
+
+    [Fact]
+    public async Task WsTransport_ConcurrentWrites_DoNotThrow()
+    {
+        // 写互斥验证（评审补强）：ClientWebSocket.SendAsync 要求单写者，多线程并发
+        // 写会抛 InvalidOperationException——内建写锁应串行化，全部写成功且帧完整。
+        await using var server = new WsEchoServer();
+        var transport = await WsTransport.ConnectAsync(server.Url, CancellationToken.None);
+        try
+        {
+            var tasks = new List<Task>(8);
+            for (var i = 0; i < 8; i++)
+            {
+                var seq = (uint)(i + 1);
+                var header = new Header { Type = MsgType.Request, Version = FrameConst.Version, Seq = seq };
+                var body = Body.BuildRequestBody("echo", new[] { (byte)i });
+                tasks.Add(transport.WriteFrameAsync(header, body, FrameConst.MaxBodySize, CancellationToken.None));
+            }
+            await Task.WhenAll(tasks); // 任一写抛 InvalidOperationException 即失败
+
+            // 读回 8 个响应验证无交错损坏（每条消息 = 完整帧）。
+            var seen = new HashSet<uint>();
+            for (var i = 0; i < 8; i++)
+            {
+                var (replyHeader, replyBody) =
+                    await transport.ReadFrameAsync(FrameConst.MaxBodySize, CancellationToken.None);
+                Assert.Equal(MsgType.Response, replyHeader.Type);
+                Assert.True(seen.Add(replyHeader.Seq), $"重复 seq {replyHeader.Seq}");
+                var (operation, payload) = Body.ParseRequestBody(replyBody);
+                Assert.Equal("echo", operation);
+                Assert.Equal((uint)(replyHeader.Seq - 1), payload[0]);
+            }
+        }
+        finally
+        {
+            await transport.CloseAsync();
+        }
     }
 }
 
