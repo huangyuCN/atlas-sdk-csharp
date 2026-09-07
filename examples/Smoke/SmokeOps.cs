@@ -82,9 +82,24 @@ public sealed class SmokeOps
     }
 
     // PingAsync 传输保活探针：空 payload 往返（对齐 Go HeartbeatOperation）。
-    public async Task PingAsync(Channel channel, CancellationToken ct)
+    // 返回 true = 往返完成：内置 Ping 成功或业务拒绝（BusinessException）均视为
+    // 链路存活（对齐 Go probeAlive——业务拒绝即请求-响应往返完成，网络类错误
+    // 才算失败）。
+    public async Task<bool> PingAsync(Channel channel, CancellationToken ct)
     {
-        await channel.InvokeRawAsync(Ops.Ping, null, ct);
+        try
+        {
+            await channel.InvokeRawAsync(Ops.Ping, null, ct);
+            return true;
+        }
+        catch (BusinessException)
+        {
+            return true; // 业务拒绝 = 往返完成 = 链路存活
+        }
+        catch (Exception)
+        {
+            return false; // 网络/超时/协议类 = 链路未恢复
+        }
     }
 
     // JoinBattleAsync 战斗绑定探针：伪造 token 验证战斗通道 payload 编解码——

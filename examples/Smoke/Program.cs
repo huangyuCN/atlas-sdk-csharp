@@ -110,7 +110,10 @@ public static class Program
         }
         Console.WriteLine("[冒烟] 业务心跳 3 次往返 OK");
 
-        await ops.PingAsync(channel, ct);
+        if (!await ops.PingAsync(channel, ct))
+        {
+            throw new Exception(transport + " 传输心跳 Ping 往返失败（链路未恢复）");
+        }
         Console.WriteLine("[冒烟] 传输心跳 Ping 往返 OK（" + transport + "）");
     }
 
@@ -119,7 +122,10 @@ public static class Program
     static async Task RunBattleChannelAsync(SmokeOps ops, Channel channel, string transport)
     {
         var ct = CancellationToken.None;
-        await ops.PingAsync(channel, ct);
+        if (!await ops.PingAsync(channel, ct))
+        {
+            throw new Exception(transport + " 通道往返探针失败（链路未恢复）");
+        }
         Console.WriteLine($"[冒烟] {transport} 通道往返探针 OK");
 
         var rejected = await ops.TryJoinBattleAsync(channel, ct);

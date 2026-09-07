@@ -36,6 +36,16 @@ internal sealed class CapturingContext : SynchronizationContext
     public int PendingCount => _posted.Count;
 }
 
+// Post 恒抛异常的同步上下文：模拟宿主上下文已终结/异常的实现，验证
+// AtlasScheduler.Post 的异常防护（回退线程池，不冒泡到调用方）。
+internal sealed class ThrowingContext : SynchronizationContext
+{
+    public override void Post(SendOrPostCallback d, object? state)
+    {
+        throw new ObjectDisposedException("host context");
+    }
+}
+
 // AtlasScheduler 与 AtlasUnity 桥的调度注入验证（对齐设计文档 §6.2：
 // handler 默认线程池、注入 SynchronizationContext 后在注入上下文执行）。
 
@@ -107,6 +117,24 @@ public sealed class SchedulerTest
             var called = new ManualResetEventSlim(false);
             AtlasScheduler.Post(() => called.Set());
             Assert.True(called.Wait(TimeSpan.FromSeconds(2)), "恢复默认后应在线程池执行");
+        }
+        finally
+        {
+            AtlasScheduler.SetScheduler(null);
+        }
+    }
+
+    // 注入上下文 Post 抛异常时：AtlasScheduler.Post 不冒泡（避免沿读循环误判
+    // 网络失败），回退线程池仍执行回调。
+    [Fact]
+    public void Post_ContextPostThrows_FallsBackToThreadPool()
+    {
+        try
+        {
+            AtlasScheduler.SetScheduler(new ThrowingContext());
+            var called = new ManualResetEventSlim(false);
+            AtlasScheduler.Post(() => called.Set());
+            Assert.True(called.Wait(TimeSpan.FromSeconds(2)), "上下文 Post 抛异常应回退线程池执行回调");
         }
         finally
         {

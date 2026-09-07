@@ -96,7 +96,8 @@ public sealed partial class Channel : IAsyncDisposable
 
     // On 订阅本通道的 Notify 帧（按 operation 分发），返回退订句柄。
     // 幂等语义：同一 (op, handler)（delegate 引用相等）重复注册只保留一份，
-    // 重复退订安全。handler 在线程池执行、异常隔离，不影响其他分发（对标 Go on）。
+    // 重复退订安全。handler 默认在线程池执行（经 AtlasScheduler 发布；Unity 注入
+    // 主线程同步上下文后在主线程执行）、异常隔离，不影响其他分发（对标 Go on）。
     // 订阅挂在 Channel 层（不随连接代际丢失），重连成功后新连接天然继续收到推送。
     public NotifySubscription On(string op, NotifyHandler handler)
     {

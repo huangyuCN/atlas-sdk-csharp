@@ -349,7 +349,8 @@ public sealed partial class Channel
 
     // DispatchNotify 解析 Notify 帧并分发到全部订阅者。帧体解析失败静默丢弃：
     // 推送非请求-响应匹配路径，坏帧不影响连接（对标 Go dispatchNotify）。
-    // handler 在独立 Task 执行且异常被隔离，单 handler 崩溃不影响其他分发。
+    // handler 经 AtlasScheduler 发布（默认线程池；注入调度器后在注入上下文执行）
+    // 且异常被隔离，单 handler 崩溃不影响其他分发。
     private void DispatchNotify(byte[] body)
     {
         string op;

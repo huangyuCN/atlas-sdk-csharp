@@ -15,6 +15,16 @@ using Xunit;
 
 namespace Atlas.Tests.Client;
 
+// GatewayOps 是 mock 网关协议 operation 共享常量（SmokeMockTest 外部测试类与
+// MockGatewayServer 分派共用——单一来源，避免两份字面量漂移；与 Go/TS mock
+// 网关的 op 名称逐字一致）。
+internal static class GatewayOps
+{
+    public const string Register = "/gateway.v1.GatewayAuth/Register";
+    public const string Login = "/gateway.v1.GatewayAuth/Login";
+    public const string Heartbeat = "/gateway.v1.GatewayAuth/Heartbeat";
+}
+
 // SmokeMockTest 覆盖 mock 网关闭环：注册→登录→业务心跳→Notify 收推→传输 Ping 往返。
 // mock 网关按 auth.proto 业务语义回响应（对标 Go/TS 的 mock-gateway；真机冒烟在 M3/M4）。
 public sealed class SmokeMockTest
@@ -29,14 +39,14 @@ public sealed class SmokeMockTest
         // 注册：account + password → 回执 player_id。
         var registerReq = new RegisterRequest { Account = "p1", Password = "pw-1" };
         var registerBytes = serializer.Serialize(registerReq);
-        var registerResp = await channel.InvokeRawAsync(opRegister, registerBytes, CancellationToken.None);
+        var registerResp = await channel.InvokeRawAsync(GatewayOps.Register, registerBytes, CancellationToken.None);
         var registerReply = (RegisterReply)serializer.Deserialize(registerResp, typeof(RegisterReply));
         Assert.Equal("p1", registerReply.PlayerId);
 
         // 登录：player_id（注册返回）+ password → token + player_id + server_time。
         var loginReq = new LoginRequest { PlayerId = registerReply.PlayerId, Password = "pw-1" };
         var loginBytes = serializer.Serialize(loginReq);
-        var loginResp = await channel.InvokeRawAsync(opLogin, loginBytes, CancellationToken.None);
+        var loginResp = await channel.InvokeRawAsync(GatewayOps.Login, loginBytes, CancellationToken.None);
         var loginReply = (LoginReply)serializer.Deserialize(loginResp, typeof(LoginReply));
         Assert.Equal("p1", loginReply.PlayerId);
         Assert.False(string.IsNullOrEmpty(loginReply.Token));
@@ -50,13 +60,13 @@ public sealed class SmokeMockTest
             Ts = 1234567890L,
         };
         var heartbeatBytes = serializer.Serialize(heartbeatReq);
-        var heartbeatResp = await channel.InvokeRawAsync(opHeartbeat, heartbeatBytes, CancellationToken.None);
+        var heartbeatResp = await channel.InvokeRawAsync(GatewayOps.Heartbeat, heartbeatBytes, CancellationToken.None);
         var heartbeatReply = (HeartbeatReply)serializer.Deserialize(heartbeatResp, typeof(HeartbeatReply));
         Assert.Equal(1234567890L, heartbeatReply.Ts);
         Assert.True(heartbeatReply.ServerTimeUnixMs > 0);
 
         // 网关应收到四种 op（顺序注册→登录→业务心跳；Ping 默认关闭）。
-        Assert.Equal(new[] { opRegister, opLogin, opHeartbeat }, gateway.Operations);
+        Assert.Equal(new[] { GatewayOps.Register, GatewayOps.Login, GatewayOps.Heartbeat }, gateway.Operations);
     }
 
     [Fact]
@@ -112,9 +122,6 @@ public sealed class SmokeMockTest
         return new TaskCompletionSource<bool>(TaskCreationOptions.RunContinuationsAsynchronously);
     }
 
-    private const string opRegister = "/gateway.v1.GatewayAuth/Register";
-    private const string opLogin = "/gateway.v1.GatewayAuth/Login";
-    private const string opHeartbeat = "/gateway.v1.GatewayAuth/Heartbeat";
 }
 
 // MockGatewayServer 是模拟网关业务语义的 TCP 回环服务端：按 operation 分派
@@ -209,14 +216,14 @@ internal sealed class MockGatewayServer : IAsyncDisposable
             case Channel.HeartbeatOperation:
                 await WriteReplyAsync(stream, header.Seq, Array.Empty<byte>(), _stop.Token);
                 return;
-            case opRegister:
+            case GatewayOps.Register:
                 {
                     var req = (RegisterRequest)_serializer.Deserialize(payload, typeof(RegisterRequest));
                     Assert.False(string.IsNullOrEmpty(req.Account), "注册请求缺 account");
                     await WriteReplyAsync(stream, header.Seq, _serializer.Serialize(new RegisterReply { PlayerId = req.Account }), _stop.Token);
                     return;
                 }
-            case opLogin:
+            case GatewayOps.Login:
                 {
                     var req = (LoginRequest)_serializer.Deserialize(payload, typeof(LoginRequest));
                     Assert.False(string.IsNullOrEmpty(req.PlayerId), "登录请求缺 player_id");
@@ -232,7 +239,7 @@ internal sealed class MockGatewayServer : IAsyncDisposable
                         _stop.Token);
                     return;
                 }
-            case opHeartbeat:
+            case GatewayOps.Heartbeat:
                 {
                     var req = (HeartbeatRequest)_serializer.Deserialize(payload, typeof(HeartbeatRequest));
                     Assert.False(string.IsNullOrEmpty(req.Token), "业务心跳缺 token");
@@ -290,7 +297,4 @@ internal sealed class MockGatewayServer : IAsyncDisposable
         bytes[offset + 3] = (byte)value;
     }
 
-    private const string opRegister = "/gateway.v1.GatewayAuth/Register";
-    private const string opLogin = "/gateway.v1.GatewayAuth/Login";
-    private const string opHeartbeat = "/gateway.v1.GatewayAuth/Heartbeat";
 }

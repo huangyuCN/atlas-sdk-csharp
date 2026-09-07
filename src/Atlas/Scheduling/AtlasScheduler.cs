@@ -27,7 +27,9 @@ public static class AtlasScheduler
     }
 
     // Post 将回调投递到当前调度器（默认线程池；注入后经 SynchronizationContext.Post）。
-    // 不阻塞调用线程；回调异常由调用方（如 SafeNotifyAsync）负责隔离。
+    // 不阻塞调用线程；回调异常由调用方（如 SafeNotify）负责隔离。
+    // Post 自身对注入上下文的 Post 调用做异常防护——宿主上下文若实现异常
+    //（已终结/非线程安全等）不会沿读循环冒泡误杀连接，回退线程池执行回调。
     public static void Post(Action callback)
     {
         if (callback == null)
@@ -41,8 +43,16 @@ public static class AtlasScheduler
         }
         if (context != null)
         {
-            context.Post(_ => callback(), null);
-            return;
+            try
+            {
+                context.Post(_ => callback(), null);
+                return;
+            }
+            catch (Exception)
+            {
+                // 注入上下文异常（如宿主已终结）：回退线程池，保证回调仍执行且
+                // 异常不冒泡到读循环（避免误判为网络失败触发 FailGeneration）。
+            }
         }
         ThreadPool.QueueUserWorkItem(_ => callback());
     }

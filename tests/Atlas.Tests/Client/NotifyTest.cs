@@ -18,17 +18,23 @@ public sealed class NotifyTest
         await using var server = new FakeServer();
         await using var channel = await ConnectAsync(server, 500);
         var received = NewSignal();
+        string? receivedOp = null;
+        string? receivedPayload = null;
 
         channel.On("match.found", (op, payload) =>
         {
-            Assert.Equal("match.found", op);
-            Assert.Equal("room-1", Encoding.UTF8.GetString(payload));
+            receivedOp = op;
+            receivedPayload = Encoding.UTF8.GetString(payload);
             received.TrySetResult(true);
         });
 
         await server.PushNotifyAsync("match.found", Encoding.UTF8.GetBytes("room-1"));
 
         await received.Task.WaitAsync(TimeSpan.FromSeconds(2));
+        // handler 内不直接 Assert（异常会被 SafeNotify 吞掉只表现超时）——
+        // 记录到字段后主流程外部断言，失败即真实测试失败。
+        Assert.Equal("match.found", receivedOp);
+        Assert.Equal("room-1", receivedPayload);
     }
 
     [Fact]

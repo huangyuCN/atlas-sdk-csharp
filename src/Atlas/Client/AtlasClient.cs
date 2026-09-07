@@ -81,6 +81,9 @@ public sealed class AtlasClient : IAsyncDisposable
         // 链式重绑（对齐 Go DialDual）：业务通道钩子成功后自动触发战斗通道钩子。
         // 仅当业务与战斗通道都配置了 ReconnectHook 时链式——业务钩子是触发点
         //（战斗自身重连成功后也会执行自己的钩子，二者不互斥）。
+        // 已知竞态窗口（与 Go 同源）：双通道同时断线、战斗先恢复 Connected 时，
+        // 业务链式触发的战斗钩子与战斗自身重连触发的钩子可能在小窗口双跑——
+        // Join 重绑幂等性依赖服务端容忍重复 Join（对齐 Go v0.4 同语义，非新增风险）。
         LinkBattleRebindHook();
     }
 
