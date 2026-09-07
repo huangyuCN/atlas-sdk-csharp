@@ -144,8 +144,40 @@ public sealed class ChannelTest
     }
 
     [Fact]
-    public async Task CloseAsync_WaitsForInstallation_AndLeavesChannelDisconnected()
+    public async Task CloseAsync_DoesNotBlockOnSlowDial()
     {
+        // 评审 M2-3 note：dial 永不返回（如 TCP 连黑洞地址）时 Close 不得挂起。
+        // 旧实现先等 _connectLock（被 in-flight ConnectAsync 持有）→ 挂起到系统
+        // TCP 超时；新实现直接 BeginClose（_closed 取消使 dial 中断）快速返回。
+        var never = new TaskCompletionSource<ITransport>(
+            TaskCreationOptions.RunContinuationsAsynchronously);
+        await using var channel = new Channel(
+            // 拨号工厂契约：必须响应取消 token（对齐 Go dial ctx）。真实 TcpTransport
+            // 注册 token 取消 Dispose 打断 connect；此处模拟同契约——token 取消即失败。
+            token =>
+            {
+                token.Register(() => never.TrySetException(
+                    new OperationCanceledException(token)));
+                return never.Task;
+            },
+            new ChannelOptions { InvokeTimeoutMs = 500 });
+
+        var connecting = channel.ConnectAsync(CancellationToken.None);
+        await Task.Delay(20); // 让 ConnectAsync 进入 dial 并持有 _connectLock。
+
+        var closing = channel.CloseAsync();
+        var completed = await Task.WhenAny(closing, Task.Delay(TimeSpan.FromSeconds(1)));
+        Assert.Same(closing, completed); // Close 不被慢 dial 阻塞（1s 内返回）。
+
+        await Assert.ThrowsAsync<NetworkException>(() => connecting);
+        Assert.Equal(ClientState.Disconnected, channel.State);
+    }
+
+    [Fact]
+    public async Task CloseAsync_DuringInstallation_LeavesDisconnected()
+    {
+        // Close 与 Connect 并发：安装钩子挂起期间 Close 主动清理（不再等安装钩子），
+        // 钩子释放后 Connect 复查 _isClosed 抛错，绝不置 Connected（关闭后不得假活）。
         var transport = new ControlledTransport();
         await using var channel = new Channel(
             _ => Task.FromResult<ITransport>(transport),
@@ -161,12 +193,10 @@ public sealed class ChannelTest
         var connecting = channel.ConnectAsync(CancellationToken.None);
         await installed.Task.WaitAsync(TimeSpan.FromSeconds(1));
         var closing = channel.CloseAsync();
-        await Task.Delay(50);
-        Assert.False(closing.IsCompleted);
+        await closing.WaitAsync(TimeSpan.FromSeconds(1)); // Close 不等安装钩子。
 
         releaseInstallation.TrySetResult(true);
-        await connecting;
-        await closing;
+        await Assert.ThrowsAsync<NetworkException>(() => connecting);
         Assert.Equal(ClientState.Disconnected, channel.State);
         await Assert.ThrowsAsync<NetworkException>(
             () => channel.InvokeRawAsync("echo", Array.Empty<byte>(), CancellationToken.None));

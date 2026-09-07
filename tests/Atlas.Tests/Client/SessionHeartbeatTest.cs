@@ -217,4 +217,58 @@ public sealed class SessionHeartbeatTest
         }
         throw new System.TimeoutException($"等待条件超时（{timeout.TotalSeconds}s）");
     }
+
+    [Fact]
+    public async Task SessionHeartbeat_NotSent_OnBattleChannel()
+    {
+        // 评审 M4-3 P3：会话心跳仅业务通道门控（规范 §5.2 战斗通道不续租）。
+        // Battle kind 通道配置会话心跳后，服务端不应收到任何会话 op（传输心跳
+        // 关闭隔离观测）。
+        await using var server = new FakeServer();
+        var channel = new Channel(
+            ChannelKind.Battle,
+            token => TcpTestTransport.ConnectAsync(server.Port, token),
+            FastOptions(o => ConfigureSession(o, SessionOp, new byte[] { 1 })));
+        await using (channel)
+        {
+            await channel.ConnectAsync(CancellationToken.None);
+            await Task.Delay(120); // 覆盖多个会话心跳周期。
+            Assert.Equal(0, CountOperation(server, SessionOp));
+        }
+    }
+
+    [Fact]
+    public async Task SessionHeartbeat_RestartsOnReconnect_NewGenerationRenews()
+    {
+        // 评审 M4-3 P3：会话心跳换代重启续租——kick 重连（新代）后会话心跳
+        // 在新连接上继续续租（对齐传输心跳 Heartbeat_RecoveredConnection）。
+        await using var server = new FakeServer();
+        var channel = new Channel(
+            ChannelKind.Business,
+            token => TcpTestTransport.ConnectAsync(server.Port, token),
+            FastOptions(o =>
+            {
+                o.InvokeTimeoutMs = 500;
+                ConfigureSession(o, SessionOp, new byte[] { 1 });
+            }));
+        channel.OnRelogin = () => Task.CompletedTask;
+        await using (channel)
+        {
+            await channel.ConnectAsync(CancellationToken.None);
+            await WaitUntilAsync(
+                () => CountOperation(server, SessionOp) >= 1,
+                TimeSpan.FromSeconds(2));
+
+            // kick 断开 → 自动重连 → 新连接会话心跳继续续租。
+            await Assert.ThrowsAsync<NetworkException>(
+                () => channel.InvokeRawAsync("kick", Array.Empty<byte>(), CancellationToken.None));
+            await WaitUntilAsync(
+                () => channel.State == ClientState.Connected && server.AcceptedConnections >= 2,
+                TimeSpan.FromSeconds(3));
+
+            await WaitUntilAsync(
+                () => CountOperation(server, SessionOp) >= 2,
+                TimeSpan.FromSeconds(2));
+        }
+    }
 }

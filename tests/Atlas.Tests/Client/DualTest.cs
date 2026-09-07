@@ -88,6 +88,9 @@ public sealed class DualTest
         await using var businessServer = new FakeServer();
         await using var battleServer = new FakeServer();
 
+        // 战斗拨号：第 1 次成功（初始 Connect），之后持续失败——kick 后战斗保持
+        // Reconnecting（未 Connected），确定性构造「战斗未就绪」窗口供 skip 断言。
+        var battleAttempts = 0;
         var businessHooks = 0;
         var battleHooks = 0;
         var client = new AtlasClient(
@@ -100,7 +103,15 @@ public sealed class DualTest
                     return Task.CompletedTask;
                 },
             },
-            new ChannelConfig(ChannelKind.Battle, token => TcpTestTransport.ConnectAsync(battleServer.Port, token))
+            new ChannelConfig(ChannelKind.Battle, token =>
+            {
+                var n = Interlocked.Increment(ref battleAttempts);
+                if (n == 1)
+                {
+                    return TcpTestTransport.ConnectAsync(battleServer.Port, token);
+                }
+                throw new NetworkException("战斗拨号失败");
+            })
             {
                 Options = FastOptions(),
                 ReconnectHook = () =>
@@ -114,12 +125,7 @@ public sealed class DualTest
         {
             await client.ConnectAsync(CancellationToken.None);
 
-            // 业务踢线（进入重连）+ 战斗踢线（战斗也断）。
-            await Assert.ThrowsAsync<NetworkException>(
-                () => client.Channel(ChannelKind.Business).InvokeRawAsync("kick", Array.Empty<byte>(), CancellationToken.None));
-
-            // 战斗也被踢——但等待业务重连时战斗可能已先恢复，为构造「战斗未就绪」
-            // 的确定性窗口，这里踢完业务立即踢战斗。
+            // 先踢战斗：战斗重连拨号持续失败 → 保持 Reconnecting（确定性未就绪）。
             var battleView = client.Channel(ChannelKind.Battle);
             try
             {
@@ -129,19 +135,28 @@ public sealed class DualTest
             {
                 // 预期：kick 触发断连，in-flight 失败。
             }
+            var battleDeadline = DateTime.UtcNow.AddSeconds(2);
+            while (client.Channel(ChannelKind.Battle).State == ClientState.Connected
+                && DateTime.UtcNow < battleDeadline)
+            {
+                await Task.Delay(10); // 等战斗进入 Reconnecting。
+            }
 
-            // 等待业务重连成功（业务钩子执行）。
+            // 再踢业务：业务重连成功 → settle 查战斗 State（Reconnecting≠Connected）
+            // → 链式跳过战斗钩子（确定性：战斗拨号持续失败，业务 settle 时战斗必未恢复）。
+            await Assert.ThrowsAsync<NetworkException>(
+                () => client.Channel(ChannelKind.Business).InvokeRawAsync("kick", Array.Empty<byte>(), CancellationToken.None));
+
             var deadline = DateTime.UtcNow.AddSeconds(3);
             while (Volatile.Read(ref businessHooks) < 1 && DateTime.UtcNow < deadline)
             {
                 await Task.Delay(10);
             }
             Assert.Equal(1, Volatile.Read(ref businessHooks));
-
-            // 业务重连成功是硬事实；战斗钩子是否被链式调用取决于时序（战斗可能
-            // 先于业务恢复 → 也会被链式调）。本用例核心断言：业务重连不因战斗未就绪
-            // 而失败——业务钩子执行即证明业务通道重连完成。
+            // skip 确定性断言：战斗未 Connected → 业务钩子不链式调战斗钩子。
+            Assert.Equal(0, Volatile.Read(ref battleHooks));
             Assert.Equal(ClientState.Connected, client.Channel(ChannelKind.Business).State);
+            Assert.Equal(ClientState.Reconnecting, client.Channel(ChannelKind.Battle).State);
         }
     }
 
@@ -198,6 +213,35 @@ public sealed class DualTest
             // 业务全程 Connected，未触发业务钩子（无重连）。
             Assert.Equal(0, Volatile.Read(ref businessHooks));
             Assert.Equal(ClientState.Connected, client.State);
+        }
+    }
+
+    // 拨号失败回滚：战斗通道拨号失败 → ConnectAsync 整体失败，已连业务通道被回滚
+    // 关闭（对齐 Go TestDialDualRollbackOnFailure；评审 M4-5 P2——此前无 C# 覆盖）。
+    [Fact]
+    public async Task ConnectAsync_BattleDialFails_RollsBackBusinessChannel()
+    {
+        await using var businessServer = new FakeServer();
+
+        var client = new AtlasClient(
+            new ChannelConfig(ChannelKind.Business, token => TcpTestTransport.ConnectAsync(businessServer.Port, token))
+            {
+                Options = FastOptions(),
+            },
+            new ChannelConfig(ChannelKind.Battle, _ => throw new NetworkException("战斗拨号失败"))
+            {
+                Options = FastOptions(),
+            });
+
+        await using (client)
+        {
+            await Assert.ThrowsAsync<NetworkException>(() => client.ConnectAsync(CancellationToken.None));
+
+            // 回滚后：业务通道已关闭（Disconnected），Invoke 立即失败。
+            Assert.Equal(ClientState.Disconnected, client.Channel(ChannelKind.Business).State);
+            await Assert.ThrowsAsync<NetworkException>(
+                () => client.Channel(ChannelKind.Business).InvokeRawAsync(
+                    "echo", Array.Empty<byte>(), CancellationToken.None));
         }
     }
 }

@@ -139,7 +139,12 @@ public sealed partial class Channel : IAsyncDisposable
 
     public async Task ConnectAsync(CancellationToken cancellationToken)
     {
-        await _connectLock.WaitAsync(cancellationToken);
+        // 拨号取消链：调用方取消 + 通道关闭（_closed）双路——CloseAsync 不等待
+        // _connectLock（否则 dial 永不返回时 Close 挂起，评审 M2-3 note）；此处
+        // linked token 使 Close 能即时中断 in-flight 拨号。
+        using var linked = CancellationTokenSource.CreateLinkedTokenSource(
+            cancellationToken, _closed.Token);
+        await _connectLock.WaitAsync(linked.Token);
         try
         {
             ThrowIfClosed();
@@ -149,7 +154,11 @@ public sealed partial class Channel : IAsyncDisposable
             }
 
             SetState(ClientState.Connecting);
-            var transport = await DialAsync(cancellationToken);
+            // 手动重连（autoReconnect=false 时连接死亡不会自动停旧代心跳）：先停
+            // 旧代心跳并等待其退出，避免与新代心跳并存双发（评审 M4-3 P3）。
+            CancelGeneration();
+            await AwaitHeartbeatTasksAsync();
+            var transport = await DialAsync(linked.Token);
             if (!InstallTransport(transport, out var epoch))
             {
                 await CloseTransportAsync(transport);
@@ -159,6 +168,16 @@ public sealed partial class Channel : IAsyncDisposable
             if (AfterTransportInstalled != null)
             {
                 await AfterTransportInstalled();
+            }
+            // 安装后置 Connected 前复查：Close 可能已并发执行（BeginClose 置
+            // _isClosed + 清 _transport）——此时不得置 Connected（对齐 M4-4
+            // zombie 语义：关闭后不得假活）。
+            lock (_gate)
+            {
+                if (_isClosed || _transport == null)
+                {
+                    throw new NetworkException("通道已关闭");
+                }
             }
             SetState(ClientState.Connected);
             // 读循环是该代的生命周期管理者：网络错误退出后自行驱动自动重连
@@ -174,49 +193,54 @@ public sealed partial class Channel : IAsyncDisposable
 
     public async Task CloseAsync()
     {
-        await _connectLock.WaitAsync();
-        (ITransport? transport, Task? readLoop) closing;
-        try
-        {
-            closing = BeginClose();
-            _closed.Cancel();
-            CancelGeneration(); // 停当前代心跳。
-        }
-        finally
-        {
-            _connectLock.Release();
-        }
+        // 不等待 _connectLock：dial 永不返回（如 TCP 连黑洞地址）时若先等锁则
+        // Close 挂起（评审 M2-3 note）。直接 BeginClose（锁内原子置 _isClosed +
+        // Disconnected + 清 transport）使 in-flight ConnectAsync 的 dial/安装路径
+        // 经 _closed 取消或复查 _isClosed 退出；随后清理本代资源。
+        var closing = BeginClose();
+        _closed.Cancel();
+        CancelGeneration(); // 停当前代心跳。
 
         FailAllInflight(new NetworkException("通道已关闭"));
         FailAllQueued();
-        if (closing.transport != null)
+        if (closing.Transport != null)
         {
-            await CloseTransportAsync(closing.transport);
+            await CloseTransportAsync(closing.Transport);
         }
-        if (closing.readLoop != null)
+        if (closing.ReadLoop != null)
         {
-            await IgnoreReadLoopAsync(closing.readLoop);
+            await IgnoreReadLoopAsync(closing.ReadLoop);
         }
-        if (_heartbeatTask != null)
+        await AwaitHeartbeatTasksAsync();
+    }
+
+    // AwaitHeartbeatTasksAsync 等待当前传输/会话心跳任务退出（关闭与换代路径共用）。
+    // 心跳 Task 在 _generationCts 取消后快速退出（Task.Delay 取消即时）；异常在
+    // 关闭/换代路径忽略（心跳退出异常不向上传播）。
+    private async Task AwaitHeartbeatTasksAsync()
+    {
+        var heartbeat = _heartbeatTask;
+        var sessionHeartbeat = _sessionHeartbeatTask;
+        if (heartbeat != null)
         {
             try
             {
-                await _heartbeatTask;
+                await heartbeat;
             }
             catch (Exception)
             {
-                // 心跳退出异常在关闭路径忽略。
+                // 心跳退出异常忽略。
             }
         }
-        if (_sessionHeartbeatTask != null)
+        if (sessionHeartbeat != null)
         {
             try
             {
-                await _sessionHeartbeatTask;
+                await sessionHeartbeat;
             }
             catch (Exception)
             {
-                // 会话心跳退出异常在关闭路径忽略。
+                // 会话心跳退出异常忽略。
             }
         }
     }

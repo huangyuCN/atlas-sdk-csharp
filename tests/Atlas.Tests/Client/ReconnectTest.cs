@@ -93,16 +93,39 @@ public sealed class ReconnectTest
     }
 
     [Fact]
-    public async Task FailFast_DoesNotQueue_FailsImmediately()
+    public async Task FailFast_DuringReconnect_DoesNotQueue_FailsImmediately()
     {
+        // 评审 M4-1 P2：原用例名不副实（只测 kick 断连）。此用例仿 Go
+        // TestFailFastDuringReconnect——构造 Reconnecting 窗口（kick + 拨号持续
+        // 失败）后调 failFast Invoke，断言立即失败（不排队等重连）。
+        var attempts = 0;
         await using var server = new FakeServer();
-        var channel = await StartChannelAsync(
-            token => TcpTestTransport.ConnectAsync(server.Port, token),
+        var channel = new Channel(
+            token =>
+            {
+                var n = Interlocked.Increment(ref attempts);
+                if (n == 1)
+                {
+                    return TcpTestTransport.ConnectAsync(server.Port, token);
+                }
+                throw new NetworkException("拨号失败");
+            },
             FastReconnectOptions());
         await using (channel)
         {
+            await channel.ConnectAsync(CancellationToken.None);
+
             await Assert.ThrowsAsync<NetworkException>(
                 () => channel.InvokeRawAsync("kick", Array.Empty<byte>(), CancellationToken.None));
+            await WaitForStateAsync(channel, ClientState.Reconnecting);
+
+            // failFast：不排队，立即失败（NetworkException）。计时证明 <150ms 即返回
+            //（若误排队会挂起重连直到拨号恢复）。
+            var sw = System.Diagnostics.Stopwatch.StartNew();
+            await Assert.ThrowsAsync<NetworkException>(
+                () => channel.InvokeRawFailFastAsync("echo", new byte[] { 1 }, CancellationToken.None));
+            sw.Stop();
+            Assert.True(sw.ElapsedMilliseconds < 150, $"failFast 应立即失败，实际 {sw.ElapsedMilliseconds}ms");
         }
     }
 
@@ -237,5 +260,41 @@ public sealed class ReconnectTest
             await Task.Delay(10);
         }
         Assert.Fail($"等待心跳 {count} 次超时：当前 {server.PingCount}");
+    }
+
+    [Fact]
+    public async Task ManualReconnect_AfterKill_StopsOldGenerationAndConnects()
+    {
+        // 评审 M4-3 P3：autoReconnect=false 时 kick 断连不自动重连，旧代心跳在失败
+        // 计数达阈值前短暂存续；手动 ConnectAsync 须先停旧代（CancelGeneration +
+        // await 旧任务）再建新连——否则旧心跳与新代并存（M2-3 note）。本用例验证
+        // 手动重连路径停旧代后正常建连。
+        await using var server = new FakeServer();
+        var options = FastReconnectOptions();
+        options.AutoReconnect = false;
+        options.HeartbeatIntervalMs = 15;
+        var channel = new Channel(
+            token => TcpTestTransport.ConnectAsync(server.Port, token),
+            options);
+        await using (channel)
+        {
+            await channel.ConnectAsync(CancellationToken.None);
+            await WaitForPingCountAsync(server, 1);
+
+            // kick 断开：autoReconnect=false → readLoop 退出置 Disconnected，不重连。
+            await Assert.ThrowsAsync<NetworkException>(
+                () => channel.InvokeRawAsync("kick", Array.Empty<byte>(), CancellationToken.None));
+            await WaitForStateAsync(channel, ClientState.Disconnected);
+
+            // 手动重连：停旧代 + 建新连。
+            await channel.ConnectAsync(CancellationToken.None);
+            Assert.Equal(ClientState.Connected, channel.State);
+
+            // 新连接健康：Invoke 往返成功，新代心跳继续。
+            var resp = await channel.InvokeRawAsync("echo", new byte[] { 7 }, CancellationToken.None);
+            Assert.Equal(new byte[] { 7 }, resp);
+            await WaitForPingCountAsync(server, 2);
+            Assert.True(server.AcceptedConnections >= 2, "手动重连应建立新连接");
+        }
     }
 }

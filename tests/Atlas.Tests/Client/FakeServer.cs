@@ -21,6 +21,9 @@ internal sealed class FakeServer : IAsyncDisposable
     private readonly ConcurrentQueue<uint> _sequences = new();
     private readonly ConcurrentQueue<string> _operations = new();
     private readonly object _pushGate = new();
+    private readonly SemaphoreSlim _writeLock = new(1, 1); // 连接写串行化（评审 M2-4 P2：
+    // PushNotifyAsync 与 ServeAsync 可并发写同 stream——.NET NetworkStream 并发写无
+    // 原子性保证，共用写锁消除字节交错）。
     private Stream? _stream;
     private Task? _serveTask;
     private int _accepted;
@@ -85,7 +88,15 @@ internal sealed class FakeServer : IAsyncDisposable
         var stream = await WaitForStreamAsync();
         var body = Body.BuildRequestBody(operation, payload);
         var header = new Header { Type = MsgType.Notify, Version = FrameConst.Version, Seq = 1 };
-        await FrameIO.WriteFrameAsync(stream, header, body, FrameConst.MaxBodySize, _stop.Token);
+        await _writeLock.WaitAsync(_stop.Token);
+        try
+        {
+            await FrameIO.WriteFrameAsync(stream, header, body, FrameConst.MaxBodySize, _stop.Token);
+        }
+        finally
+        {
+            _writeLock.Release();
+        }
     }
 
     // WaitForStreamAsync 等待服务端 accept 并保存连接流（PushNotify 前置）。
@@ -212,21 +223,29 @@ internal sealed class FakeServer : IAsyncDisposable
         }
     }
 
-    private static async Task WriteReplyAsync(Stream stream, uint sequence, byte version, byte[] payload, CancellationToken token)
+    private async Task WriteReplyAsync(Stream stream, uint sequence, byte version, byte[] payload, CancellationToken token)
     {
         var reply = new byte[5 + payload.Length];
         reply[0] = 0;
         WriteUInt32(reply, 1, (uint)payload.Length);
         Array.Copy(payload, 0, reply, 5, payload.Length);
         var header = new Header { Type = MsgType.Response, Version = version, Seq = sequence };
-        await FrameIO.WriteFrameAsync(stream, header, reply, FrameConst.MaxBodySize, token);
+        await _writeLock.WaitAsync(token);
+        try
+        {
+            await FrameIO.WriteFrameAsync(stream, header, reply, FrameConst.MaxBodySize, token);
+        }
+        finally
+        {
+            _writeLock.Release();
+        }
     }
 
     // WriteBusinessErrorReplyAsync 回业务拒绝包络：
     // [1][statusLen:u32][Status wire][dataLen:u32][data]
     // Status 含 code=1（int32 varint）与 message=3（string），reason 空——
     // 对齐 Go testStatus(500, "", "engine: not registered") 形态。
-    private static async Task WriteBusinessErrorReplyAsync(
+    private async Task WriteBusinessErrorReplyAsync(
         Stream stream, uint sequence, byte version, CancellationToken token)
     {
         // Status wire：field1=code(500) varint + field3=message(string)。
@@ -244,7 +263,15 @@ internal sealed class FakeServer : IAsyncDisposable
         status.CopyTo(reply, 5);
         WriteUInt32(reply, 5 + status.Count, 0); // dataLen=0
         var header = new Header { Type = MsgType.Response, Version = version, Seq = sequence };
-        await FrameIO.WriteFrameAsync(stream, header, reply, FrameConst.MaxBodySize, token);
+        await _writeLock.WaitAsync(token);
+        try
+        {
+            await FrameIO.WriteFrameAsync(stream, header, reply, FrameConst.MaxBodySize, token);
+        }
+        finally
+        {
+            _writeLock.Release();
+        }
     }
 
     private static TaskCompletionSource<bool> NewSignal()

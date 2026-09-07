@@ -236,7 +236,16 @@ public sealed partial class Channel
                 var (header, body) = await transport.ReadFrameAsync(
                     _options.MaxBodySize,
                     _closed.Token);
-                await DispatchFrameAsync(epoch, header, body);
+                // 快路径：无测试钩子时同步分发（避免每帧 async 状态机分配，评审
+                // M2-3 note——帧率敏感）；有钩子（仅测试）才走 async 包装。
+                if (BeforeInflightCompletion == null)
+                {
+                    DispatchFrame(epoch, header, body);
+                }
+                else
+                {
+                    await DispatchFrameAsync(epoch, header, body);
+                }
             }
             cause = new NetworkException("通道已关闭");
         }
@@ -282,10 +291,34 @@ public sealed partial class Channel
 
     private async Task DispatchFrameAsync(uint epoch, Header header, byte[] body)
     {
+        var (inflight, reply) = DispatchFrameCore(epoch, header, body);
+        if (inflight == null)
+        {
+            return;
+        }
+        // 测试钩子：在「已取 key、未设结果」窗口暂停（制造超时/响应竞态窗口）。
+        await BeforeInflightCompletion!();
+        inflight.Completion.TrySetResult(reply!);
+    }
+
+    // DispatchFrame 同步分发（生产快路径，无测试钩子时零 async 状态机分配，评审
+    // M2-3 note——帧率敏感热路径）。
+    private void DispatchFrame(uint epoch, Header header, byte[] body)
+    {
+        var (inflight, reply) = DispatchFrameCore(epoch, header, body);
+        if (inflight != null)
+        {
+            inflight.Completion.TrySetResult(reply!);
+        }
+    }
+
+    private (Inflight? Inflight, ReplyData? Reply) DispatchFrameCore(
+        uint epoch, Header header, byte[] body)
+    {
         if (header.Type == MsgType.Notify)
         {
             DispatchNotify(body);
-            return;
+            return (null, null);
         }
         if (header.Type != MsgType.Response)
         {
@@ -298,16 +331,7 @@ public sealed partial class Channel
 
         var reply = Reply.DecodeReply(body);
         var key = new InflightKey(epoch, header.Seq);
-        var inflight = TakeInflight(key);
-        if (inflight == null)
-        {
-            return;
-        }
-        if (BeforeInflightCompletion != null)
-        {
-            await BeforeInflightCompletion();
-        }
-        inflight.Completion.TrySetResult(reply);
+        return (TakeInflight(key), reply);
     }
 
     private Inflight? TakeInflight(InflightKey key)

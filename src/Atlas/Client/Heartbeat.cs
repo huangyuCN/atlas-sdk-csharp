@@ -49,6 +49,12 @@ public sealed partial class Channel
             {
                 return;
             }
+            // 评审 M4-2 note：ProtocolException（协议致命）也经此分支计入失败。真实
+            // 场景中协议致命已先使 readLoop 因 ProtocolException 退出（terminate 不
+            // 重连，连接被关）——心跳随后在此分支计失败并 CloseGenerationTransportAsync
+            // 按代核对，连接已关故无害；无双路径触发重连（重连仅由 readLoop 的
+            // shouldReconnect 驱动，协议致命时不为 true）。此处计数保留作网络类
+            //（超时/写失败）死链判定用。
             catch (AtlasException)
             {
                 failures++;
