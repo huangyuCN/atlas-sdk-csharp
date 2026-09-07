@@ -1,0 +1,12 @@
+{
+  "name": "com.huangyucn.atlas",
+  "version": "0.1.0",
+  "displayName": "Atlas SDK",
+  "description": "Atlas 帧协议 C# 客户端 SDK（Unity 优先）：四通道 + dual + 双层心跳 + 重连 + protojson/protobuf",
+  "unity": "6000.0",
+  "keywords": ["atlas", "networking", "frame", "game", "realtime"],
+  "license": "Apache-2.0",
+  "documentationUrl": "https://github.com/huangyuCN/atlas-sdk-csharp",
+  "changelogUrl": "https://github.com/huangyuCN/atlas-sdk-csharp/releases",
+  "author": { "name": "huangyuCN", "url": "https://github.com/huangyuCN" }
+}

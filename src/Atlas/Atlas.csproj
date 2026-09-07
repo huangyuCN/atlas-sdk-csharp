@@ -3,6 +3,14 @@
     <TargetFramework>netstandard2.1</TargetFramework>
     <RootNamespace>Atlas</RootNamespace>
     <AssemblyName>Atlas</AssemblyName>
+    <!-- NuGet 发布元数据：Atlas.Sdk 包（Unity 优先的帧协议客户端）。 -->
+    <PackageId>Atlas.Sdk</PackageId>
+    <Version>0.1.0</Version>
+    <Description>Atlas 帧协议 C# 客户端 SDK（Unity 优先）：四通道 + dual + 双层心跳 + 重连 + 三编码</Description>
+    <Authors>huangyuCN</Authors>
+    <PackageLicenseExpression>Apache-2.0</PackageLicenseExpression>
+    <PackageTags>atlas;frame;game;unity;client;realtime</PackageTags>
+    <RepositoryUrl>https://github.com/huangyuCN/atlas-sdk-csharp</RepositoryUrl>
   </PropertyGroup>
   <ItemGroup>
     <PackageReference Include="Google.Protobuf" Version="3.27.1" />

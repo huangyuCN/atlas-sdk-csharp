@@ -1,0 +1,50 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
+
+      # golden vectors 由主仓生成（transport/frame -update），本仓消费同一份
+      # manifest + 向量——协议一致性锚点（规范 §8.1）。检出到 ../atlas 供
+      # ATLAS_GOLDEN_DIR 定位。
+      - name: Checkout atlas (golden vectors)
+        run: git clone --depth 1 --branch main https://github.com/huangyuCN/atlas.git ../atlas
+
+      - name: Set up .NET
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: '8.0.x'
+
+      # DTO 打样产物（examples/Smoke/Proto/gen/Auth.cs）由 protoc-gen-csharp
+      # 生成，已提交入库；protoc 仍用于重生成验证（脚本 gen-dto.sh）。
+      - name: Install protoc
+        run: |
+          PROTOC_VERSION=26.1
+          curl -fsSL -o /tmp/protoc.zip \
+            "https://github.com/protocolbuffers/protobuf/releases/download/v${PROTOC_VERSION}/protoc-${PROTOC_VERSION}-linux-x86_64.zip"
+          sudo unzip -o /tmp/protoc.zip -d /usr/local
+          sudo chmod +x /usr/local/bin/protoc
+          protoc --version
+
+      - name: Restore
+        run: dotnet restore Atlas.sln
+
+      - name: Test (golden vectors)
+        env:
+          ATLAS_GOLDEN_DIR: ${{ github.workspace }}/../atlas/testdata/golden
+        run: dotnet test Atlas.sln --no-restore
+
+      - name: Format check
+        run: dotnet format Atlas.sln --verify-no-changes --no-restore

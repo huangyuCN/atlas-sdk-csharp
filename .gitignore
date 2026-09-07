@@ -10,7 +10,8 @@ obj/
 
 # NuGet
 *.nupkg
-packages/
+packages/*
+!packages/com.huangyucn.atlas/
 
 # 测试产物
 TestResults/

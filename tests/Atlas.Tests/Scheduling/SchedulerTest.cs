@@ -38,6 +38,16 @@ internal sealed class CapturingContext : SynchronizationContext
 
 // AtlasScheduler 与 AtlasUnity 桥的调度注入验证（对齐设计文档 §6.2：
 // handler 默认线程池、注入 SynchronizationContext 后在注入上下文执行）。
+
+// 本集合禁用并行：AtlasScheduler 是进程级静态调度器，测试注入自定义上下文期间
+// 若其它并行测试类的 Notify handler 被 Post 到无人 Drain 的 CapturingContext，会
+// 永不执行导致信号超时——串行隔离消除互扰 flake（M5-1 评审 P2）。
+[CollectionDefinition("scheduler", DisableParallelization = true)]
+public sealed class SchedulerCollection
+{
+}
+
+[Collection("scheduler")]
 public sealed class SchedulerTest
 {
     // 默认调度走线程池：回调不在调用线程同步执行。
