@@ -15,7 +15,10 @@ mkdir -p "$PLUGINS"
 dotnet publish src/Atlas.Unity/Atlas.Unity.csproj -c Release -o /tmp/atlas-upm-pub --no-restore >/dev/null
 
 # 保留清单：自研两库 + 第三方运行时依赖（Unity 6 内置其余 System.*）。
-KEEP='^Atlas\.dll$|^Atlas\.Unity\.dll$|^Google\.Protobuf\.dll$|^KcpSharp\.dll$|^Microsoft\.Bcl\.AsyncInterfaces\.dll$|^System\.Threading\.Tasks\.Extensions\.dll$'
+# Microsoft.Bcl.HashCode 是 KcpSharp(netstandard2.0) 的独立依赖程序集，非
+# Unity 内置 System.HashCode 类型，必须随包（评审 M5-2-P1：遗漏则 Unity 加载
+# KcpSharp 时 FileNotFoundException）。
+KEEP='^Atlas\.dll$|^Atlas\.Unity\.dll$|^Google\.Protobuf\.dll$|^KcpSharp\.dll$|^Microsoft\.Bcl\.AsyncInterfaces\.dll$|^Microsoft\.Bcl\.HashCode\.dll$|^System\.Threading\.Tasks\.Extensions\.dll$'
 
 copied=0
 for f in /tmp/atlas-upm-pub/*.dll; do

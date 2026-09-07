@@ -6,6 +6,9 @@
     <!-- 适配薄层零 UnityEngine 编译依赖：纯 API 层，Unity 主线程同步上下文由
          宿主（Unity 侧代码）在运行时注入——不引用 UnityEngine 程序集，
          保证可在纯 .NET 工具链编译、单测可跑。 -->
+    <!-- Unity 专属薄层不进 NuGet（走 UPM 分发）；防呆：dotnet pack Atlas.sln
+         不产出无元数据的 Atlas.Unity 包。 -->
+    <IsPackable>false</IsPackable>
   </PropertyGroup>
   <ItemGroup>
     <ProjectReference Include="../Atlas/Atlas.csproj" />

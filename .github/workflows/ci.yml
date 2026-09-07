@@ -28,7 +28,8 @@ jobs:
           dotnet-version: '8.0.x'
 
       # DTO 打样产物（examples/Smoke/Proto/gen/Auth.cs）由 protoc-gen-csharp
-      # 生成，已提交入库；protoc 仍用于重生成验证（脚本 gen-dto.sh）。
+      # 生成，已提交入库；重生成验证——产物与 proto 不一致即 CI 失败（防止
+      # 手改产物或 proto 漂移）。
       - name: Install protoc
         run: |
           PROTOC_VERSION=26.1
@@ -37,6 +38,11 @@ jobs:
           sudo unzip -o /tmp/protoc.zip -d /usr/local
           sudo chmod +x /usr/local/bin/protoc
           protoc --version
+
+      - name: Verify DTO regenerated
+        run: |
+          bash scripts/gen-dto.sh
+          git diff --exit-code examples/Smoke/Proto/gen
 
       - name: Restore
         run: dotnet restore Atlas.sln

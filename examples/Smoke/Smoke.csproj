@@ -13,6 +13,8 @@
     <TargetFramework>net8.0</TargetFramework>
     <ImplicitUsings>enable</ImplicitUsings>
     <Nullable>enable</Nullable>
+    <!-- 示例工程不产出 NuGet 包（防呆：dotnet pack Atlas.sln 不生成 Smoke 包）。 -->
+    <IsPackable>false</IsPackable>
   </PropertyGroup>
 
 </Project>
