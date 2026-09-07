@@ -17,10 +17,28 @@ jobs:
           fetch-depth: 0
 
       # golden vectors 由主仓生成（transport/frame -update），本仓消费同一份
-      # manifest + 向量——协议一致性锚点（规范 §8.1）。检出到 ../atlas 供
-      # ATLAS_GOLDEN_DIR 定位。
+      # manifest + 向量——协议一致性锚点（规范 §8.1）。atlas 为私有仓：检出用
+      # 只读 PAT（fine-grained，仅授 atlas 仓 Contents:Read），经
+      # secrets.ATLAS_CI_TOKEN 注入（对齐 sdk-go/sdk-ts CI）；未配置时守卫步骤
+      # 给出配置指引后失败。
+      - name: 校验向量源仓访问凭证
+        env:
+          TOKEN_SET: ${{ secrets.ATLAS_CI_TOKEN != '' }}
+        run: |
+          if [ "$TOKEN_SET" != "true" ]; then
+            echo "::error::缺少 secrets.ATLAS_CI_TOKEN（只读 PAT，授 atlas 仓 Contents:Read）。"
+            echo "配置指引：GitHub 仓 Settings → Secrets and variables → Actions →"
+            echo "New repository secret → 名称 ATLAS_CI_TOKEN → 值 PAT。"
+            exit 1
+          fi
+
       - name: Checkout atlas (golden vectors)
-        run: git clone --depth 1 --branch main https://github.com/huangyuCN/atlas.git ../atlas
+        uses: actions/checkout@v5
+        with:
+          repository: huangyuCN/atlas
+          ref: feat/actor
+          path: atlas
+          token: ${{ secrets.ATLAS_CI_TOKEN }}
 
       - name: Set up .NET
         uses: actions/setup-dotnet@v4
@@ -49,7 +67,7 @@ jobs:
 
       - name: Test (golden vectors)
         env:
-          ATLAS_GOLDEN_DIR: ${{ github.workspace }}/../atlas/testdata/golden
+          ATLAS_GOLDEN_DIR: ${{ github.workspace }}/atlas/testdata/golden
         run: dotnet test Atlas.sln --no-restore
 
       - name: Format check
