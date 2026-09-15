@@ -130,6 +130,7 @@ public sealed class TransportTest
 
 // WsEchoServer：HttpListener 承载的本地 WS echo 服务端——收到消息回同样字节
 // 的 Response 帧（测试宿主专用，验证「一条消息 = 一个完整帧」的 WS 边界语义）。
+// 端口动态探测空闲（先监听再关闭取得端口号），避免多服务环境固定端口冲突。
 internal sealed class WsEchoServer : IAsyncDisposable
 {
     private readonly HttpListener _listener = new();
@@ -138,9 +139,15 @@ internal sealed class WsEchoServer : IAsyncDisposable
 
     public WsEchoServer()
     {
-        _listener.Prefixes.Add("http://127.0.0.1:18080/");
+        int port;
+        using (var probe = new TcpListener(IPAddress.Loopback, 0))
+        {
+            probe.Start();
+            port = ((IPEndPoint)probe.LocalEndpoint).Port;
+        } // 显式块作用域：probe 释放后才允许 HttpListener 绑定同端口。
+        _listener.Prefixes.Add($"http://127.0.0.1:{port}/");
         _listener.Start();
-        _url = "ws://127.0.0.1:18080/";
+        _url = $"ws://127.0.0.1:{port}/";
         _serveTask = Task.Run(ServeAsync);
     }
 

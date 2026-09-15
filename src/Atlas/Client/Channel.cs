@@ -18,6 +18,10 @@ public sealed partial class Channel : IAsyncDisposable
 {
     private readonly Func<CancellationToken, Task<ITransport>> _dial;
     private readonly ChannelOptions _options;
+    // 帧级会话槽开关：无连接传输（UDP/KCP）为 true——请求帧凭据非空时置位
+    // FrameConst.FlagSession 携带会话槽；长连接（TCP/WS）为 false，身份按连接绑定
+    //（对齐 Go channel.frameSessionSlot：按传输类型推导）。
+    private readonly bool _frameSessionSlot;
     private readonly object _gate = new();
     private readonly SemaphoreSlim _connectLock = new(1, 1);
     private readonly SemaphoreSlim _writeLock = new(1, 1);
@@ -78,6 +82,8 @@ public sealed partial class Channel : IAsyncDisposable
     }
 
     // Channel 构造：kind 标定通道角色（业务/战斗；dual 编排用，M4-5）。
+    // OnRelogin 默认取 options.OnReconnected（Session 对象经 ChannelOptions 装配的
+    // 自动恢复钩子）；调用方/AtlasClient 随后显式赋值时覆盖。
     public Channel(
         ChannelKind kind,
         Func<CancellationToken, Task<ITransport>> dial,
@@ -87,6 +93,9 @@ public sealed partial class Channel : IAsyncDisposable
         _dial = dial ?? throw new ArgumentNullException(nameof(dial));
         _options = options ?? throw new ArgumentNullException(nameof(options));
         ValidateOptions(_options);
+        _frameSessionSlot = _options.TransportKind == TransportKind.Udp
+            || _options.TransportKind == TransportKind.Kcp;
+        OnRelogin = _options.OnReconnected;
     }
 
     // Kind 是本通道角色（dual 形态区分业务/战斗；会话心跳仅业务通道生效的门控依据）。

@@ -70,7 +70,9 @@ public sealed class AtlasClient : IAsyncDisposable
             }
             var channel = new Channel(config.Kind, config.Dial, config.Options)
             {
-                OnRelogin = config.ReconnectHook,
+                // 钩子优先级：ChannelConfig.ReconnectHook 显式配置时覆盖通道 Options
+                //（如 Session 经 Options.OnReconnected 装配的自动恢复钩子）。
+                OnRelogin = config.ReconnectHook ?? config.Options.OnReconnected,
             };
             _channels[config.Kind] = channel;
         }

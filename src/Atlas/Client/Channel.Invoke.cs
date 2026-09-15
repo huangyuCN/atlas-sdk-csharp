@@ -100,11 +100,11 @@ public sealed partial class Channel
         byte[]? payload,
         CancellationToken cancellationToken)
     {
-        var body = Body.BuildRequestBody(operation, payload);
+        var (header, body) = BuildRequestFrame(operation, payload);
         var request = RegisterInflight();
         try
         {
-            await WriteRequestAsync(request, body, cancellationToken);
+            await WriteRequestAsync(request, header, body, cancellationToken);
             var reply = await AwaitReplyAsync(request, cancellationToken);
             return ToPayload(reply);
         }
@@ -113,6 +113,29 @@ public sealed partial class Channel
             RemoveInflight(request.Key, request.Inflight);
             throw;
         }
+    }
+
+    // BuildRequestFrame 组请求帧（header + body）：帧级会话槽开启（UDP/KCP）且
+    // 凭据提供者就绪时，凭据非空则置位 FrameConst.FlagSession 并以带槽布局封装
+    //（[opLen][op][sessionLen][session][payload]）；凭据为空发匿名帧（旧布局、
+    // 不置位）；长连接（TCP/WS）恒走旧布局（对齐 Go invokeOnce 组帧）。
+    private (Header Header, byte[] Body) BuildRequestFrame(string operation, byte[]? payload)
+    {
+        var header = new Header
+        {
+            Type = MsgType.Request,
+            Version = (byte)_options.Serializer.Version,
+        };
+        if (_frameSessionSlot && _options.SessionTokenProvider != null)
+        {
+            var token = _options.SessionTokenProvider();
+            if (!string.IsNullOrEmpty(token))
+            {
+                header.Flags = FrameConst.FlagSession;
+                return (header, Body.BuildRequestBodyWithSession(operation, token, payload));
+            }
+        }
+        return (header, Body.BuildRequestBody(operation, payload));
     }
 
     private (InflightKey Key, Inflight Inflight, ITransport Transport) RegisterInflight()
@@ -143,6 +166,7 @@ public sealed partial class Channel
 
     private async Task WriteRequestAsync(
         (InflightKey Key, Inflight Inflight, ITransport Transport) request,
+        Header header,
         byte[] body,
         CancellationToken cancellationToken)
     {
@@ -151,12 +175,7 @@ public sealed partial class Channel
         {
             await _writeLock.WaitAsync(cancellationToken);
             acquired = true;
-            var header = new Header
-            {
-                Type = MsgType.Request,
-                Version = (byte)_options.Serializer.Version,
-                Seq = request.Key.Sequence,
-            };
+            header.Seq = request.Key.Sequence;
             await request.Transport.WriteFrameAsync(
                 header,
                 body,

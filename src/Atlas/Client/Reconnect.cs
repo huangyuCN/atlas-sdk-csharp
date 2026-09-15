@@ -459,11 +459,13 @@ public sealed partial class Channel
         }
         try
         {
-            var body = Body.BuildRequestBody(queued.Operation, queued.Payload);
+            // 组帧经 BuildRequestFrame：会话槽凭据在重发时点快照（新连接新凭据），
+            // 对齐 Go drainQueue → invokeOnce 的重发组帧语义。
+            var (header, body) = BuildRequestFrame(queued.Operation, queued.Payload);
             var request = RegisterInflight();
             try
             {
-                await WriteRequestAsync(request, body, CancellationToken.None);
+                await WriteRequestAsync(request, header, body, CancellationToken.None);
                 var reply = await AwaitReplyAsync(request, CancellationToken.None);
                 queued.Completion.TrySetResult(ToPayload(reply));
             }

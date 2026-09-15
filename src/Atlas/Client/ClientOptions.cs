@@ -1,8 +1,19 @@
 using System;
+using System.Threading.Tasks;
 using Atlas.Frame;
 using Atlas.Serialization;
 
 namespace Atlas.Client;
+
+// TransportKind 是通道传输类型（对标 Go client.Transport；零值 Tcp 对齐
+// Go 零值 TransportTCP）。帧会话槽仅在无连接传输（Udp/Kcp）的请求帧上启用。
+public enum TransportKind
+{
+    Tcp = 0,
+    Ws = 1,
+    Kcp = 2,
+    Udp = 3,
+}
 
 // SessionHeartbeatRequest 是一次会话心跳的请求描述（业务 Heartbeat 的 op + payload）。
 // payload 为 null 表示仅发 operation（空请求）；业务方在闭包内用同一 Serializer
@@ -53,4 +64,21 @@ public sealed class ChannelOptions
     // 表示本轮跳过（尚未登录无 token）。非空时与 SessionHeartbeatIntervalMs>0 共同
     // 启用会话心跳（对齐 Go WithSessionHeartbeat 的 interval>0 && opFactory!=nil）。
     public Func<SessionHeartbeatRequest>? SessionHeartbeatOpFactory { get; set; }
+
+    // TransportKind 声明本通道传输类型（拨号工厂不可自描述，由调用方声明）：
+    // 帧会话槽（SessionTokenProvider）仅对 Udp/Kcp（无连接）传输生效；Tcp/Ws
+    // 长连接按连接绑定身份、不携带会话槽（对齐 Go frameSessionSlot 推导）。
+    public TransportKind TransportKind { get; set; }
+
+    // SessionTokenProvider 是会话凭据提供者（Session 对象装配；业务层亦可自给）：
+    // 无连接传输（UDP/KCP）的请求帧据此自动携带会话槽（FrameConst.FlagSession），
+    // 服务端按凭据验证身份；长连接（TCP/WS）不携带。闭包返回空串表示当前无会话
+    //（匿名帧，如登录前的 Login 请求）（对齐 Go WithSessionTokenProvider）。
+    public Func<string>? SessionTokenProvider { get; set; }
+
+    // OnReconnected 是本通道重连成功后的会话钩子（对标 Go WithOnReconnected）：
+    // Session 对象经此装配断线自动恢复钩子；语义同 ChannelConfig.ReconnectHook
+    //（重连编排同步执行、hookBypass 直通窗口）。AtlasClient 装配层同时配置
+    // ChannelConfig.ReconnectHook 时以 ReconnectHook 为准（通道级覆盖）。
+    public Func<Task>? OnReconnected { get; set; }
 }
