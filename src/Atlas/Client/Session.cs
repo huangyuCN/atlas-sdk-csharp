@@ -172,7 +172,36 @@ public sealed class Session
         {
             throw new InvalidOperationException("session: 无会话凭据（未登录）");
         }
-        return await CallAsync(_options.Ops.Resume, TokenPayload(token), cancellationToken).ConfigureAwait(false);
+        return await CallAsync(
+            _options.Ops.Resume,
+            RestorePayload(token, PlayerId),
+            cancellationToken).ConfigureAwait(false);
+    }
+
+    // HeartbeatAsync 手动触发一次会话心跳并返回对时回执（无载荷：服务端按连接/
+    // 帧槽定位会话续租）；与内置定时心跳语义一致，未登录抛 InvalidOperationException。
+    public async Task<SessionHeartbeatReply> HeartbeatAsync(CancellationToken cancellationToken)
+    {
+        if (Token.Length == 0)
+        {
+            throw new InvalidOperationException("session: 无会话凭据（未登录）");
+        }
+        var data = await InvokeRawSessionAsync(_options.Ops.Heartbeat, null, cancellationToken).ConfigureAwait(false);
+        return SessionHeartbeatReply.Parse(data);
+    }
+
+    // RestoreAsync 用外部凭据恢复会话（成功后凭据由 Session 保管）：凭据来自
+    // 上一代连接（如断线前快照），区别于 ResumeAsync（用保管中的凭据）。
+    public async Task<SessionReply> RestoreAsync(string token, string playerId, CancellationToken cancellationToken)
+    {
+        if (string.IsNullOrEmpty(token) || string.IsNullOrEmpty(playerId))
+        {
+            throw new InvalidOperationException("session: 恢复凭据与玩家 ID 不能为空");
+        }
+        return await CallAsync(
+            _options.Ops.Resume,
+            RestorePayload(token, playerId),
+            cancellationToken).ConfigureAwait(false);
     }
 
     // LogoutAsync 登出并清空本地凭据（无论请求成败都清空，对齐 Go Logout）。
@@ -229,12 +258,31 @@ public sealed class Session
     private async Task<SessionReply> InvokeSessionAsync(
         string operation, byte[]? payload, CancellationToken cancellationToken)
     {
-        var client = _client ?? throw new InvalidOperationException("session: 未绑定 Client");
-        var data = await client.InvokeRawAsync(operation, payload, cancellationToken).ConfigureAwait(false);
+        var data = await InvokeRawSessionAsync(operation, payload, cancellationToken).ConfigureAwait(false);
         return ParseReply(data);
     }
 
-    // TokenPayload 构造 Resume/Logout 请求体（protojson 形态 {"token":...}）。
+    // InvokeRawSessionAsync 委托业务通道 InvokeRawAsync 返回原始回执字节
+    //（心跳等非 SessionReply 形状回执使用）。
+    private Task<byte[]> InvokeRawSessionAsync(string operation, byte[]? payload, CancellationToken cancellationToken)
+    {
+        var client = _client ?? throw new InvalidOperationException("session: 未绑定 Client");
+        return client.InvokeRawAsync(operation, payload, cancellationToken);
+    }
+
+    // RestorePayload 构造 Resume 请求体（protojson 形态 {"token":...,"playerId":...}）。
+    private static byte[] RestorePayload(string token, string playerId)
+    {
+        var request = new Struct();
+        request.Fields.Add("token", Value.ForString(token));
+        if (playerId.Length > 0)
+        {
+            request.Fields.Add("playerId", Value.ForString(playerId));
+        }
+        return Encoding.UTF8.GetBytes(JsonFormatter.Default.Format(request));
+    }
+
+    // TokenPayload 构造 Logout 请求体（protojson 形态 {"token":...}）。
     private static byte[] TokenPayload(string token)
     {
         var request = new Struct();
@@ -279,5 +327,28 @@ public sealed class Session
             _token = "";
             _playerId = "";
         }
+    }
+}
+
+// SessionHeartbeatReply 是会话心跳回执（客户端对时用；int64 经 protojson 为
+// 字符串，对齐 Go client.SessionHeartbeatReply；命名避开业务 DTO 同名歧义）。
+public sealed class SessionHeartbeatReply
+{
+    public string? ServerTimeUnixMs { get; private set; }
+
+    // Parse 从回执 JSON 构造（Struct：任意键对象 + 值；空回执按零值）。
+    public static SessionHeartbeatReply Parse(byte[] data)
+    {
+        var reply = new SessionHeartbeatReply();
+        if (data.Length > 0)
+        {
+            var parsed = JsonParser.Default.Parse(Encoding.UTF8.GetString(data), Struct.Descriptor);
+            var fields = (Struct)parsed;
+            if (fields.Fields.TryGetValue("serverTimeUnixMs", out var v) && v.KindCase == Value.KindOneofCase.StringValue)
+            {
+                reply.ServerTimeUnixMs = v.StringValue;
+            }
+        }
+        return reply;
     }
 }
