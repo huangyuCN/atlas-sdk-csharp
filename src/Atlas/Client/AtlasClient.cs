@@ -44,7 +44,7 @@ public sealed class ChannelConfig
 //（停心跳/重连、断开连接、取消全部 in-flight 与排队请求——幂等、无死锁）。
 // 聚合状态向下降级（任一通道取最劣 Connected < Reconnecting < Disconnected，
 // 规范 §5.1）；细粒度用 Channel(kind).State()。
-public sealed class AtlasClient : IAsyncDisposable
+public sealed class AtlasClient : IAsyncDisposable, IAtlasInvoker
 {
     private readonly Dictionary<ChannelKind, Channel> _channels = new();
     private readonly Channel _business;
