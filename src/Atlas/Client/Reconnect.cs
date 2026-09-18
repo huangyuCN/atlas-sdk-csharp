@@ -17,17 +17,20 @@ internal sealed class QueuedInvoke
         string operation,
         byte[]? payload,
         TaskCompletionSource<byte[]> completion,
-        DateTime deadline)
+        DateTime deadline,
+        string? requestID = null)
     {
         Operation = operation;
         Payload = payload;
         Completion = completion;
         Deadline = deadline;
+        RequestID = requestID;
     }
 
-    public string Operation { get; }
+        public string Operation { get; }
 
-    public byte[]? Payload { get; }
+    // RequestID 是幂等键：drain 重发复用同一 ID（服务端去重窗口内不重复执行）。
+    public string? RequestID { get; }  public byte[]? Payload { get; }
 
     // 完成源：drain 重发成功后置结果；关闭时置 NetworkException。
     public TaskCompletionSource<byte[]> Completion { get; }
@@ -461,7 +464,7 @@ public sealed partial class Channel
         {
             // 组帧经 BuildRequestFrame：会话槽凭据在重发时点快照（新连接新凭据），
             // 对齐 Go drainQueue → invokeOnce 的重发组帧语义。
-            var (header, body) = BuildRequestFrame(queued.Operation, queued.Payload);
+            var (header, body) = BuildRequestFrame(queued.Operation, queued.Payload, queued.RequestID);
             var request = RegisterInflight();
             try
             {

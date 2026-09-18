@@ -10,6 +10,17 @@ using AtlasTimeoutException = Atlas.Errors.TimeoutException;
 
 namespace Atlas.Client;
 
+// InvokeOptions 是调用级选项（逃生门）：显式幂等键 / 本次不携带。
+// 等级日志的调用面在 ClientOptions.Logger（客户端级，对齐 Go WithLog* Option）。
+public sealed class InvokeOptions
+{
+    // IdempotencyKey 显式指定幂等键（覆盖自动生成；按业务实体幂等，如以订单号为键）。
+    public string? IdempotencyKey { get; set; }
+
+    // NoIdempotency 使本次调用不携带幂等键（逃生门：高频无副作用调用省去 ID）。
+    public bool NoIdempotency { get; set; }
+}
+
 public sealed partial class Channel
 {
     // InvokeRawAsync 发送原始 payload；payload 为 null 时只发送 operation，用于 Ping 等空请求。
@@ -18,6 +29,15 @@ public sealed partial class Channel
     public Task<byte[]> InvokeRawAsync(string operation, byte[]? payload, CancellationToken cancellationToken)
     {
         return InvokeRawCoreAsync(operation, payload, cancellationToken, failFast: false);
+    }
+
+    // InvokeRawAsync（带调用级选项）：显式幂等键或本次不携带（逃生门，对齐 Go/TS 的
+    // WithIdempotencyKey/WithNoIdempotency）。
+    public Task<byte[]> InvokeRawAsync(
+        string operation, byte[]? payload, InvokeOptions options, CancellationToken cancellationToken)
+    {
+        return InvokeRawCoreAsync(operation, payload, cancellationToken, failFast: false,
+            idempotencyKey: options?.IdempotencyKey, noIdempotency: options?.NoIdempotency ?? false);
     }
 
     // InvokeRawFailFastAsync 重连期间不排队、立即失败（对齐 Go WithFailFast）。
@@ -30,8 +50,13 @@ public sealed partial class Channel
         string operation,
         byte[]? payload,
         CancellationToken cancellationToken,
-        bool failFast)
+        bool failFast,
+        string? idempotencyKey = null,
+        bool noIdempotency = false)
     {
+        // 幂等键在入口一次决定（重发/重试复用同一 ID；对齐 Go invoke 的入口决策）：
+        // 显式逃生门 noIdempotency 优先，显式 idempotencyKey 次之，缺省自动生成。
+        var requestID = noIdempotency ? null : idempotencyKey ?? NewRequestID();
         // 会话钩子同步执行期间（hookBypass，对齐 Go invoke.go）直通当前代连接：
         // 钩子的重登/重绑请求不排队（队列要等钩子成功后才 drain），传输心跳亦经此
         // 路径保活。已文档化的语义：该窗口内外部并发 Invoke 同样直写当前代连接（连接
@@ -39,7 +64,7 @@ public sealed partial class Channel
         // 无法按调用方区分钩子内外（对齐 Go 公开 API 约束下的既定取舍）。
         if (IsHookBypass())
         {
-            return await InvokeOnceAsync(operation, payload, cancellationToken);
+            return await InvokeOnceAsync(operation, payload, cancellationToken, requestID);
         }
         // 排队判定与入队在 _gate 临界区原子完成：drain 与入队互斥，
         // 不存在「drain 空队列后请求才入队」的永久遗留窗口（对齐 Go B4 修复）。
@@ -65,7 +90,8 @@ public sealed partial class Channel
                     payload,
                     new TaskCompletionSource<byte[]>(
                         TaskCreationOptions.RunContinuationsAsynchronously),
-                    deadline);
+                    deadline,
+                    requestID);
                 _queue.Enqueue(queued);
             }
         }
@@ -74,7 +100,7 @@ public sealed partial class Channel
             StartQueueDeadlineWatch(queued);
             return await queued.Completion.Task;
         }
-        return await InvokeOnceAsync(operation, payload, cancellationToken);
+        return await InvokeOnceAsync(operation, payload, cancellationToken, requestID);
     }
 
     // StartQueueDeadlineWatch 启动排队超时看护：到点后原子认领并发送超时结果
@@ -98,14 +124,17 @@ public sealed partial class Channel
     private async Task<byte[]> InvokeOnceAsync(
         string operation,
         byte[]? payload,
-        CancellationToken cancellationToken)
+        CancellationToken cancellationToken,
+        string? requestID = null)
     {
-        var (header, body) = BuildRequestFrame(operation, payload);
+        var (header, body) = BuildRequestFrame(operation, payload, requestID);
+        _logger.Debugf("send op={0} id={1} req={2}", operation, requestID ?? "", Snippet(payload));
         var request = RegisterInflight();
         try
         {
             await WriteRequestAsync(request, header, body, cancellationToken);
             var reply = await AwaitReplyAsync(request, cancellationToken);
+            _logger.Debugf("recv op={0} resp={1}", operation, Snippet(reply.Data));
             return ToPayload(reply);
         }
         catch
@@ -119,7 +148,7 @@ public sealed partial class Channel
     // 凭据提供者就绪时，凭据非空则置位 FrameConst.FlagSession 并以带槽布局封装
     //（[opLen][op][sessionLen][session][payload]）；凭据为空发匿名帧（旧布局、
     // 不置位）；长连接（TCP/WS）恒走旧布局（对齐 Go invokeOnce 组帧）。
-    private (Header Header, byte[] Body) BuildRequestFrame(string operation, byte[]? payload)
+    private (Header Header, byte[] Body) BuildRequestFrame(string operation, byte[]? payload, string? requestID)
     {
         var header = new Header
         {
@@ -132,10 +161,38 @@ public sealed partial class Channel
             if (!string.IsNullOrEmpty(token))
             {
                 header.Flags = FrameConst.FlagSession;
-                return (header, Body.BuildRequestBodyWithSession(operation, token, payload));
             }
         }
-        return (header, Body.BuildRequestBody(operation, payload));
+        if (!string.IsNullOrEmpty(requestID))
+        {
+            header.Flags |= FrameConst.FlagRequestID;
+        }
+        var slotToken = _frameSessionSlot && _options.SessionTokenProvider != null
+            ? _options.SessionTokenProvider()
+            : null;
+        return (header, Body.BuildRequestBodyFull(operation, slotToken, requestID, payload));
+    }
+
+    // Snippet 取 payload 调试摘要（Debug 日志用：完整 JSON 截断 512 字节，防日志爆炸）。
+    private static string Snippet(byte[]? data)
+    {
+        if (data == null || data.Length == 0)
+        {
+            return "{}";
+        }
+        var text = System.Text.Encoding.UTF8.GetString(data);
+        return text.Length > 512 ? text[..512] + "...(truncated)" : text;
+    }
+
+    // NewRequestID 生成请求幂等键（RNGCryptoServiceProvider 12 字节 base64url，无外部依赖）。
+    private static string NewRequestID()
+    {
+        var b = new byte[12];
+        using (var rng = System.Security.Cryptography.RandomNumberGenerator.Create())
+        {
+            rng.GetBytes(b);
+        }
+        return Convert.ToBase64String(b).TrimEnd('=').Replace('+', '-').Replace('/', '_');
     }
 
     private (InflightKey Key, Inflight Inflight, ITransport Transport) RegisterInflight()

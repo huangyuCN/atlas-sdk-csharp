@@ -52,6 +52,16 @@ public sealed class ChannelOptions
 
     public int HookTimeoutMs { get; set; } = 10_000;
 
+    // Logger 是调试日志实现（WithLog* 构造的 SDKLogger；null + LogSilence=false
+    // = 默认 Error 级 Console.Error；对齐 Go WithLog* Option）。
+    public SDKLogger? Logger { get; set; }
+
+    // LogSilence 完全静默（显式关闭默认 Error 输出；对齐 Go WithLogSilence）。
+    public bool LogSilence { get; set; }
+
+    // LogOut 输出目标委托（可空；WithLog 输出器内部经它可写自定义目标）。
+    public Action<string>? LogSink { get; set; }
+
     public int HeartbeatFailures { get; set; } = 3;
 
     // SessionHeartbeatIntervalMs 是会话心跳（业务续租）周期（毫秒）；≤0 表示关闭

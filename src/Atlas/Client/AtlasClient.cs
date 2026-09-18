@@ -147,6 +147,13 @@ public sealed class AtlasClient : IAsyncDisposable, IAtlasInvoker
         return _business.InvokeRawAsync(operation, payload, cancellationToken);
     }
 
+    // InvokeRawAsync（带调用级选项）：显式幂等键 / 本次不携带（逃生门）。
+    public Task<byte[]> InvokeRawAsync(
+        string operation, byte[]? payload, InvokeOptions options, CancellationToken cancellationToken)
+    {
+        return _business.InvokeRawAsync(operation, payload, options, cancellationToken);
+    }
+
     // On 订阅 Notify 帧（默认业务通道），返回退订句柄。
     public NotifySubscription On(string op, NotifyHandler handler)
     {

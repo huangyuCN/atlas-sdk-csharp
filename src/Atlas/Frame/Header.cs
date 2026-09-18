@@ -13,9 +13,16 @@ public static class FrameConst
     public const int MaxBodySize = 2 << 20;
     public const int MaxOperationLen = 4096;
     public const int MaxSessionLen = 256;
+    // MaxRequestIDLen 是请求幂等键的最大长度（与服务端引擎解析上限对齐）。
+    public const int MaxRequestIDLen = 128;
     // FlagSession 是帧头 flags 字节的 bit0：请求帧 body 携带会话槽（sessionLen +
     // session + payload）。仅无连接传输（UDP/KCP）的请求帧置位；长连接按连接绑定身份。
     public const byte FlagSession = 0x01;
+
+    // FlagRequestID 是帧头 flags 字节的 bit1：请求帧 body 携带请求幂等键段
+    //（requestIDLen + requestID，紧随会话槽之后、payload 之前）。客户端重试/
+    // 重发复用同一 ID；服务端按 atlas.route.v1 注解决定是否注入投递去重键。
+    public const byte FlagRequestID = 0x02;
 }
 
 public enum MsgType : byte
@@ -72,7 +79,7 @@ public struct Header
 
     // flagReservedMask 是未定义的保留位掩码（未知位即协议非法，前向保留位白名单；
     // 对齐 Go frame.flagReserved 0xFE）。
-    private const byte FlagReservedMask = 0xFE;
+    private const byte FlagReservedMask = 0xFC;
 
     // Check 按 Go Header.Check 的顺序校验 magic、seq、类型、版本白名单、flags
     // 未知位和长度；seq=0 对所有帧类型均非法，与 golden frame-bad-seq-zero 保持一致。

@@ -145,7 +145,7 @@ public sealed class BodySessionTest
 
     // Header_RejectsUnknownFlags 验证未知 flags 位被拒绝（前向保留位白名单）。
     [Theory]
-    [InlineData((byte)0x02)]
+    [InlineData((byte)0x04)]
     [InlineData((byte)0xFE)]
     [InlineData((byte)0xFF)]
     public void Header_UnknownFlags_ThrowsProtocol(byte flags)

@@ -104,7 +104,7 @@ internal sealed class SessionUdpServer : IAsyncDisposable
             string session;
             try
             {
-                (op, session, _) = Body.ParseRequestBodyWithSession(body, header.Flags);
+                (op, session, _, _) = Body.ParseRequestBodyFull(body, header.Flags);
             }
             catch (ProtocolException)
             {
@@ -378,7 +378,7 @@ internal sealed class SessionKcpServer : IAsyncDisposable
             string session;
             try
             {
-                (op, session, _) = Body.ParseRequestBodyWithSession(body, header.Flags);
+                (op, session, _, _) = Body.ParseRequestBodyFull(body, header.Flags);
             }
             catch (ProtocolException)
             {

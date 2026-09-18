@@ -22,6 +22,8 @@ public sealed partial class Channel : IAsyncDisposable
     // FrameConst.FlagSession 携带会话槽；长连接（TCP/WS）为 false，身份按连接绑定
     //（对齐 Go channel.frameSessionSlot：按传输类型推导）。
     private readonly bool _frameSessionSlot;
+    // _logger 是调试日志实现（默认 Error 级 stderr；LogSilence=静默哨兵）。
+    private readonly SDKLogger _logger;
     private readonly object _gate = new();
     private readonly SemaphoreSlim _connectLock = new(1, 1);
     private readonly SemaphoreSlim _writeLock = new(1, 1);
@@ -96,6 +98,10 @@ public sealed partial class Channel : IAsyncDisposable
         _frameSessionSlot = _options.TransportKind == TransportKind.Udp
             || _options.TransportKind == TransportKind.Kcp;
         OnRelogin = _options.OnReconnected;
+        // 默认 Error 级 stderr；显式 Silence（LogSilence）或注入 Logger 时按注入。
+        _logger = _options.LogSilence
+            ? SDKLoggerFactory.Silent()
+            : _options.Logger ?? SDKLoggerFactory.Of(LogLevel.Error, _options.LogSink);
     }
 
     // Kind 是本通道角色（dual 形态区分业务/战斗；会话心跳仅业务通道生效的门控依据）。

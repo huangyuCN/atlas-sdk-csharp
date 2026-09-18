@@ -203,7 +203,9 @@ internal sealed class MockGatewayServer : IAsyncDisposable
         while (!_stop.IsCancellationRequested)
         {
             var (header, body) = await FrameIO.ReadFrameAsync(stream, FrameConst.MaxBodySize, _stop.Token);
-            var (operation, payload) = Body.ParseRequestBody(body);
+            var (operation, _s, _rid, payload) = Body.ParseRequestBodyFull(body, header.Flags);
+            void discard1() { _ = (_s, _rid); }
+            discard1();
             _operations.Enqueue(operation);
             await HandleOperationAsync(stream, header, operation, payload);
         }

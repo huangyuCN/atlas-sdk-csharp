@@ -191,7 +191,9 @@ internal sealed class FakeServer : IAsyncDisposable
         while (!_stop.IsCancellationRequested)
         {
             var (header, body) = await FrameIO.ReadFrameAsync(stream, FrameConst.MaxBodySize, _stop.Token);
-            var (operation, payload) = Body.ParseRequestBody(body);
+            var (operation, _s, _rid, payload) = Body.ParseRequestBodyFull(body, header.Flags);
+            void discard1() { _ = (_s, _rid); }
+            discard1();
             _sequences.Enqueue(header.Seq);
             _operations.Enqueue(operation);
             if (operation == "hold")
