@@ -27,10 +27,12 @@ internal sealed class QueuedInvoke
         RequestID = requestID;
     }
 
-        public string Operation { get; }
+    public string Operation { get; }
+
+    public byte[]? Payload { get; }
 
     // RequestID 是幂等键：drain 重发复用同一 ID（服务端去重窗口内不重复执行）。
-    public string? RequestID { get; }  public byte[]? Payload { get; }
+    public string? RequestID { get; }
 
     // 完成源：drain 重发成功后置结果；关闭时置 NetworkException。
     public TaskCompletionSource<byte[]> Completion { get; }
