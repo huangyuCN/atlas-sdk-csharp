@@ -35,6 +35,9 @@ public static class ChannelDial
                 : new JsonSerializer(),
             HeartbeatIntervalMs = 0, // 冒烟用显式 Ping；后台心跳关 M4 编排
             InvokeTimeoutMs = 5_000,
+            // 冒烟定位即调试工具：Debug 级收发打点（请求/响应 JSON + 幂等键），
+            // 与服务端日志的 request_id 一一对应（三语言 SDK 行为对齐验证）。
+            Logger = SDKLoggerFactory.Of(LogLevel.Debug),
         };
 
         Channel channel;
