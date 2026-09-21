@@ -12,11 +12,13 @@ namespace Atlas.Smoke;
 // atlas-game-layout api/gateway/v1/auth.proto 对齐，去掉跨包引用）。
 public static class Ops
 {
-    public const string Register = "/gateway.v1.GatewayAuth/Register";
-    public const string Login = "/gateway.v1.GatewayAuth/Login";
-    public const string Heartbeat = "/gateway.v1.GatewayAuth/Heartbeat";
+    // op 与模板 api/gateway/v1（Session 服务）+ api/battle/v1（BattleService）
+    // 对齐（会话即身份重构后的统一契约）。
+    public const string Register = "/gateway.v1.Session/Register";
+    public const string Login = "/gateway.v1.Session/Login";
+    public const string Heartbeat = "/gateway.v1.Session/Heartbeat";
     public const string Ping = "/atlas.internal.Heartbeat/Ping";
-    public const string JoinBattle = "/gateway.v1.GatewayBattle/JoinBattle";
+    public const string JoinBattle = "/battle.v1.BattleService/JoinBattle";
 }
 
 // 载荷编码模式：json=protojson（ver=1）、protobuf=二进制（ver=2）。
