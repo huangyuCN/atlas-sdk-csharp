@@ -27,7 +27,7 @@ public sealed class TransportTest
             new ChannelOptions
             {
                 InvokeTimeoutMs = 500,
-                MaxBodySize = FrameConst.MaxBodySize,
+                MaxBodySize = FrameGen.MaxBodySize,
             });
         await channel.ConnectAsync(CancellationToken.None);
 
@@ -63,12 +63,12 @@ public sealed class TransportTest
         try
         {
             var body = Body.BuildRequestBody("echo", new byte[] { 9, 9 });
-            var header = new Header { Type = MsgType.Request, Version = FrameConst.Version, Seq = 1 };
-            await transport.WriteFrameAsync(header, body, FrameConst.MaxBodySize, CancellationToken.None);
+            var header = new Header { Type = MsgType.Request, Version = FrameGen.Version, Seq = 1 };
+            await transport.WriteFrameAsync(header, body, FrameGen.MaxBodySize, CancellationToken.None);
 
-            var (replyHeader, replyBody) = await transport.ReadFrameAsync(FrameConst.MaxBodySize, CancellationToken.None);
+            var (replyHeader, replyBody) = await transport.ReadFrameAsync(FrameGen.MaxBodySize, CancellationToken.None);
             Assert.Equal(MsgType.Response, replyHeader.Type);
-            Assert.Equal(FrameConst.Version, replyHeader.Version);
+            Assert.Equal(FrameGen.Version, replyHeader.Version);
             Assert.Equal((uint)1, replyHeader.Seq);
             var (operation, payload) = Body.ParseRequestBody(replyBody);
             Assert.Equal("echo", operation);
@@ -102,9 +102,9 @@ public sealed class TransportTest
             for (var i = 0; i < 8; i++)
             {
                 var seq = (uint)(i + 1);
-                var header = new Header { Type = MsgType.Request, Version = FrameConst.Version, Seq = seq };
+                var header = new Header { Type = MsgType.Request, Version = FrameGen.Version, Seq = seq };
                 var body = Body.BuildRequestBody("echo", new[] { (byte)i });
-                tasks.Add(transport.WriteFrameAsync(header, body, FrameConst.MaxBodySize, CancellationToken.None));
+                tasks.Add(transport.WriteFrameAsync(header, body, FrameGen.MaxBodySize, CancellationToken.None));
             }
             await Task.WhenAll(tasks); // 任一写抛 InvalidOperationException 即失败
 
@@ -113,7 +113,7 @@ public sealed class TransportTest
             for (var i = 0; i < 8; i++)
             {
                 var (replyHeader, replyBody) =
-                    await transport.ReadFrameAsync(FrameConst.MaxBodySize, CancellationToken.None);
+                    await transport.ReadFrameAsync(FrameGen.MaxBodySize, CancellationToken.None);
                 Assert.Equal(MsgType.Response, replyHeader.Type);
                 Assert.True(seen.Add(replyHeader.Seq), $"重复 seq {replyHeader.Seq}");
                 var (operation, payload) = Body.ParseRequestBody(replyBody);
@@ -186,19 +186,19 @@ internal sealed class WsEchoServer : IAsyncDisposable
 
                         // 收到的是完整帧（16B 头 + body）：帧头独立解码，body 切分后按
                         // Response 类型回写同帧（body 内仍为 request body，语义为 echo）。
-                        var headerBytes = new byte[FrameConst.HeaderSize];
+                        var headerBytes = new byte[FrameGen.HeaderSize];
                         Array.Copy(message, headerBytes, headerBytes.Length);
                         var header = Header.Decode(headerBytes);
-                        var body = new byte[message.Length - FrameConst.HeaderSize];
-                        Array.Copy(message, FrameConst.HeaderSize, body, 0, body.Length);
+                        var body = new byte[message.Length - FrameGen.HeaderSize];
+                        Array.Copy(message, FrameGen.HeaderSize, body, 0, body.Length);
                         var responseHeader = new Header
                         {
-                            Magic = FrameConst.Magic,
+                            Magic = FrameGen.Magic,
                             Version = header.Version,
                             Type = MsgType.Response,
                             Seq = header.Seq,
                         };
-                        var encoded = FrameIO.EncodeMessage(responseHeader, body, FrameConst.MaxBodySize);
+                        var encoded = FrameIO.EncodeMessage(responseHeader, body, FrameGen.MaxBodySize);
                         await socket.SendAsync(encoded, System.Net.WebSockets.WebSocketMessageType.Binary, true, CancellationToken.None);
                     }
                 }

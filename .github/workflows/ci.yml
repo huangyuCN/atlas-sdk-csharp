@@ -40,14 +40,30 @@ jobs:
           path: atlas
           token: ${{ secrets.ATLAS_CI_TOKEN }}
 
+      # 会话协议唯一来源是模板仓（R13）：descriptor set 从模板导出，帧常量与生成器
+      # 取自框架仓——「重生成无 diff」门禁需要三个检出（同一只读 PAT）。
+      - name: Checkout atlas-game-layout (会话协议来源)
+        uses: actions/checkout@v5
+        with:
+          repository: huangyuCN/atlas-game-layout
+          ref: main
+          path: atlas-game-layout
+          token: ${{ secrets.ATLAS_CI_TOKEN }}
+
+      - name: Set up Go (构建 protoc-gen-atlas-client)
+        uses: actions/setup-go@v5
+        with:
+          # 与框架仓 go.mod 的 go 指令同源（生成器构建版本不得低于框架要求）。
+          go-version-file: atlas/go.mod
+
       - name: Set up .NET
         uses: actions/setup-dotnet@v4
         with:
           dotnet-version: '8.0.x'
 
-      # DTO 打样产物（examples/Smoke/Proto/gen/Auth.cs）由 protoc-gen-csharp
-      # 生成，已提交入库；重生成验证——产物与 proto 不一致即 CI 失败（防止
-      # 手改产物或 proto 漂移）。
+      # 生成物（帧常量快照 + 会话 DTO/stub，含 src/Atlas/Frame/Gen/FrameGen.cs 与
+      # examples/Smoke/Proto/gen/**）全部已提交入库；重生成验证——产物与上游不一致
+      # 即 CI 失败（防手改产物或上游漂移）。
       - name: Install protoc
         run: |
           PROTOC_VERSION=26.1
@@ -58,9 +74,12 @@ jobs:
           protoc --version
 
       - name: Verify DTO regenerated
+        env:
+          ATLAS_DIR: ${{ github.workspace }}/atlas
+          ATLAS_LAYOUT_DIR: ${{ github.workspace }}/atlas-game-layout
         run: |
           bash scripts/gen-dto.sh
-          git diff --exit-code examples/Smoke/Proto/gen
+          git diff --exit-code src/Atlas/Frame/Gen examples/Smoke/Proto/gen
 
       - name: Restore
         run: dotnet restore Atlas.sln

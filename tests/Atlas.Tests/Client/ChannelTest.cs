@@ -45,6 +45,33 @@ public sealed class ChannelTest
         Assert.Equal(new byte[] { 2 }, response);
     }
 
+    // InvokeRawAsync_InvokeOptions_PassThroughIdempotencyKey 验证调用级选项透传
+    //（C.5：幂等键进请求帧的 requestID 段；NoIdempotency 逃生门不携带）。
+    [Fact]
+    public async Task InvokeRawAsync_InvokeOptions_PassThroughIdempotencyKey()
+    {
+        await using var server = new FakeServer();
+        await using var channel = await ConnectAsync(server, 500);
+
+        await channel.InvokeRawAsync("echo", new byte[] { 1 }, CancellationToken.None);
+        await channel.InvokeRawAsync(
+            "echo",
+            new byte[] { 2 },
+            new InvokeOptions { IdempotencyKey = "order-42" },
+            CancellationToken.None);
+        await channel.InvokeRawAsync(
+            "echo",
+            new byte[] { 3 },
+            new InvokeOptions { NoIdempotency = true },
+            CancellationToken.None);
+
+        var requestIds = server.RequestIDs;
+        Assert.Equal(3, requestIds.Length);
+        Assert.False(string.IsNullOrEmpty(requestIds[0])); // 缺省自动生成幂等键。
+        Assert.Equal("order-42", requestIds[1]);           // 显式幂等键原样透传。
+        Assert.Equal("", requestIds[2]);                   // 逃生门：本次不携带。
+    }
+
     [Fact]
     public async Task InvokeRawAsync_SequencesIncreaseMonotonically()
     {
@@ -96,7 +123,7 @@ public sealed class ChannelTest
 
         var invoke = channel.InvokeRawAsync("echo", new byte[] { 7 }, CancellationToken.None);
         await transport.WaitForWritesAsync(1).WaitAsync(TimeSpan.FromSeconds(1));
-        transport.QueueReply(transport.WrittenHeaders[0].Seq, FrameConst.Version, new byte[] { 9 });
+        transport.QueueReply(transport.WrittenHeaders[0].Seq, FrameGen.Version, new byte[] { 9 });
 
         try
         {
@@ -118,18 +145,18 @@ public sealed class ChannelTest
     public async Task InvokeRawAsync_OutOfOrderResponses_MatchTheirSequences()
     {
         var transport = new ControlledTransport();
-        await using var channel = await ConnectControlledAsync(transport, 500, FrameConst.MaxBodySize);
+        await using var channel = await ConnectControlledAsync(transport, 500, FrameGen.MaxBodySize);
 
         var first = channel.InvokeRawAsync("first", new byte[] { 1 }, CancellationToken.None);
         await transport.WaitForWritesAsync(1).WaitAsync(TimeSpan.FromSeconds(1));
         var second = channel.InvokeRawAsync("second", new byte[] { 2 }, CancellationToken.None);
         await transport.WaitForWritesAsync(2).WaitAsync(TimeSpan.FromSeconds(1));
         var headers = transport.WrittenHeaders;
-        transport.QueueReply(headers[1].Seq, FrameConst.Version, new byte[] { 20 });
+        transport.QueueReply(headers[1].Seq, FrameGen.Version, new byte[] { 20 });
 
         Assert.Equal(new byte[] { 20 }, await second);
         Assert.False(first.IsCompleted);
-        transport.QueueReply(headers[0].Seq, FrameConst.Version, new byte[] { 10 });
+        transport.QueueReply(headers[0].Seq, FrameGen.Version, new byte[] { 10 });
         Assert.Equal(new byte[] { 10 }, await first);
     }
 
@@ -217,7 +244,7 @@ public sealed class ChannelTest
             new ChannelOptions
             {
                 InvokeTimeoutMs = timeoutMs,
-                MaxBodySize = maxBodySize ?? FrameConst.MaxBodySize,
+                MaxBodySize = maxBodySize ?? FrameGen.MaxBodySize,
             });
         await channel.ConnectAsync(CancellationToken.None);
         return channel;
@@ -259,6 +286,8 @@ public sealed class ChannelTest
         public int Version => 3;
 
         public byte[] Serialize(IMessage message) => Array.Empty<byte>();
+
+        public byte[] Serialize(object message) => Array.Empty<byte>();
 
         public object Deserialize(byte[] data, Type type) => throw new NotSupportedException();
     }

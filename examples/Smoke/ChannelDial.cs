@@ -7,7 +7,8 @@ using Atlas.Transport;
 
 namespace Atlas.Smoke;
 
-// ChannelDial 封装形态差异的拨号入口：按 transport 类型构造 Channel 拨号工厂。
+// ChannelDial 封装形态差异的拨号入口：按 transport 类型构造 AtlasClient（单业务通道）
+// 的拨号工厂。
 public static class ChannelDial
 {
     // ParseEndpoint 解析 host:port（IPv4 字面量/域名 + 端口；冒烟目标为局域网/本机）。
@@ -23,9 +24,10 @@ public static class ChannelDial
         return (host, port);
     }
 
-    // Dial 建立单通道 Channel（关闭自动传输心跳——冒烟用显式 Ping 探针验证往返，
-    // 避免后台心跳与业务断言交织；重连编排属 M4 范围，此处单连接）。
-    public static async Task<Channel> DialAsync(string transport, string addr, string wsPath, SmokeMode mode, CancellationToken ct)
+    // DialAsync 建立单通道 AtlasClient（关闭自动传输心跳——冒烟用显式 Ping 探针验证
+    // 往返，避免后台心跳与业务断言交织；重连编排属 M4 范围，此处单连接）。
+    public static async Task<AtlasClient> DialAsync(
+        string transport, string addr, string wsPath, SmokeMode mode, CancellationToken ct)
     {
         var (host, port) = ParseEndpoint(addr);
         var options = new ChannelOptions
@@ -40,37 +42,30 @@ public static class ChannelDial
             Logger = SDKLoggerFactory.Of(LogLevel.Debug),
         };
 
-        Channel channel;
+        Func<CancellationToken, Task<ITransport>> dial;
         switch (transport)
         {
             case "tcp":
-                channel = new Channel(
-                    token => TcpTransport.ConnectAsync(host, port, token),
-                    options);
+                dial = token => TcpTransport.ConnectAsync(host, port, token);
                 break;
             case "ws":
                 {
                     var url = WsTransport.NormalizeUrl(host + ":" + port, wsPath);
-                    channel = new Channel(
-                        token => WsTransport.ConnectAsync(url, token),
-                        options);
+                    dial = token => WsTransport.ConnectAsync(url, token);
                     break;
                 }
             case "kcp":
-                channel = new Channel(
-                    token => KcpTransport.ConnectAsync(host, port, token),
-                    options);
+                dial = token => KcpTransport.ConnectAsync(host, port, token);
                 break;
             case "udp":
-                channel = new Channel(
-                    token => UdpTransport.ConnectAsync(host, port, token),
-                    options);
+                dial = token => UdpTransport.ConnectAsync(host, port, token);
                 break;
             default:
                 throw new ArgumentException($"未知传输 {transport}（tcp|ws|kcp|udp）");
         }
 
-        await channel.ConnectAsync(ct);
-        return channel;
+        var client = new AtlasClient(new ChannelConfig(ChannelKind.Business, dial) { Options = options });
+        await client.ConnectAsync(ct);
+        return client;
     }
 }

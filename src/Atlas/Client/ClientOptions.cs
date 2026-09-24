@@ -38,7 +38,7 @@ public sealed class ChannelOptions
 
     public int InvokeTimeoutMs { get; set; } = 10_000;
 
-    public int MaxBodySize { get; set; } = FrameConst.MaxBodySize;
+    public int MaxBodySize { get; set; } = FrameGen.MaxBodySize;
 
     public ISerializer Serializer { get; set; } = new JsonSerializer();
 
@@ -81,7 +81,7 @@ public sealed class ChannelOptions
     public TransportKind TransportKind { get; set; }
 
     // SessionTokenProvider 是会话凭据提供者（Session 对象装配；业务层亦可自给）：
-    // 无连接传输（UDP/KCP）的请求帧据此自动携带会话槽（FrameConst.FlagSession），
+    // 无连接传输（UDP/KCP）的请求帧据此自动携带会话槽（FrameGen.FlagSession），
     // 服务端按凭据验证身份；长连接（TCP/WS）不携带。闭包返回空串表示当前无会话
     //（匿名帧，如登录前的 Login 请求）（对齐 Go WithSessionTokenProvider）。
     public Func<string>? SessionTokenProvider { get; set; }

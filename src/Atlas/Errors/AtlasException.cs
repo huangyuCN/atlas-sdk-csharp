@@ -38,12 +38,14 @@ public sealed class BusinessException : AtlasException
         int code,
         string reason,
         string message,
-        IReadOnlyDictionary<string, string>? metadata)
+        IReadOnlyDictionary<string, string>? metadata,
+        ErrorClass errorClass = ErrorClass.Unspecified)
         : base(message)
     {
         Code = code;
         Reason = reason ?? string.Empty;
         Metadata = CopyMetadata(metadata);
+        Class = errorClass;
     }
 
     public int Code { get; }
@@ -51,6 +53,12 @@ public sealed class BusinessException : AtlasException
     public string Reason { get; }
 
     public IReadOnlyDictionary<string, string> Metadata { get; }
+
+    // Class 是错误分类（业务/运行时/取消；Unspecified = 未分类）——服务端 Status.class
+    // 的投影，客户端按它决定处置策略（重试/提示/下线），对齐 Go errors.Class 语义。
+    // 帧通道下发数值（proto enum wire 形态），protojson 形态的枚举名经
+    // ErrorClassCodec.Parse / Status.ParseClass 解析——两种形态都接受。
+    public ErrorClass Class { get; }
 
     private static IReadOnlyDictionary<string, string> CopyMetadata(
         IReadOnlyDictionary<string, string>? metadata)

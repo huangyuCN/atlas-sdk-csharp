@@ -38,6 +38,16 @@ public sealed class ChannelView
         return _channel.On(op, handler);
     }
 
+    // OnAny 订阅本通道的全部推送 op（通配分发；语义同 Client.OnAny）。
+    public NotifySubscription OnAny(NotifyHandler handler)
+    {
+        if (_channel == null)
+        {
+            return new NotifySubscription(() => { });
+        }
+        return _channel.OnAny(handler);
+    }
+
     // State 返回本通道独立状态（dual 双通道独立重连的细粒度观测，规范 §5.2）。
     public ClientState State => _channel?.State ?? ClientState.Disconnected;
 

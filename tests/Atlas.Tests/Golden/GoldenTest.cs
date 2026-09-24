@@ -5,6 +5,9 @@ using System.Security.Cryptography;
 using System.Text.Json;
 using Atlas.Errors;
 using Atlas.Frame;
+using Atlas.Gateway.V1;
+using Atlas.Serialization;
+using ProtoLoginRequest = global::Gateway.V1.LoginRequest;
 using Xunit;
 
 namespace Atlas.Tests.Golden;
@@ -82,6 +85,46 @@ public sealed class GoldenTest
         var (operation, payload) = Body.ParseRequestBody(body);
         Assert.Equal(expected.GetProperty("operation").GetString(), operation);
         Assert.Equal(HexBytes(expected.GetProperty("payloadHex").GetString()), payload);
+        AssertFrameSemantics(id, header, operation, payload);
+    }
+
+    // AssertFrameSemantics 断言新增 golden 用例的语义（不只比字节/字段字面量）：
+    //   1. 会话 op：请求 operation 必须是生成物 SessionProtocolOps 中的会话 op；
+    //   2. ver=2 载荷：帧头 ver=2，载荷按 protobuf 二进制解码出业务字段。
+    private static void AssertFrameSemantics(string id, Header header, string operation, byte[] payload)
+    {
+        if (operation.StartsWith("/gateway.v1.Session/", StringComparison.Ordinal))
+        {
+            Assert.Contains(operation, SessionOperations());
+        }
+        switch (id)
+        {
+            case "frame-request-session-login":
+                // 会话登录 op 解析（生成物 SessionProtocolOps 为会话 op 唯一来源）。
+                Assert.Equal(SessionProtocolOps.Login, operation);
+                break;
+            case "frame-request-ver2":
+                // ver=2（protobuf 二进制）载荷映射：帧头 ver=2 且载荷按 wire 解码
+                // （IMessage 族 DTO——protoc --csharp_out 产物，ver=2 载荷形态）。
+                Assert.Equal(FrameGen.Version2, header.Version);
+                var login = (ProtoLoginRequest)new ProtobufSerializer()
+                    .Deserialize(payload, typeof(ProtoLoginRequest));
+                Assert.Equal("p1", login.PlayerId);
+                break;
+        }
+    }
+
+    // SessionOperations 返回生成物的 5 个会话 op（会话 op 语义断言的合法集合）。
+    private static string[] SessionOperations()
+    {
+        return new[]
+        {
+            SessionProtocolOps.Register,
+            SessionProtocolOps.Login,
+            SessionProtocolOps.Resume,
+            SessionProtocolOps.Logout,
+            SessionProtocolOps.Heartbeat,
+        };
     }
 
     private static void AssertReply(string id, byte[] input, JsonElement expected)
@@ -132,12 +175,18 @@ public sealed class GoldenTest
     }
 
     // 只比较 expected.json 中存在的字段；metadata=null 表示 Go 侧同样不比较空 map。
+    // class 是 p6 新增的错误分类（业务/运行时/取消）——客户端按它决定处置策略。
     private static void AssertStatusValue(string id, Status? actual, JsonElement expected)
     {
         Assert.NotNull(actual);
         Assert.Equal(expected.GetProperty("code").GetInt32(), actual!.Code);
         Assert.Equal(expected.GetProperty("reason").GetString(), actual.Reason);
         Assert.Equal(expected.GetProperty("message").GetString(), actual.Message);
+        if (expected.TryGetProperty("class", out var errorClass))
+        {
+            // class 是 proto enum（errors.proto ErrorClass）：wire 数值投影到枚举类型。
+            Assert.Equal((ErrorClass)errorClass.GetInt32(), actual!.Class);
+        }
         if (expected.TryGetProperty("metadata", out var metadata) && metadata.ValueKind == JsonValueKind.Object)
         {
             var expectedMetadata = ReadMetadata(metadata);

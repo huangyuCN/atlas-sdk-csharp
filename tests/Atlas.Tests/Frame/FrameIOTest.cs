@@ -15,8 +15,8 @@ public sealed class FrameIOTest
     {
         var header = new Header
         {
-            Magic = FrameConst.Magic,
-            Version = FrameConst.Version,
+            Magic = FrameGen.Magic,
+            Version = FrameGen.Version,
             Type = MsgType.Request,
             Seq = 0x01020304,
             Length = 0x0A,
@@ -25,7 +25,7 @@ public sealed class FrameIOTest
         var bytes = header.Encode();
         var decoded = Header.Decode(bytes);
 
-        Assert.Equal(FrameConst.HeaderSize, bytes.Length);
+        Assert.Equal(FrameGen.HeaderSize, bytes.Length);
         Assert.Equal(header.Magic, decoded.Magic);
         Assert.Equal(header.Version, decoded.Version);
         Assert.Equal(header.Type, decoded.Type);
@@ -38,8 +38,8 @@ public sealed class FrameIOTest
     {
         var header = new Header
         {
-            Magic = FrameConst.Magic,
-            Version = FrameConst.Version,
+            Magic = FrameGen.Magic,
+            Version = FrameGen.Version,
             Type = MsgType.Request,
             Seq = 0x01020304,
             Length = 0x0A0B0C0D,
@@ -57,8 +57,8 @@ public sealed class FrameIOTest
     {
         var header = new Header
         {
-            Magic = FrameConst.Magic,
-            Version = FrameConst.Version,
+            Magic = FrameGen.Magic,
+            Version = FrameGen.Version,
             Type = (MsgType)4,
             Seq = 1,
             Length = 0,
@@ -72,7 +72,7 @@ public sealed class FrameIOTest
     {
         var header = new Header
         {
-            Magic = FrameConst.Magic,
+            Magic = FrameGen.Magic,
             Version = 3,
             Type = (MsgType)4,
             Seq = 1,
@@ -89,11 +89,11 @@ public sealed class FrameIOTest
     {
         var header = new Header
         {
-            Magic = FrameConst.Magic,
-            Version = FrameConst.Version,
+            Magic = FrameGen.Magic,
+            Version = FrameGen.Version,
             Type = MsgType.Request,
             Seq = 1,
-            Length = (uint)FrameConst.MaxBodySize + 1,
+            Length = (uint)FrameGen.MaxBodySize + 1,
         };
 
         Assert.Throws<ProtocolException>(() => Header.Decode(header.Encode()));
@@ -104,19 +104,19 @@ public sealed class FrameIOTest
     {
         var header = new Header
         {
-            Magic = FrameConst.Magic,
-            Version = FrameConst.Version,
+            Magic = FrameGen.Magic,
+            Version = FrameGen.Version,
             Type = MsgType.Request,
             Seq = 1,
             Length = 2,
         };
         await using var wire = new MemoryStream();
-        await FrameIO.WriteFrameAsync(wire, header, new byte[] { 7, 8 }, FrameConst.MaxBodySize, CancellationToken.None);
+        await FrameIO.WriteFrameAsync(wire, header, new byte[] { 7, 8 }, FrameGen.MaxBodySize, CancellationToken.None);
         var bytes = wire.ToArray();
 
         await using var stream = new SegmentedReadStream(bytes);
 
-        var actual = await FrameIO.ReadFrameAsync(stream, FrameConst.MaxBodySize, CancellationToken.None);
+        var actual = await FrameIO.ReadFrameAsync(stream, FrameGen.MaxBodySize, CancellationToken.None);
 
         Assert.Equal((uint)1, actual.Header.Seq);
         Assert.Equal(new byte[] { 7, 8 }, actual.Body);
@@ -125,7 +125,7 @@ public sealed class FrameIOTest
     [Fact]
     public void Decode_InvalidMagic_ThrowsProtocol()
     {
-        var bytes = new byte[FrameConst.HeaderSize];
+        var bytes = new byte[FrameGen.HeaderSize];
 
         Assert.Throws<ProtocolException>(() => Header.Decode(bytes));
     }
@@ -137,7 +137,7 @@ public sealed class FrameIOTest
     {
         var header = new Header
         {
-            Magic = FrameConst.Magic,
+            Magic = FrameGen.Magic,
             Version = version,
             Type = MsgType.Request,
             Seq = 1,
@@ -152,8 +152,8 @@ public sealed class FrameIOTest
     {
         var header = new Header
         {
-            Magic = FrameConst.Magic,
-            Version = FrameConst.Version,
+            Magic = FrameGen.Magic,
+            Version = FrameGen.Version,
             Type = MsgType.Notify,
             Seq = 0,
             Length = 0,
@@ -167,28 +167,28 @@ public sealed class FrameIOTest
     {
         var first = new Header
         {
-            Magic = FrameConst.Magic,
-            Version = FrameConst.Version,
+            Magic = FrameGen.Magic,
+            Version = FrameGen.Version,
             Type = MsgType.Request,
             Seq = 1,
             Length = 3,
         };
         var second = new Header
         {
-            Magic = FrameConst.Magic,
-            Version = FrameConst.Version2,
+            Magic = FrameGen.Magic,
+            Version = FrameGen.Version2,
             Type = MsgType.Response,
             Seq = 2,
             Length = 2,
         };
 
         await using var stream = new MemoryStream();
-        await FrameIO.WriteFrameAsync(stream, first, new byte[] { 1, 2, 3 }, FrameConst.MaxBodySize, CancellationToken.None);
-        await FrameIO.WriteFrameAsync(stream, second, new byte[] { 4, 5 }, FrameConst.MaxBodySize, CancellationToken.None);
+        await FrameIO.WriteFrameAsync(stream, first, new byte[] { 1, 2, 3 }, FrameGen.MaxBodySize, CancellationToken.None);
+        await FrameIO.WriteFrameAsync(stream, second, new byte[] { 4, 5 }, FrameGen.MaxBodySize, CancellationToken.None);
         stream.Position = 0;
 
-        var actualFirst = await FrameIO.ReadFrameAsync(stream, FrameConst.MaxBodySize, CancellationToken.None);
-        var actualSecond = await FrameIO.ReadFrameAsync(stream, FrameConst.MaxBodySize, CancellationToken.None);
+        var actualFirst = await FrameIO.ReadFrameAsync(stream, FrameGen.MaxBodySize, CancellationToken.None);
+        var actualSecond = await FrameIO.ReadFrameAsync(stream, FrameGen.MaxBodySize, CancellationToken.None);
 
         Assert.Equal(first.Seq, actualFirst.Item1.Seq);
         Assert.Equal(new byte[] { 1, 2, 3 }, actualFirst.Item2);
@@ -206,13 +206,13 @@ public sealed class FrameIOTest
             Length = 99,
         };
         await using var stream = new MemoryStream();
-        await FrameIO.WriteFrameAsync(stream, header, new byte[] { 1, 2 }, FrameConst.MaxBodySize, CancellationToken.None);
+        await FrameIO.WriteFrameAsync(stream, header, new byte[] { 1, 2 }, FrameGen.MaxBodySize, CancellationToken.None);
         stream.Position = 0;
 
-        var actual = await FrameIO.ReadFrameAsync(stream, FrameConst.MaxBodySize, CancellationToken.None);
+        var actual = await FrameIO.ReadFrameAsync(stream, FrameGen.MaxBodySize, CancellationToken.None);
 
-        Assert.Equal(FrameConst.Magic, actual.Header.Magic);
-        Assert.Equal(FrameConst.Version, actual.Header.Version);
+        Assert.Equal(FrameGen.Magic, actual.Header.Magic);
+        Assert.Equal(FrameGen.Version, actual.Header.Version);
         Assert.Equal((uint)2, actual.Header.Length);
         Assert.Equal(new byte[] { 1, 2 }, actual.Body);
     }
@@ -222,14 +222,14 @@ public sealed class FrameIOTest
     {
         var header = new Header
         {
-            Magic = FrameConst.Magic,
-            Version = FrameConst.Version,
+            Magic = FrameGen.Magic,
+            Version = FrameGen.Version,
             Type = MsgType.Request,
             Seq = 1,
             Length = 3,
         };
         await using var stream = new MemoryStream();
-        await FrameIO.WriteFrameAsync(stream, header, new byte[] { 1, 2, 3 }, FrameConst.MaxBodySize, CancellationToken.None);
+        await FrameIO.WriteFrameAsync(stream, header, new byte[] { 1, 2, 3 }, FrameGen.MaxBodySize, CancellationToken.None);
         stream.Position = 0;
 
         await Assert.ThrowsAsync<ProtocolException>(async () =>
@@ -266,8 +266,8 @@ public sealed class FrameIOTest
     {
         var header = new Header
         {
-            Magic = FrameConst.Magic,
-            Version = FrameConst.Version,
+            Magic = FrameGen.Magic,
+            Version = FrameGen.Version,
             Type = MsgType.Request,
             Seq = 1,
         };
@@ -281,18 +281,18 @@ public sealed class FrameIOTest
     {
         var header = new Header
         {
-            Magic = FrameConst.Magic,
-            Version = FrameConst.Version,
+            Magic = FrameGen.Magic,
+            Version = FrameGen.Version,
             Type = MsgType.Request,
             Seq = 1,
         };
-        Assert.Throws<ArgumentNullException>(() => FrameIO.EncodeMessage(header, null!, FrameConst.MaxBodySize));
+        Assert.Throws<ArgumentNullException>(() => FrameIO.EncodeMessage(header, null!, FrameGen.MaxBodySize));
     }
 
     [Fact]
     public void DecodeMessage_ShorterThanHeader_ThrowsProtocol()
     {
-        Assert.Throws<ProtocolException>(() => FrameIO.DecodeMessage(new byte[] { 1, 2, 3 }, FrameConst.MaxBodySize));
+        Assert.Throws<ProtocolException>(() => FrameIO.DecodeMessage(new byte[] { 1, 2, 3 }, FrameGen.MaxBodySize));
     }
 
     [Fact]
@@ -301,24 +301,24 @@ public sealed class FrameIOTest
         // 头 bodyLen=3 但消息只有 2B body——长度不一致即协议非法（消息边界下失步）。
         var header = new Header
         {
-            Magic = FrameConst.Magic,
-            Version = FrameConst.Version,
+            Magic = FrameGen.Magic,
+            Version = FrameGen.Version,
             Type = MsgType.Request,
             Seq = 1,
             Length = 3,
         };
-        var message = new byte[FrameConst.HeaderSize + 2];
+        var message = new byte[FrameGen.HeaderSize + 2];
         var headerBytes = header.Encode();
-        Array.Copy(headerBytes, message, FrameConst.HeaderSize);
-        Assert.Throws<ProtocolException>(() => FrameIO.DecodeMessage(message, FrameConst.MaxBodySize));
+        Array.Copy(headerBytes, message, FrameGen.HeaderSize);
+        Assert.Throws<ProtocolException>(() => FrameIO.DecodeMessage(message, FrameGen.MaxBodySize));
     }
 
     [Fact]
     public void DecodeMessage_BadMagic_ThrowsProtocol()
     {
         // ≥16B 但 magic 非法（全零）——头校验失败。
-        var message = new byte[FrameConst.HeaderSize + 2];
-        Assert.Throws<ProtocolException>(() => FrameIO.DecodeMessage(message, FrameConst.MaxBodySize));
+        var message = new byte[FrameGen.HeaderSize + 2];
+        Assert.Throws<ProtocolException>(() => FrameIO.DecodeMessage(message, FrameGen.MaxBodySize));
     }
 
     [Fact]
@@ -326,13 +326,13 @@ public sealed class FrameIOTest
     {
         var header = new Header
         {
-            Magic = FrameConst.Magic,
-            Version = FrameConst.Version,
+            Magic = FrameGen.Magic,
+            Version = FrameGen.Version,
             Type = MsgType.Request,
             Seq = 9,
         };
-        var message = FrameIO.EncodeMessage(header, new byte[] { 7, 8 }, FrameConst.MaxBodySize);
-        var (decodedHeader, body) = FrameIO.DecodeMessage(message, FrameConst.MaxBodySize);
+        var message = FrameIO.EncodeMessage(header, new byte[] { 7, 8 }, FrameGen.MaxBodySize);
+        var (decodedHeader, body) = FrameIO.DecodeMessage(message, FrameGen.MaxBodySize);
         Assert.Equal(9u, decodedHeader.Seq);
         Assert.Equal(new byte[] { 7, 8 }, body);
     }

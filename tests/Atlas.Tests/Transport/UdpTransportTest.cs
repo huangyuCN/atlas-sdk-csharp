@@ -31,16 +31,16 @@ public sealed class UdpTransportTest
         var requestBody = new byte[] { 1, 2, 3, 4, 5 };
         var requestHeader = new Header
         {
-            Magic = FrameConst.Magic,
-            Version = FrameConst.Version,
+            Magic = FrameGen.Magic,
+            Version = FrameGen.Version,
             Type = MsgType.Request,
             Seq = 7,
         };
-        await transport.WriteFrameAsync(requestHeader, requestBody, FrameConst.MaxBodySize, CancellationToken.None);
+        await transport.WriteFrameAsync(requestHeader, requestBody, FrameGen.MaxBodySize, CancellationToken.None);
 
         // 读回显响应（同一数据报往返）
         var (responseHeader, responseBody) = await transport.ReadFrameAsync(
-            FrameConst.MaxBodySize, CancellationToken.None);
+            FrameGen.MaxBodySize, CancellationToken.None);
 
         Assert.Equal(MsgType.Response, responseHeader.Type);
         Assert.Equal(7u, responseHeader.Seq);
@@ -69,15 +69,15 @@ public sealed class UdpTransportTest
         var requestBody = new byte[] { 9, 9, 9 };
         var requestHeader = new Header
         {
-            Magic = FrameConst.Magic,
-            Version = FrameConst.Version,
+            Magic = FrameGen.Magic,
+            Version = FrameGen.Version,
             Type = MsgType.Request,
             Seq = 2,
         };
-        await transport.WriteFrameAsync(requestHeader, requestBody, FrameConst.MaxBodySize, CancellationToken.None);
+        await transport.WriteFrameAsync(requestHeader, requestBody, FrameGen.MaxBodySize, CancellationToken.None);
 
         var (_, responseBody) = await transport.ReadFrameAsync(
-            FrameConst.MaxBodySize, CancellationToken.None);
+            FrameGen.MaxBodySize, CancellationToken.None);
         Assert.Equal(requestBody, responseBody);
     }
 
@@ -91,13 +91,13 @@ public sealed class UdpTransportTest
         var oversized = new byte[UdpTransport.MaxDatagramSize]; // body 已超（含头）
         var header = new Header
         {
-            Magic = FrameConst.Magic,
-            Version = FrameConst.Version,
+            Magic = FrameGen.Magic,
+            Version = FrameGen.Version,
             Type = MsgType.Request,
             Seq = 1,
         };
         await Assert.ThrowsAsync<ProtocolException>(() =>
-            transport.WriteFrameAsync(header, oversized, FrameConst.MaxBodySize, CancellationToken.None));
+            transport.WriteFrameAsync(header, oversized, FrameGen.MaxBodySize, CancellationToken.None));
     }
 
     [Fact]
@@ -110,7 +110,7 @@ public sealed class UdpTransportTest
         await transport.CloseAsync();
         // 关闭后读应抛异常（socket 关闭）
         await Assert.ThrowsAnyAsync<Exception>(() =>
-            transport.ReadFrameAsync(FrameConst.MaxBodySize, CancellationToken.None).AsTask());
+            transport.ReadFrameAsync(FrameGen.MaxBodySize, CancellationToken.None).AsTask());
     }
 
     [Fact]
@@ -131,14 +131,14 @@ public sealed class UdpTransportTest
         var requestBody = new byte[] { 0x55 };
         var requestHeader = new Header
         {
-            Magic = FrameConst.Magic,
-            Version = FrameConst.Version,
+            Magic = FrameGen.Magic,
+            Version = FrameGen.Version,
             Type = MsgType.Request,
             Seq = 3,
         };
-        await transport.WriteFrameAsync(requestHeader, requestBody, FrameConst.MaxBodySize, CancellationToken.None);
+        await transport.WriteFrameAsync(requestHeader, requestBody, FrameGen.MaxBodySize, CancellationToken.None);
         var (_, responseBody) = await transport.ReadFrameAsync(
-            FrameConst.MaxBodySize, CancellationToken.None);
+            FrameGen.MaxBodySize, CancellationToken.None);
         Assert.Equal(requestBody, responseBody);
     }
 
@@ -152,7 +152,7 @@ public sealed class UdpTransportTest
         await using var _ = server;
 
         // 16B 头 + 2B body，但 magic 非法（全零——非 ATLS）。
-        var badDatagram = new byte[FrameConst.HeaderSize + 2];
+        var badDatagram = new byte[FrameGen.HeaderSize + 2];
         using (var sender = new UdpClient())
         {
             await sender.SendAsync(badDatagram, badDatagram.Length, "127.0.0.1", port);
@@ -162,14 +162,14 @@ public sealed class UdpTransportTest
         var requestBody = new byte[] { 0x66 };
         var requestHeader = new Header
         {
-            Magic = FrameConst.Magic,
-            Version = FrameConst.Version,
+            Magic = FrameGen.Magic,
+            Version = FrameGen.Version,
             Type = MsgType.Request,
             Seq = 4,
         };
-        await transport.WriteFrameAsync(requestHeader, requestBody, FrameConst.MaxBodySize, CancellationToken.None);
+        await transport.WriteFrameAsync(requestHeader, requestBody, FrameGen.MaxBodySize, CancellationToken.None);
         var (_, responseBody) = await transport.ReadFrameAsync(
-            FrameConst.MaxBodySize, CancellationToken.None);
+            FrameGen.MaxBodySize, CancellationToken.None);
         Assert.Equal(requestBody, responseBody);
     }
 
@@ -186,8 +186,8 @@ public sealed class UdpTransportTest
         // 构造：头 bodyLen=100（声明 100 字节 body）但数据报实际无 body（16B 头）。
         var mismatchHeader = new Header
         {
-            Magic = FrameConst.Magic,
-            Version = FrameConst.Version,
+            Magic = FrameGen.Magic,
+            Version = FrameGen.Version,
             Type = MsgType.Request,
             Seq = 5,
             Length = 100,
@@ -204,14 +204,14 @@ public sealed class UdpTransportTest
         var requestBody = new byte[] { 0x77 };
         var requestHeader = new Header
         {
-            Magic = FrameConst.Magic,
-            Version = FrameConst.Version,
+            Magic = FrameGen.Magic,
+            Version = FrameGen.Version,
             Type = MsgType.Request,
             Seq = 6,
         };
-        await transport.WriteFrameAsync(requestHeader, requestBody, FrameConst.MaxBodySize, CancellationToken.None);
+        await transport.WriteFrameAsync(requestHeader, requestBody, FrameGen.MaxBodySize, CancellationToken.None);
         var (_, responseBody) = await transport.ReadFrameAsync(
-            FrameConst.MaxBodySize, CancellationToken.None);
+            FrameGen.MaxBodySize, CancellationToken.None);
         Assert.Equal(requestBody, responseBody);
     }
 }
@@ -249,7 +249,7 @@ internal sealed class UdpEchoServer : IAsyncDisposable
                 // 垃圾/非法帧原样回显（由 client 侧验证坏包丢弃语义）。
                 var echo = new byte[count];
                 Array.Copy(buffer, echo, count);
-                if (count >= FrameConst.HeaderSize && echo[5] == (byte)MsgType.Request)
+                if (count >= FrameGen.HeaderSize && echo[5] == (byte)MsgType.Request)
                 {
                     echo[5] = (byte)MsgType.Response; // type 字段偏移 5
                 }

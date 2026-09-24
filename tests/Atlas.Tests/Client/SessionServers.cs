@@ -10,7 +10,10 @@ using Atlas.Client;
 using Atlas.Errors;
 using Atlas.Frame;
 using Atlas.Transport;
+using Google.Protobuf;
 using KcpSharp;
+using ProtoKickedNotify = global::Gateway.V1.KickedNotify;
+using ProtoKickedReason = global::Gateway.V1.KickedReason;
 
 namespace Atlas.Tests.Client;
 
@@ -20,6 +23,8 @@ internal sealed class SessionUdpServer : IAsyncDisposable
 {
     private readonly Socket _socket = new(AddressFamily.InterNetwork, SocketType.Dgram, ProtocolType.Udp);
     private readonly ConcurrentQueue<string> _seen = new();
+    private readonly ConcurrentDictionary<string, byte[]> _payloads = new();
+    private readonly ConcurrentDictionary<string, string> _replies = new();
     private readonly CancellationTokenSource _cts = new();
     private readonly Task _serveTask;
     private IPEndPoint? _lastRemote;
@@ -42,19 +47,46 @@ internal sealed class SessionUdpServer : IAsyncDisposable
         return _seen.Contains(op + "|" + session);
     }
 
-    // PushKickedAsync 向最近一次请求的客户端推送被挤下线 Notify 帧。
-    public async Task PushKickedAsync()
+    // PayloadFor 返回指定 op 最近一次请求的载荷（未收到过返回空数组；客户端版本上报断言用）。
+    public byte[] PayloadFor(string op)
+    {
+        return _payloads.TryGetValue(op, out var payload) ? payload : Array.Empty<byte>();
+    }
+
+    // SetReply 覆盖指定 op 的回执 JSON（回执解析失败/凭据缺失用例用）。
+    public void SetReply(string op, string json)
+    {
+        _replies[op] = json;
+    }
+
+    // PushKickedAsync 向最近一次请求的客户端推送被挤下线 Notify 帧：version 选载荷编码
+    //（ver=1 为 protojson 枚举名字节、ver=2 为 protobuf wire 字节——接缝按帧头 version
+    // 选解码器，两条路都应取到同一原因）。
+    public Task PushKickedAsync(byte version = FrameGen.Version)
+    {
+        var payload = version == FrameGen.Version2
+            ? new ProtoKickedNotify
+            {
+                Reason = ProtoKickedReason.LoggedInElsewhere,
+            }.ToByteArray()
+            : System.Text.Encoding.UTF8.GetBytes(
+                "{\"reason\":\"KICKED_REASON_LOGGED_IN_ELSEWHERE\"}");
+        return PushNotifyAsync(Atlas.Gateway.V1.SessionPushOps.KickedNotify, version, payload);
+    }
+
+    // PushNotifyAsync 推送任意 op 的 Notify 帧（version 为帧头载荷编码版本）。
+    public async Task PushNotifyAsync(string op, byte version, byte[] payload)
     {
         var remote = _lastRemote ?? throw new InvalidOperationException("尚无客户端请求");
-        var body = Body.BuildRequestBody(Session.KickedNotifyOperation, null);
+        var body = Body.BuildRequestBody(op, payload);
         var header = new Header
         {
-            Magic = FrameConst.Magic,
-            Version = FrameConst.Version,
+            Magic = FrameGen.Magic,
+            Version = version,
             Type = MsgType.Notify,
             Seq = 1,
         };
-        var datagram = FrameIO.EncodeMessage(header, body, FrameConst.MaxBodySize);
+        var datagram = FrameIO.EncodeMessage(header, body, FrameGen.MaxBodySize);
         await _socket.SendToAsync(
             new ArraySegment<byte>(datagram), SocketFlags.None, remote, _cts.Token);
     }
@@ -94,7 +126,7 @@ internal sealed class SessionUdpServer : IAsyncDisposable
             byte[] body;
             try
             {
-                (header, body) = FrameIO.DecodeMessage(datagram, FrameConst.MaxBodySize);
+                (header, body) = FrameIO.DecodeMessage(datagram, FrameGen.MaxBodySize);
             }
             catch (ProtocolException)
             {
@@ -102,9 +134,10 @@ internal sealed class SessionUdpServer : IAsyncDisposable
             }
             string op;
             string session;
+            byte[] payload;
             try
             {
-                (op, session, _, _) = Body.ParseRequestBodyFull(body, header.Flags);
+                (op, session, _, payload) = Body.ParseRequestBodyFull(body, header.Flags);
             }
             catch (ProtocolException)
             {
@@ -112,29 +145,37 @@ internal sealed class SessionUdpServer : IAsyncDisposable
             }
 
             _seen.Enqueue(op + "|" + session);
+            _payloads[op] = payload;
             _lastRemote = requestRemote;
             await WriteReplyAsync(requestRemote, header.Seq, op, cancellationToken);
         }
     }
 
-    // WriteReplyAsync 按 op 回预置 protojson 回执：Login/Resume 下发凭据，其余空回执。
+    // WriteReplyAsync 按 op 回预置 protojson 回执（权威 proto 形态）：Login 下发凭据，
+    // Resume 只下发 playerId（token 沿用原凭据），其余空回执；SetReply 可覆盖。
     private async Task WriteReplyAsync(IPEndPoint remote, uint sequence, string op, CancellationToken cancellationToken)
     {
-        var json = op == Session.LoginOperation || op == Session.ResumeOperation
-            ? "{\"playerId\":\"42\",\"token\":\"tok-42\"}"
-            : "{}";
+        var json = _replies.TryGetValue(op, out var custom)
+            ? custom
+            : op switch
+            {
+                var login when login == Atlas.Gateway.V1.SessionProtocolOps.Login =>
+                    "{\"playerId\":\"42\",\"token\":\"tok-42\"}",
+                var resume when resume == Atlas.Gateway.V1.SessionProtocolOps.Resume => "{\"playerId\":\"42\"}",
+                _ => "{}",
+            };
         var data = System.Text.Encoding.UTF8.GetBytes(json);
         var envelope = new byte[5 + data.Length];
         WriteUInt32(envelope, 1, (uint)data.Length);
         Array.Copy(data, 0, envelope, 5, data.Length);
         var header = new Header
         {
-            Magic = FrameConst.Magic,
-            Version = FrameConst.Version,
+            Magic = FrameGen.Magic,
+            Version = FrameGen.Version,
             Type = MsgType.Response,
             Seq = sequence,
         };
-        var datagram = FrameIO.EncodeMessage(header, envelope, FrameConst.MaxBodySize);
+        var datagram = FrameIO.EncodeMessage(header, envelope, FrameGen.MaxBodySize);
         await _socket.SendToAsync(
             new ArraySegment<byte>(datagram), SocketFlags.None, remote, cancellationToken);
     }
@@ -333,7 +374,7 @@ internal sealed class SessionKcpServer : IAsyncDisposable
         // HandleMessageAsync 组装完整帧（头消息 + body 消息），记录 (op, session) 并按 op 回执。
         private async Task HandleMessageAsync(byte[] first)
         {
-            if (first.Length != FrameConst.HeaderSize)
+            if (first.Length != FrameGen.HeaderSize)
             {
                 return; // 非帧首消息：坏消息丢弃。
             }
@@ -388,12 +429,17 @@ internal sealed class SessionKcpServer : IAsyncDisposable
             await WriteReplyAsync(header, op);
         }
 
-        // WriteReplyAsync 按 op 回预置 protojson 回执（头消息 + body 消息两次发送）。
+        // WriteReplyAsync 按 op 回预置 protojson 回执（权威 proto 形态；头消息 + body
+        // 消息两次发送）：Login 下发凭据，Resume 只下发 playerId。
         private async Task WriteReplyAsync(Header requestHeader, string op)
         {
-            var json = op == Session.LoginOperation || op == Session.ResumeOperation
-                ? "{\"playerId\":\"42\",\"token\":\"tok-42\"}"
-                : "{}";
+            var json = op switch
+            {
+                var login when login == Atlas.Gateway.V1.SessionProtocolOps.Login =>
+                    "{\"playerId\":\"42\",\"token\":\"tok-42\"}",
+                var resume when resume == Atlas.Gateway.V1.SessionProtocolOps.Resume => "{\"playerId\":\"42\"}",
+                _ => "{}",
+            };
             var data = System.Text.Encoding.UTF8.GetBytes(json);
             var envelope = new byte[5 + data.Length];
             envelope[0] = 0;
@@ -402,7 +448,7 @@ internal sealed class SessionKcpServer : IAsyncDisposable
             var replyHeader = new Header
             {
                 Magic = requestHeader.Magic,
-                Version = FrameConst.Version,
+                Version = FrameGen.Version,
                 Type = MsgType.Response,
                 Seq = requestHeader.Seq,
                 Length = (uint)envelope.Length,

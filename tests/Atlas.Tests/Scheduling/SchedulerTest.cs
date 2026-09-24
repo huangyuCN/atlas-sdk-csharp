@@ -177,7 +177,7 @@ public sealed class SchedulerTest
                 new ChannelOptions());
             await channel.ConnectAsync(CancellationToken.None);
             string? receivedOp = null;
-            using var sub = channel.On("notify-op", (op, _) => receivedOp = op);
+            using var sub = channel.On("notify-op", (op, _, _) => receivedOp = op);
 
             // 服务端推一条 Notify 帧。
             await server.PushNotifyAsync("notify-op", Array.Empty<byte>());

@@ -20,6 +20,7 @@ internal sealed class FakeServer : IAsyncDisposable
     private readonly TaskCompletionSource<bool> _releaseHold = NewSignal();
     private readonly ConcurrentQueue<uint> _sequences = new();
     private readonly ConcurrentQueue<string> _operations = new();
+    private readonly ConcurrentQueue<string> _requestIds = new();
     private readonly object _pushGate = new();
     private readonly SemaphoreSlim _writeLock = new(1, 1); // 连接写串行化（评审 M2-4 P2：
     // PushNotifyAsync 与 ServeAsync 可并发写同 stream——.NET NetworkStream 并发写无
@@ -55,6 +56,9 @@ internal sealed class FakeServer : IAsyncDisposable
     // OperationNames 返回服务端收到的全部 operation（按到达顺序）。
     public string[] OperationNames => _operations.ToArray();
 
+    // RequestIDs 返回服务端收到的全部请求幂等键（按到达顺序；空串 = 未携带）。
+    public string[] RequestIDs => _requestIds.ToArray();
+
     // AcceptedConnections 返回服务端接受的连接总数（重连观测用）。
     public int AcceptedConnections
     {
@@ -87,11 +91,11 @@ internal sealed class FakeServer : IAsyncDisposable
     {
         var stream = await WaitForStreamAsync();
         var body = Body.BuildRequestBody(operation, payload);
-        var header = new Header { Type = MsgType.Notify, Version = FrameConst.Version, Seq = 1 };
+        var header = new Header { Type = MsgType.Notify, Version = FrameGen.Version, Seq = 1 };
         await _writeLock.WaitAsync(_stop.Token);
         try
         {
-            await FrameIO.WriteFrameAsync(stream, header, body, FrameConst.MaxBodySize, _stop.Token);
+            await FrameIO.WriteFrameAsync(stream, header, body, FrameGen.MaxBodySize, _stop.Token);
         }
         finally
         {
@@ -190,12 +194,13 @@ internal sealed class FakeServer : IAsyncDisposable
         }
         while (!_stop.IsCancellationRequested)
         {
-            var (header, body) = await FrameIO.ReadFrameAsync(stream, FrameConst.MaxBodySize, _stop.Token);
-            var (operation, _s, _rid, payload) = Body.ParseRequestBodyFull(body, header.Flags);
-            void discard1() { _ = (_s, _rid); }
+            var (header, body) = await FrameIO.ReadFrameAsync(stream, FrameGen.MaxBodySize, _stop.Token);
+            var (operation, _s, requestId, payload) = Body.ParseRequestBodyFull(body, header.Flags);
+            void discard1() { _ = _s; }
             discard1();
             _sequences.Enqueue(header.Seq);
             _operations.Enqueue(operation);
+            _requestIds.Enqueue(requestId);
             if (operation == "hold")
             {
                 _holdSeen.TrySetResult(true);
@@ -220,7 +225,7 @@ internal sealed class FakeServer : IAsyncDisposable
                 continue; // 静默丢弃 Ping：客户端 invoke 超时（网络类失败）。
             }
 
-            var version = operation == "bad-version" ? FrameConst.Version2 : header.Version;
+            var version = operation == "bad-version" ? FrameGen.Version2 : header.Version;
             await WriteReplyAsync(stream, header.Seq, version, payload, _stop.Token);
         }
     }
@@ -235,7 +240,7 @@ internal sealed class FakeServer : IAsyncDisposable
         await _writeLock.WaitAsync(token);
         try
         {
-            await FrameIO.WriteFrameAsync(stream, header, reply, FrameConst.MaxBodySize, token);
+            await FrameIO.WriteFrameAsync(stream, header, reply, FrameGen.MaxBodySize, token);
         }
         finally
         {
@@ -268,7 +273,7 @@ internal sealed class FakeServer : IAsyncDisposable
         await _writeLock.WaitAsync(token);
         try
         {
-            await FrameIO.WriteFrameAsync(stream, header, reply, FrameConst.MaxBodySize, token);
+            await FrameIO.WriteFrameAsync(stream, header, reply, FrameGen.MaxBodySize, token);
         }
         finally
         {

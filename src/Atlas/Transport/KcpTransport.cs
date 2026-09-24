@@ -117,8 +117,8 @@ public sealed class KcpTransport : ITransport
     {
         maxBodySize = Header.NormalizeMaxBodySize(maxBodySize);
         // 收头消息（16B）。
-        var headerMessage = await ReceiveMessageAsync(FrameConst.HeaderSize, cancellationToken).ConfigureAwait(false);
-        if (headerMessage.Length != FrameConst.HeaderSize)
+        var headerMessage = await ReceiveMessageAsync(FrameGen.HeaderSize, cancellationToken).ConfigureAwait(false);
+        if (headerMessage.Length != FrameGen.HeaderSize)
         {
             throw new ProtocolException($"KCP 帧头消息长度 {headerMessage.Length} != 16");
         }
@@ -204,11 +204,11 @@ public sealed class KcpTransport : ITransport
         var h = header;
         if (h.Magic == 0)
         {
-            h.Magic = FrameConst.Magic;
+            h.Magic = FrameGen.Magic;
         }
         if (h.Version == 0)
         {
-            h.Version = FrameConst.Version;
+            h.Version = FrameGen.Version;
         }
         h.Length = (uint)body.Length;
         Header.Check(h, maxBodySize);

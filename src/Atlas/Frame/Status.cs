@@ -6,7 +6,7 @@ using Atlas.Errors;
 namespace Atlas.Frame;
 
 // Status 是 atlas errors.Status 的客户端侧还原。字段号：code=1、reason=2、
-// message=3、metadata=4。手写 protobuf wire 解码，不依赖 protobuf 运行时。
+// message=3、metadata=4、class=5。手写 protobuf wire 解码，不依赖 protobuf 运行时。
 public sealed class Status
 {
     public int Code { get; internal set; }
@@ -16,6 +16,19 @@ public sealed class Status
     public string Message { get; internal set; } = "";
 
     public Dictionary<string, string> Metadata { get; } = new Dictionary<string, string>();
+
+    // Class 是错误分类（业务/运行时/取消；Unspecified = 未分类）：日志定级、故障率口径
+    // 与客户端处置决策用（对齐框架 errors.Status.class，错误投影语义）。帧通道下发
+    // proto enum 的数值形态；protojson 形态（JSON 里的枚举名，如 ERROR_CLASS_RUNTIME）
+    // 经 ParseClass 解析——两种形态都接受，不各自判定。
+    public ErrorClass Class { get; internal set; }
+
+    // ParseClass 解析错误分类的文本形态：protojson 枚举名（ERROR_CLASS_BUSINESS）、
+    // 稳定标签（business）或数值（"2"）都接受，未知回落 Unspecified（前向兼容）。
+    public static ErrorClass ParseClass(string? text)
+    {
+        return ErrorClassCodec.Parse(text);
+    }
 }
 
 public static class StatusWire
@@ -52,6 +65,12 @@ public static class StatusWire
                 if (field == 1)
                 {
                     status.Code = unchecked((int)numeric);
+                }
+                else if (field == 5)
+                {
+                    // class 是 proto enum（errors.proto ErrorClass）：wire 形态是数值，
+                    // 经唯一解析点归一（未知数值原样保留，前向兼容）。
+                    status.Class = ErrorClassCodec.Of(unchecked((int)numeric));
                 }
 
                 return;

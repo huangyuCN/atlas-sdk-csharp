@@ -40,11 +40,11 @@ public sealed class ReplyTest
     [Fact]
     public void BuildBody_OperationLengthBoundary()
     {
-        var maximum = new string('a', FrameConst.MaxOperationLen);
+        var maximum = new string('a', Body.MaxOperationLen);
 
         var actual = Body.BuildRequestBody(maximum, Array.Empty<byte>());
 
-        Assert.Equal(FrameConst.MaxOperationLen + 2, actual.Length);
+        Assert.Equal(Body.MaxOperationLen + 2, actual.Length);
         Assert.Throws<ProtocolException>(() => Body.BuildRequestBody(maximum + "a", Array.Empty<byte>()));
     }
 

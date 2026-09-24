@@ -25,16 +25,16 @@ public sealed class KcpTransportTest
         var requestBody = new byte[] { 1, 2, 3, 4, 5, 6, 7, 8 };
         var requestHeader = new Header
         {
-            Magic = FrameConst.Magic,
-            Version = FrameConst.Version,
+            Magic = FrameGen.Magic,
+            Version = FrameGen.Version,
             Type = MsgType.Request,
             Seq = 7,
         };
-        await transport.WriteFrameAsync(requestHeader, requestBody, FrameConst.MaxBodySize, CancellationToken.None);
+        await transport.WriteFrameAsync(requestHeader, requestBody, FrameGen.MaxBodySize, CancellationToken.None);
 
         // 读回显响应
         using var cts = new CancellationTokenSource(5000);
-        var (responseHeader, responseBody) = await transport.ReadFrameAsync(FrameConst.MaxBodySize, cts.Token);
+        var (responseHeader, responseBody) = await transport.ReadFrameAsync(FrameGen.MaxBodySize, cts.Token);
 
         Assert.Equal(MsgType.Response, responseHeader.Type);
         Assert.Equal(7u, responseHeader.Seq);
@@ -51,15 +51,15 @@ public sealed class KcpTransportTest
         // 空 body 请求（如 Ping）
         var requestHeader = new Header
         {
-            Magic = FrameConst.Magic,
-            Version = FrameConst.Version,
+            Magic = FrameGen.Magic,
+            Version = FrameGen.Version,
             Type = MsgType.Request,
             Seq = 3,
         };
-        await transport.WriteFrameAsync(requestHeader, Array.Empty<byte>(), FrameConst.MaxBodySize, CancellationToken.None);
+        await transport.WriteFrameAsync(requestHeader, Array.Empty<byte>(), FrameGen.MaxBodySize, CancellationToken.None);
 
         using var cts = new CancellationTokenSource(5000);
-        var (responseHeader, responseBody) = await transport.ReadFrameAsync(FrameConst.MaxBodySize, cts.Token);
+        var (responseHeader, responseBody) = await transport.ReadFrameAsync(FrameGen.MaxBodySize, cts.Token);
 
         Assert.Equal(MsgType.Response, responseHeader.Type);
         Assert.Equal(3u, responseHeader.Seq);
@@ -86,33 +86,33 @@ public sealed class KcpTransportTest
         // 而非发出后由对端丢弃——对齐 FrameIO.WriteFrameAsync 语义。
         var badType = new Header
         {
-            Magic = FrameConst.Magic,
-            Version = FrameConst.Version,
+            Magic = FrameGen.Magic,
+            Version = FrameGen.Version,
             Type = (MsgType)4,
             Seq = 1,
         };
         await Assert.ThrowsAsync<ProtocolException>(() =>
-            transport.WriteFrameAsync(badType, Array.Empty<byte>(), FrameConst.MaxBodySize, CancellationToken.None));
+            transport.WriteFrameAsync(badType, Array.Empty<byte>(), FrameGen.MaxBodySize, CancellationToken.None));
 
         var zeroSeq = new Header
         {
-            Magic = FrameConst.Magic,
-            Version = FrameConst.Version,
+            Magic = FrameGen.Magic,
+            Version = FrameGen.Version,
             Type = MsgType.Request,
             Seq = 0,
         };
         await Assert.ThrowsAsync<ProtocolException>(() =>
-            transport.WriteFrameAsync(zeroSeq, Array.Empty<byte>(), FrameConst.MaxBodySize, CancellationToken.None));
+            transport.WriteFrameAsync(zeroSeq, Array.Empty<byte>(), FrameGen.MaxBodySize, CancellationToken.None));
 
         var badVersion = new Header
         {
-            Magic = FrameConst.Magic,
+            Magic = FrameGen.Magic,
             Version = 3,
             Type = MsgType.Request,
             Seq = 1,
         };
         await Assert.ThrowsAsync<ProtocolException>(() =>
-            transport.WriteFrameAsync(badVersion, Array.Empty<byte>(), FrameConst.MaxBodySize, CancellationToken.None));
+            transport.WriteFrameAsync(badVersion, Array.Empty<byte>(), FrameGen.MaxBodySize, CancellationToken.None));
     }
 
     [Fact]
@@ -124,13 +124,13 @@ public sealed class KcpTransportTest
 
         var header = new Header
         {
-            Magic = FrameConst.Magic,
-            Version = FrameConst.Version,
+            Magic = FrameGen.Magic,
+            Version = FrameGen.Version,
             Type = MsgType.Request,
             Seq = 1,
         };
         await Assert.ThrowsAsync<ArgumentNullException>(() =>
-            transport.WriteFrameAsync(header, null!, FrameConst.MaxBodySize, CancellationToken.None));
+            transport.WriteFrameAsync(header, null!, FrameGen.MaxBodySize, CancellationToken.None));
     }
 
     [Fact]
@@ -144,8 +144,8 @@ public sealed class KcpTransportTest
 
         var header = new Header
         {
-            Magic = FrameConst.Magic,
-            Version = FrameConst.Version,
+            Magic = FrameGen.Magic,
+            Version = FrameGen.Version,
             Type = MsgType.Request,
             Seq = 11,
         };
@@ -182,8 +182,8 @@ public sealed class KcpTransportTest
             // 触发窗口满 → 后续写阻塞 → 800ms 超时抛 NetworkException。
             var header = new Header
             {
-                Magic = FrameConst.Magic,
-                Version = FrameConst.Version,
+                Magic = FrameGen.Magic,
+                Version = FrameGen.Version,
                 Type = MsgType.Request,
                 Seq = 1,
             };
@@ -194,7 +194,7 @@ public sealed class KcpTransportTest
             {
                 try
                 {
-                    await transport.WriteFrameAsync(header, payload, FrameConst.MaxBodySize, CancellationToken.None);
+                    await transport.WriteFrameAsync(header, payload, FrameGen.MaxBodySize, CancellationToken.None);
                     header.Seq = (uint)(i + 2);
                     writes++;
                 }

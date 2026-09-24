@@ -1,11 +1,7 @@
 using System;
-using System.Collections.Generic;
 using System.Threading;
 using System.Threading.Tasks;
 using Atlas.Errors;
-using Atlas.Frame;
-using Atlas.Scheduling;
-using Atlas.Transport;
 using AtlasTimeoutException = Atlas.Errors.TimeoutException;
 
 namespace Atlas.Client;
@@ -21,6 +17,9 @@ public sealed class InvokeOptions
     public bool NoIdempotency { get; set; }
 }
 
+// Channel 的调用面：入口重载、幂等键决策、重连排队与单次请求-响应往返。
+// 组帧/在途表/读循环分发分别在 Channel.Frame.cs / Channel.Inflight.cs /
+// Channel.ReadLoop.cs（同一 partial 类型，按职责分文件）。
 public sealed partial class Channel
 {
     // InvokeRawAsync 发送原始 payload；payload 为 null 时只发送 operation，用于 Ping 等空请求。
@@ -32,9 +31,10 @@ public sealed partial class Channel
     }
 
     // InvokeRawAsync（带调用级选项）：显式幂等键或本次不携带（逃生门，对齐 Go/TS 的
-    // WithIdempotencyKey/WithNoIdempotency）。
+    // WithIdempotencyKey/WithNoIdempotency）；options 为 null 等价于无选项重载
+    //（IAtlasInvoker 重载语义，生成 stub 透传）。
     public Task<byte[]> InvokeRawAsync(
-        string operation, byte[]? payload, InvokeOptions options, CancellationToken cancellationToken)
+        string operation, byte[]? payload, InvokeOptions? options, CancellationToken cancellationToken)
     {
         return InvokeRawCoreAsync(operation, payload, cancellationToken, failFast: false,
             idempotencyKey: options?.IdempotencyKey, noIdempotency: options?.NoIdempotency ?? false);
@@ -46,6 +46,8 @@ public sealed partial class Channel
         return InvokeRawCoreAsync(operation, payload, cancellationToken, failFast: true);
     }
 
+    // InvokeRawCoreAsync 是调用入口的唯一实现源：决定幂等键 → 钩子窗口直通 →
+    // 重连排队 → 单次往返。
     private async Task<byte[]> InvokeRawCoreAsync(
         string operation,
         byte[]? payload,
@@ -66,41 +68,48 @@ public sealed partial class Channel
         {
             return await InvokeOnceAsync(operation, payload, cancellationToken, requestID);
         }
-        // 排队判定与入队在 _gate 临界区原子完成：drain 与入队互斥，
-        // 不存在「drain 空队列后请求才入队」的永久遗留窗口（对齐 Go B4 修复）。
-        QueuedInvoke? queued = null;
-        lock (_gate)
-        {
-            if (_isClosed)
-            {
-                throw new NetworkException("通道已关闭");
-            }
-            var reconnecting = State == ClientState.Reconnecting;
-            if (reconnecting && !failFast)
-            {
-                if (_queue.Count >= _options.QueueSize)
-                {
-                    throw new NetworkException($"重连排队已满（{_options.QueueSize}）");
-                }
-                // 排队期限 = 单次超时（invokeTimeout）：到点未 drain 则由看护认领
-                // 超时失败——排队阶段计入超时（对齐 Go enqueueLocked：不再无限等待重连）。
-                var deadline = DateTime.UtcNow.AddMilliseconds(_options.InvokeTimeoutMs);
-                queued = new QueuedInvoke(
-                    operation,
-                    payload,
-                    new TaskCompletionSource<byte[]>(
-                        TaskCreationOptions.RunContinuationsAsynchronously),
-                    deadline,
-                    requestID);
-                _queue.Enqueue(queued);
-            }
-        }
+        var queued = EnqueueIfReconnecting(operation, payload, failFast, requestID);
         if (queued != null)
         {
             StartQueueDeadlineWatch(queued);
             return await queued.Completion.Task;
         }
         return await InvokeOnceAsync(operation, payload, cancellationToken, requestID);
+    }
+
+    // EnqueueIfReconnecting 在 _gate 临界区原子完成「排队判定 + 入队」：drain 与入队
+    // 互斥，不存在「drain 空队列后请求才入队」的永久遗留窗口（对齐 Go B4 修复）。
+    // 返回 null = 不排队（非重连态或 failFast），由调用方直接发请求。
+    private QueuedInvoke? EnqueueIfReconnecting(
+        string operation, byte[]? payload, bool failFast, string? requestID)
+    {
+        lock (_gate)
+        {
+            if (_isClosed)
+            {
+                throw new NetworkException("通道已关闭");
+            }
+            if (State != ClientState.Reconnecting || failFast)
+            {
+                return null;
+            }
+            if (_queue.Count >= _options.QueueSize)
+            {
+                throw new NetworkException($"重连排队已满（{_options.QueueSize}）");
+            }
+            // 排队期限 = 单次超时（invokeTimeout）：到点未 drain 则由看护认领
+            // 超时失败——排队阶段计入超时（对齐 Go enqueueLocked：不再无限等待重连）。
+            var deadline = DateTime.UtcNow.AddMilliseconds(_options.InvokeTimeoutMs);
+            var queued = new QueuedInvoke(
+                operation,
+                payload,
+                new TaskCompletionSource<byte[]>(
+                    TaskCreationOptions.RunContinuationsAsynchronously),
+                deadline,
+                requestID);
+            _queue.Enqueue(queued);
+            return queued;
+        }
     }
 
     // StartQueueDeadlineWatch 启动排队超时看护：到点后原子认领并发送超时结果
@@ -121,6 +130,7 @@ public sealed partial class Channel
             new AtlasTimeoutException($"排队超时（{queued.Operation}）"));
     }
 
+    // InvokeOnceAsync 执行一次请求-响应往返（组帧 → 注册在途 → 写帧 → 等回执 → 还原 payload）。
     private async Task<byte[]> InvokeOnceAsync(
         string operation,
         byte[]? payload,
@@ -141,409 +151,6 @@ public sealed partial class Channel
         {
             RemoveInflight(request.Key, request.Inflight);
             throw;
-        }
-    }
-
-    // BuildRequestFrame 组请求帧（header + body）：帧级会话槽开启（UDP/KCP）且
-    // 凭据提供者就绪时，凭据非空则置位 FrameConst.FlagSession 并以带槽布局封装
-    //（[opLen][op][sessionLen][session][payload]）；凭据为空发匿名帧（旧布局、
-    // 不置位）；长连接（TCP/WS）恒走旧布局（对齐 Go invokeOnce 组帧）。
-    private (Header Header, byte[] Body) BuildRequestFrame(string operation, byte[]? payload, string? requestID)
-    {
-        var header = new Header
-        {
-            Type = MsgType.Request,
-            Version = (byte)_options.Serializer.Version,
-        };
-        if (_frameSessionSlot && _options.SessionTokenProvider != null)
-        {
-            var token = _options.SessionTokenProvider();
-            if (!string.IsNullOrEmpty(token))
-            {
-                header.Flags = FrameConst.FlagSession;
-            }
-        }
-        if (!string.IsNullOrEmpty(requestID))
-        {
-            header.Flags |= FrameConst.FlagRequestID;
-        }
-        var slotToken = _frameSessionSlot && _options.SessionTokenProvider != null
-            ? _options.SessionTokenProvider()
-            : null;
-        return (header, Body.BuildRequestBodyFull(operation, slotToken, requestID, payload));
-    }
-
-    // Snippet 取 payload 调试摘要（Debug 日志用：完整 JSON 截断 512 字节，防日志爆炸）。
-    private static string Snippet(byte[]? data)
-    {
-        if (data == null || data.Length == 0)
-        {
-            return "{}";
-        }
-        var text = System.Text.Encoding.UTF8.GetString(data);
-        return text.Length > 512 ? text[..512] + "...(truncated)" : text;
-    }
-
-    // NewRequestID 生成请求幂等键（RNGCryptoServiceProvider 12 字节 base64url，无外部依赖）。
-    private static string NewRequestID()
-    {
-        var b = new byte[12];
-        using (var rng = System.Security.Cryptography.RandomNumberGenerator.Create())
-        {
-            rng.GetBytes(b);
-        }
-        return Convert.ToBase64String(b).TrimEnd('=').Replace('+', '-').Replace('/', '_');
-    }
-
-    private (InflightKey Key, Inflight Inflight, ITransport Transport) RegisterInflight()
-    {
-        lock (_gate)
-        {
-            // Reconnecting 期间不注册 in-flight（写死连接无意义，等完整超时）。
-            // 例外：会话钩子执行期间（hookBypass，对齐 Go invokeOnce）放行——
-            // 钩子的重登请求正是为建立会话，必须直通当前代连接。
-            if (_isClosed || _transport == null)
-            {
-                throw new NetworkException("通道未连接");
-            }
-            if (!IsHookBypass() && State != ClientState.Connected)
-            {
-                // 非钩子窗口：仅 Connected 可注册（Connecting/Reconnecting/Disconnected
-                // 均拒绝——Reconnecting 由排队层拦截，failFast 在此失败）。
-                throw new NetworkException("通道未连接");
-            }
-
-            _sequence = NextNonZero(_sequence);
-            var key = new InflightKey(_epoch, _sequence);
-            var inflight = new Inflight();
-            _inflight.Add(key, inflight);
-            return (key, inflight, _transport);
-        }
-    }
-
-    private async Task WriteRequestAsync(
-        (InflightKey Key, Inflight Inflight, ITransport Transport) request,
-        Header header,
-        byte[] body,
-        CancellationToken cancellationToken)
-    {
-        var acquired = false;
-        try
-        {
-            await _writeLock.WaitAsync(cancellationToken);
-            acquired = true;
-            header.Seq = request.Key.Sequence;
-            await request.Transport.WriteFrameAsync(
-                header,
-                body,
-                _options.MaxBodySize,
-                cancellationToken);
-        }
-        catch (ProtocolException)
-        {
-            throw;
-        }
-        catch (Exception exception)
-        {
-            throw new NetworkException("写帧失败", exception);
-        }
-        finally
-        {
-            if (acquired)
-            {
-                _writeLock.Release();
-            }
-        }
-    }
-
-    private async Task<ReplyData> AwaitReplyAsync(
-        (InflightKey Key, Inflight Inflight, ITransport Transport) request,
-        CancellationToken cancellationToken)
-    {
-        using var timeout = new CancellationTokenSource(_options.InvokeTimeoutMs);
-        using var linked = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken, timeout.Token);
-        var interrupted = Task.Delay(Timeout.Infinite, linked.Token);
-        var completed = await Task.WhenAny(request.Inflight.Completion.Task, interrupted);
-        if (completed == request.Inflight.Completion.Task || request.Inflight.Completion.Task.IsCompleted)
-        {
-            return await request.Inflight.Completion.Task;
-        }
-
-        // 只有成功删除 key 的路径才拥有超时/取消结果；若响应或断连已先认领，
-        // 必须等待同一个 Completion，避免「key 已删但 TCS 尚未置位」时误报超时。
-        if (!RemoveInflight(request.Key, request.Inflight))
-        {
-            return await request.Inflight.Completion.Task;
-        }
-
-        if (cancellationToken.IsCancellationRequested)
-        {
-            request.Inflight.Completion.TrySetException(
-                new NetworkException("调用已取消", new OperationCanceledException(cancellationToken)));
-        }
-        else
-        {
-            request.Inflight.Completion.TrySetException(
-                new AtlasTimeoutException($"调用 {request.Key.Sequence} 超时（{_options.InvokeTimeoutMs}ms）"));
-        }
-        return await request.Inflight.Completion.Task;
-    }
-
-    private static byte[] ToPayload(ReplyData reply)
-    {
-        if (reply.Status == null)
-        {
-            return reply.Data;
-        }
-        throw new BusinessException(
-            reply.Status.Code,
-            reply.Status.Reason,
-            reply.Status.Message,
-            reply.Status.Metadata);
-    }
-
-    private async Task ReadLoopAsync(ITransport transport, uint epoch)
-    {
-        Exception cause;
-        try
-        {
-            while (!_closed.IsCancellationRequested)
-            {
-                var (header, body) = await transport.ReadFrameAsync(
-                    _options.MaxBodySize,
-                    _closed.Token);
-                // 快路径：无测试钩子时同步分发（避免每帧 async 状态机分配，评审
-                // M2-3 note——帧率敏感）；有钩子（仅测试）才走 async 包装。
-                if (BeforeInflightCompletion == null)
-                {
-                    DispatchFrame(epoch, header, body);
-                }
-                else
-                {
-                    await DispatchFrameAsync(epoch, header, body);
-                }
-            }
-            cause = new NetworkException("通道已关闭");
-        }
-        catch (ProtocolException exception)
-        {
-            cause = exception;
-        }
-        catch (Exception exception)
-        {
-            cause = new NetworkException("读取帧失败", exception);
-        }
-
-        FailGeneration(epoch, cause);
-
-        // M4：网络错误退出（非协议致命、非主动关闭）驱动自动重连。
-        // 协议级致命错误（ProtocolException：版本不匹配/帧非法）直接终止、不重连
-        //（对标 Go：不可重试、连接已断；ChannelTest.ResponseVersionMismatch 依赖此语义）。
-        //
-        // 置 Reconnecting 与判定同临界区、在 FailGeneration 结算后立即完成（其间无
-        // await 间隙）：踢线后 in-flight 被结算（kick Invoke 返回 NetworkException），
-        // 若此刻状态仍是 Disconnected 且到置 Reconnecting 前有异步间隙（关闭旧连接等），
-        // 紧接发出的 Invoke 会看到 Disconnected 而不排队、直接打向已断连接。提前到锁内
-        // 置位消除该窗口——对标 Go supervisor：<-g.done 后立即置 StateReconnecting 再重连。
-        var shouldReconnect = false;
-        lock (_gate)
-        {
-            shouldReconnect = !_isClosed
-                && _options.AutoReconnect
-                && cause is not ProtocolException
-                && !_reconnecting;
-            if (shouldReconnect)
-            {
-                _reconnecting = true;
-                SetState(ClientState.Reconnecting);
-            }
-        }
-        await CloseTransportAsync(transport);
-        if (shouldReconnect)
-        {
-            await RunReconnectLoopAsync();
-        }
-    }
-
-    private async Task DispatchFrameAsync(uint epoch, Header header, byte[] body)
-    {
-        var (inflight, reply) = DispatchFrameCore(epoch, header, body);
-        if (inflight == null)
-        {
-            return;
-        }
-        // 测试钩子：在「已取 key、未设结果」窗口暂停（制造超时/响应竞态窗口）。
-        await BeforeInflightCompletion!();
-        inflight.Completion.TrySetResult(reply!);
-    }
-
-    // DispatchFrame 同步分发（生产快路径，无测试钩子时零 async 状态机分配，评审
-    // M2-3 note——帧率敏感热路径）。
-    private void DispatchFrame(uint epoch, Header header, byte[] body)
-    {
-        var (inflight, reply) = DispatchFrameCore(epoch, header, body);
-        if (inflight != null)
-        {
-            inflight.Completion.TrySetResult(reply!);
-        }
-    }
-
-    private (Inflight? Inflight, ReplyData? Reply) DispatchFrameCore(
-        uint epoch, Header header, byte[] body)
-    {
-        if (header.Type == MsgType.Notify)
-        {
-            DispatchNotify(body);
-            return (null, null);
-        }
-        if (header.Type != MsgType.Response)
-        {
-            throw new ProtocolException($"客户端收到非法帧类型 {(byte)header.Type}");
-        }
-        if (header.Version != _options.Serializer.Version)
-        {
-            throw new ProtocolException($"响应帧 version {header.Version} 与载荷编码 {_options.Serializer.Version} 不一致");
-        }
-
-        var reply = Reply.DecodeReply(body);
-        var key = new InflightKey(epoch, header.Seq);
-        return (TakeInflight(key), reply);
-    }
-
-    private Inflight? TakeInflight(InflightKey key)
-    {
-        lock (_gate)
-        {
-            if (!_inflight.TryGetValue(key, out var inflight))
-            {
-                return null;
-            }
-            _inflight.Remove(key);
-            return inflight;
-        }
-    }
-
-    // DispatchNotify 解析 Notify 帧并分发到全部订阅者。帧体解析失败静默丢弃：
-    // 推送非请求-响应匹配路径，坏帧不影响连接（对标 Go dispatchNotify）。
-    // handler 经 AtlasScheduler 发布（默认线程池；注入调度器后在注入上下文执行）
-    // 且异常被隔离，单 handler 崩溃不影响其他分发。
-    private void DispatchNotify(byte[] body)
-    {
-        string op;
-        byte[] payload;
-        NotifyHandler[] handlers;
-        try
-        {
-            (op, payload) = Body.ParseRequestBody(body);
-        }
-        catch (ProtocolException)
-        {
-            return; // 帧体解析失败静默丢弃（推送非匹配路径，坏帧不影响连接）。
-        }
-        lock (_notifyGate)
-        {
-            if (!_notifies.TryGetValue(op, out var entries))
-            {
-                return;
-            }
-            handlers = new NotifyHandler[entries.Count];
-            for (var i = 0; i < entries.Count; i++)
-            {
-                handlers[i] = entries[i].Handler;
-            }
-        }
-        foreach (var handler in handlers)
-        {
-            // handler 经 AtlasScheduler 发布（默认线程池；Unity 注入主线程
-            // SynchronizationContext 后在主线程执行）——SafeNotify 内捕获异常。
-            AtlasScheduler.Post(() => SafeNotify(handler, op, payload));
-        }
-    }
-
-    // SafeNotify 单 handler 的保护执行：异常被捕获，不影响其他分发或读循环
-    //（对标 Go safeNotify 的 recover）。在 AtlasScheduler 发布的回调内同步执行。
-    private static void SafeNotify(NotifyHandler handler, string op, byte[] payload)
-    {
-        try
-        {
-            handler(op, payload);
-        }
-        catch (Exception)
-        {
-            // 单 handler 异常隔离（对标 Go safeNotify 的 recover）。
-        }
-    }
-
-    private void FailGeneration(uint epoch, Exception cause)
-    {
-        var failed = new List<Inflight>();
-        lock (_gate)
-        {
-            foreach (var pair in _inflight)
-            {
-                if (pair.Key.Epoch == epoch)
-                {
-                    failed.Add(pair.Value);
-                }
-            }
-            foreach (var inflight in failed)
-            {
-                RemoveInflightLocked(inflight);
-            }
-            if (_epoch == epoch)
-            {
-                _transport = null;
-                _generationFault = cause; // 本代已死：记录退出原因（settle 前核对用）。
-                SetState(ClientState.Disconnected);
-            }
-        }
-        foreach (var inflight in failed)
-        {
-            inflight.Completion.TrySetException(cause);
-        }
-    }
-
-    private void FailAllInflight(Exception cause)
-    {
-        List<Inflight> failed;
-        lock (_gate)
-        {
-            failed = new List<Inflight>(_inflight.Values);
-            _inflight.Clear();
-        }
-        foreach (var inflight in failed)
-        {
-            inflight.Completion.TrySetException(cause);
-        }
-    }
-
-    private bool RemoveInflight(InflightKey key, Inflight inflight)
-    {
-        lock (_gate)
-        {
-            if (_inflight.TryGetValue(key, out var current) && ReferenceEquals(current, inflight))
-            {
-                _inflight.Remove(key);
-                return true;
-            }
-            return false;
-        }
-    }
-
-    private void RemoveInflightLocked(Inflight inflight)
-    {
-        InflightKey? found = null;
-        foreach (var pair in _inflight)
-        {
-            if (ReferenceEquals(pair.Value, inflight))
-            {
-                found = pair.Key;
-                break;
-            }
-        }
-        if (found.HasValue)
-        {
-            _inflight.Remove(found.Value);
         }
     }
 }

@@ -179,7 +179,7 @@ public sealed class KcpEchoServer : IAsyncDisposable
         // 帧组装：先头消息（16B）再 body 消息；回显同帧（头+body 两次发送）。
         private async Task HandleMessageAsync(byte[] first)
         {
-            if (first.Length != FrameConst.HeaderSize)
+            if (first.Length != FrameGen.HeaderSize)
             {
                 // 非帧首消息：按坏消息丢弃（保持会话存活）。
                 return;

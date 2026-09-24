@@ -23,7 +23,7 @@ public sealed class BodySessionTest
     {
         var body = Body.BuildRequestBodyWithSession(Operation, "tok-abc", Encoding.UTF8.GetBytes(@"{""ruleset"":""rank""}"));
 
-        var (operation, session, payload) = Body.ParseRequestBodyWithSession(body, FrameConst.FlagSession);
+        var (operation, session, payload) = Body.ParseRequestBodyWithSession(body, FrameGen.FlagSession);
 
         Assert.Equal(Operation, operation);
         Assert.Equal("tok-abc", session);
@@ -55,7 +55,7 @@ public sealed class BodySessionTest
         var truncated = new byte[body.Length - 1];
         Array.Copy(body, truncated, truncated.Length);
 
-        Assert.Throws<ProtocolException>(() => Body.ParseRequestBodyWithSession(truncated, FrameConst.FlagSession));
+        Assert.Throws<ProtocolException>(() => Body.ParseRequestBodyWithSession(truncated, FrameGen.FlagSession));
     }
 
     // SessionSlot_MissingLength 验证置位但槽长度字节缺席时报协议错误。
@@ -66,7 +66,7 @@ public sealed class BodySessionTest
         var body = Body.BuildRequestBody("/op", new byte[] { 1 });
 
         var exception = Assert.Throws<ProtocolException>(() =>
-            Body.ParseRequestBodyWithSession(body, FrameConst.FlagSession));
+            Body.ParseRequestBodyWithSession(body, FrameGen.FlagSession));
         Assert.Contains("缺少", exception.Message);
     }
 
@@ -74,7 +74,7 @@ public sealed class BodySessionTest
     [Fact]
     public void SessionSlot_OverLimit_ThrowsProtocol()
     {
-        var oversized = new string('t', FrameConst.MaxSessionLen + 1);
+        var oversized = new string('t', Body.MaxSessionLen + 1);
 
         Assert.Throws<ProtocolException>(() =>
             Body.BuildRequestBodyWithSession("/op", oversized, null));
@@ -84,10 +84,10 @@ public sealed class BodySessionTest
     [Fact]
     public void SessionSlot_AtLimit_RoundTrips()
     {
-        var token = new string('t', FrameConst.MaxSessionLen);
+        var token = new string('t', Body.MaxSessionLen);
         var body = Body.BuildRequestBodyWithSession("/op", token, null);
 
-        var (_, session, _) = Body.ParseRequestBodyWithSession(body, FrameConst.FlagSession);
+        var (_, session, _) = Body.ParseRequestBodyWithSession(body, FrameGen.FlagSession);
 
         Assert.Equal(token, session);
     }
@@ -98,28 +98,28 @@ public sealed class BodySessionTest
     {
         var header = new Header
         {
-            Magic = FrameConst.Magic,
-            Version = FrameConst.Version,
+            Magic = FrameGen.Magic,
+            Version = FrameGen.Version,
             Type = MsgType.Request,
-            Flags = FrameConst.FlagSession,
+            Flags = FrameGen.FlagSession,
             Seq = 7,
         };
         var body = Body.BuildRequestBodyWithSession("/op", "tok", null);
 
         // 流式：WriteFrameAsync/ReadFrameAsync 往返。
         await using var stream = new System.IO.MemoryStream();
-        await FrameIO.WriteFrameAsync(stream, header, body, FrameConst.MaxBodySize, System.Threading.CancellationToken.None);
+        await FrameIO.WriteFrameAsync(stream, header, body, FrameGen.MaxBodySize, System.Threading.CancellationToken.None);
         stream.Position = 0;
         var (streamHeader, streamBody) = await FrameIO.ReadFrameAsync(
-            stream, FrameConst.MaxBodySize, System.Threading.CancellationToken.None);
-        Assert.Equal(FrameConst.FlagSession, streamHeader.Flags);
+            stream, FrameGen.MaxBodySize, System.Threading.CancellationToken.None);
+        Assert.Equal(FrameGen.FlagSession, streamHeader.Flags);
         Assert.Equal(7u, streamHeader.Seq);
         Assert.Equal(body, streamBody);
 
         // 消息边界：EncodeMessage/DecodeMessage 往返。
-        var message = FrameIO.EncodeMessage(header, body, FrameConst.MaxBodySize);
-        var (messageHeader, messageBody) = FrameIO.DecodeMessage(message, FrameConst.MaxBodySize);
-        Assert.Equal(FrameConst.FlagSession, messageHeader.Flags);
+        var message = FrameIO.EncodeMessage(header, body, FrameGen.MaxBodySize);
+        var (messageHeader, messageBody) = FrameIO.DecodeMessage(message, FrameGen.MaxBodySize);
+        Assert.Equal(FrameGen.FlagSession, messageHeader.Flags);
         Assert.Equal(body, messageBody);
     }
 
@@ -129,17 +129,17 @@ public sealed class BodySessionTest
     {
         var header = new Header
         {
-            Magic = FrameConst.Magic,
-            Version = FrameConst.Version,
+            Magic = FrameGen.Magic,
+            Version = FrameGen.Version,
             Type = MsgType.Request,
-            Flags = FrameConst.FlagSession,
+            Flags = FrameGen.FlagSession,
             Seq = 7,
         };
 
         var bytes = header.Encode();
 
-        Assert.Equal(FrameConst.HeaderSize, bytes.Length);
-        Assert.Equal(FrameConst.FlagSession, bytes[6]);
+        Assert.Equal(FrameGen.HeaderSize, bytes.Length);
+        Assert.Equal(FrameGen.FlagSession, bytes[6]);
         Assert.Equal(0, bytes[7]);
     }
 
@@ -152,8 +152,8 @@ public sealed class BodySessionTest
     {
         var header = new Header
         {
-            Magic = FrameConst.Magic,
-            Version = FrameConst.Version,
+            Magic = FrameGen.Magic,
+            Version = FrameGen.Version,
             Type = MsgType.Request,
             Flags = flags,
             Seq = 1,

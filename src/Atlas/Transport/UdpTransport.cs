@@ -81,7 +81,7 @@ public sealed class UdpTransport : ITransport
                 throw new OperationCanceledException(cancellationToken);
             }
 
-            if (received < FrameConst.HeaderSize)
+            if (received < FrameGen.HeaderSize)
             {
                 continue; // 短于帧头：坏数据报，静默丢弃
             }
@@ -110,10 +110,10 @@ public sealed class UdpTransport : ITransport
         {
             throw new ArgumentNullException(nameof(body));
         }
-        if (body.Length + FrameConst.HeaderSize > MaxDatagramSize)
+        if (body.Length + FrameGen.HeaderSize > MaxDatagramSize)
         {
             throw new ProtocolException(
-                $"udp: 数据报过大: {body.Length} body + {FrameConst.HeaderSize} 头 > {MaxDatagramSize}");
+                $"udp: 数据报过大: {body.Length} body + {FrameGen.HeaderSize} 头 > {MaxDatagramSize}");
         }
 
         var datagram = FrameIO.EncodeMessage(header, body, maxBodySize);

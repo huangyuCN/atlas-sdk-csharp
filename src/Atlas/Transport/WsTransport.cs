@@ -86,9 +86,9 @@ public sealed class WsTransport : ITransport
     public async ValueTask<(Header Header, byte[] Body)> ReadFrameAsync(int maxBodySize, CancellationToken cancellationToken)
     {
         // 读侧消息上限：帧头 + body 上限（对齐 Go conn.SetReadLimit(HeaderSize+maxBodySize)）。
-        var maxMessageSize = FrameConst.HeaderSize + maxBodySize;
+        var maxMessageSize = FrameGen.HeaderSize + maxBodySize;
         var buffer = new byte[4096];
-        var received = new System.Collections.Generic.List<byte>(FrameConst.HeaderSize + 4096);
+        var received = new System.Collections.Generic.List<byte>(FrameGen.HeaderSize + 4096);
         while (true)
         {
             var result = await _socket.ReceiveAsync(buffer, cancellationToken);

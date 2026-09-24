@@ -33,7 +33,7 @@ public static class FrameIO
             throw new ArgumentNullException(nameof(stream));
         }
 
-        var headerBytes = new byte[FrameConst.HeaderSize];
+        var headerBytes = new byte[FrameGen.HeaderSize];
         await ReadFullAsync(stream, headerBytes, headerBytes.Length, cancellationToken);
         var header = Header.Decode(headerBytes);
         Header.Check(header, maxBodySize);
@@ -101,22 +101,22 @@ public static class FrameIO
         {
             throw new ArgumentNullException(nameof(message));
         }
-        if (message.Length < FrameConst.HeaderSize)
+        if (message.Length < FrameGen.HeaderSize)
         {
-            throw new ProtocolException($"消息短于帧头: {message.Length} < {FrameConst.HeaderSize}");
+            throw new ProtocolException($"消息短于帧头: {message.Length} < {FrameGen.HeaderSize}");
         }
 
-        var headerBytes = new byte[FrameConst.HeaderSize];
+        var headerBytes = new byte[FrameGen.HeaderSize];
         Array.Copy(message, headerBytes, headerBytes.Length);
         var header = Header.Decode(headerBytes);
         Header.Check(header, maxBodySize);
-        if ((ulong)(message.Length - FrameConst.HeaderSize) != header.Length)
+        if ((ulong)(message.Length - FrameGen.HeaderSize) != header.Length)
         {
-            throw new ProtocolException($"消息长度与 bodyLen 不一致: {message.Length - FrameConst.HeaderSize} != {header.Length}");
+            throw new ProtocolException($"消息长度与 bodyLen 不一致: {message.Length - FrameGen.HeaderSize} != {header.Length}");
         }
 
-        var body = new byte[message.Length - FrameConst.HeaderSize];
-        Buffer.BlockCopy(message, FrameConst.HeaderSize, body, 0, body.Length);
+        var body = new byte[message.Length - FrameGen.HeaderSize];
+        Buffer.BlockCopy(message, FrameGen.HeaderSize, body, 0, body.Length);
         return (header, body);
     }
 
@@ -125,11 +125,11 @@ public static class FrameIO
     {
         if (header.Magic == 0)
         {
-            header.Magic = FrameConst.Magic;
+            header.Magic = FrameGen.Magic;
         }
         if (header.Version == 0)
         {
-            header.Version = FrameConst.Version;
+            header.Version = FrameGen.Version;
         }
         header.Length = (uint)bodyLength;
         return header;

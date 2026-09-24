@@ -15,7 +15,7 @@ protobuf C# 实现：
 | json（=protojson） | 1 | `Atlas.Serialization.JsonSerializer` | `Google.Protobuf.JsonFormatter` / `JsonParser` |
 | protobuf 二进制 | 2 | `Atlas.Serialization.ProtobufSerializer` | `IMessage.ToByteArray` / 静态 `Parser.ParseFrom` |
 
-- **DTO 单一来源**：`protoc-gen-csharp` 产出的 `.pb.cs`（`IMessage`）一套类型，
+- **DTO 单一来源**：模板仓 descriptor set 经 `scripts/gen-dto.sh` 生成（`IMessage` 与 POCO 两套，来自同一份 IDL）；
   同一对象可经 `JsonSerializer`（ver=1）或 `ProtobufSerializer`（ver=2）双编码
   互通——不维护两份 DTO。
 - **帧头 version 随序列化器声明**：构造期白名单校验 `{1,2}`，出站帧头 version =
@@ -64,7 +64,7 @@ JSON」形态。线上字节即 proto3 JSON 映射：
 - **DTO 单套 vs 双套**：Go/TS 的 ver=1 DTO 与 ver=2 DTO 是不同类型（业务按编码
   选型引用）；C# 一套 `IMessage` 通吃，业务侧无需按编码维护两套类型。
 - **C# 强制 protojson**：Go 默认 JSONSerializer 可序列化任意 plain struct
-  （非 proto 类型）；C# 的 `JsonSerializer.Serialize` 入参必须为 `IMessage`。
+  （非 proto 类型）；C# 的 `JsonSerializer.Serialize` 既有 `IMessage` 重载，也有 POCO 对象重载（v2 起生成 stub 走后者，ver=2 的 `ProtobufSerializer` 仍只接受 `IMessage`）。
   游戏项目 proto 驱动下无差异；纯手写 JSON 对象直发在 C# 侧不支持（需先定义
   .proto → 生成 DTO）。
 

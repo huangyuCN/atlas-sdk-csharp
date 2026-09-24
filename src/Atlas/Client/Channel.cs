@@ -19,7 +19,7 @@ public sealed partial class Channel : IAsyncDisposable
     private readonly Func<CancellationToken, Task<ITransport>> _dial;
     private readonly ChannelOptions _options;
     // 帧级会话槽开关：无连接传输（UDP/KCP）为 true——请求帧凭据非空时置位
-    // FrameConst.FlagSession 携带会话槽；长连接（TCP/WS）为 false，身份按连接绑定
+    // FrameGen.FlagSession 携带会话槽；长连接（TCP/WS）为 false，身份按连接绑定
     //（对齐 Go channel.frameSessionSlot：按传输类型推导）。
     private readonly bool _frameSessionSlot;
     // _logger 是调试日志实现（默认 Error 级 stderr；LogSilence=静默哨兵）。
@@ -113,7 +113,9 @@ public sealed partial class Channel : IAsyncDisposable
     // 幂等语义：同一 (op, handler)（delegate 引用相等）重复注册只保留一份，
     // 重复退订安全。handler 默认在线程池执行（经 AtlasScheduler 发布；Unity 注入
     // 主线程同步上下文后在主线程执行）、异常隔离，不影响其他分发（对标 Go on）。
-    // 订阅挂在 Channel 层（不随连接代际丢失），重连成功后新连接天然继续收到推送。
+    // handler 收帧头载荷编码版本（ver=1 protojson / ver=2 protobuf wire），据此选解码器。
+    // 订阅挂在 Channel 层（不随连接代际丢失），重连成功后新连接天然继续收到推送；
+    // CloseAsync 关闭时订阅表被清空（关闭后不再分发推送）。
     public NotifySubscription On(string op, NotifyHandler handler)
     {
         if (handler == null)
@@ -175,36 +177,42 @@ public sealed partial class Channel : IAsyncDisposable
             CancelGeneration();
             await AwaitHeartbeatTasksAsync();
             var transport = await DialAsync(linked.Token);
-            if (!InstallTransport(transport, out var epoch))
-            {
-                await CloseTransportAsync(transport);
-                ThrowIfClosed();
-            }
-
-            if (AfterTransportInstalled != null)
-            {
-                await AfterTransportInstalled();
-            }
-            // 安装后置 Connected 前复查：Close 可能已并发执行（BeginClose 置
-            // _isClosed + 清 _transport）——此时不得置 Connected（对齐 M4-4
-            // zombie 语义：关闭后不得假活）。
-            lock (_gate)
-            {
-                if (_isClosed || _transport == null)
-                {
-                    throw new NetworkException("通道已关闭");
-                }
-            }
-            SetState(ClientState.Connected);
-            // 读循环是该代的生命周期管理者：网络错误退出后自行驱动自动重连
-            //（RunReconnectLoopAsync 在其中）；协议致命/主动关闭则直接结束。
-            _readLoop = Task.Run(() => ReadLoopAsync(transport, epoch));
-            StartGenerationHeartbeat(epoch);
+            await InstallConnectedTransportAsync(transport);
         }
         finally
         {
             _connectLock.Release();
         }
+    }
+
+    // InstallConnectedTransportAsync 安装新代传输并启动该代读循环/心跳（首连路径）。
+    // 读循环是该代的生命周期管理者：网络错误退出后自行驱动自动重连
+    //（RunReconnectLoopAsync 在其中）；协议致命/主动关闭则直接结束。
+    private async Task InstallConnectedTransportAsync(ITransport transport)
+    {
+        if (!InstallTransport(transport, out var epoch))
+        {
+            await CloseTransportAsync(transport);
+            ThrowIfClosed();
+        }
+
+        if (AfterTransportInstalled != null)
+        {
+            await AfterTransportInstalled();
+        }
+        // 安装后置 Connected 前复查：Close 可能已并发执行（BeginClose 置
+        // _isClosed + 清 _transport）——此时不得置 Connected（对齐 M4-4
+        // zombie 语义：关闭后不得假活）。
+        lock (_gate)
+        {
+            if (_isClosed || _transport == null)
+            {
+                throw new NetworkException("通道已关闭");
+            }
+        }
+        SetState(ClientState.Connected);
+        _readLoop = Task.Run(() => ReadLoopAsync(transport, epoch));
+        StartGenerationHeartbeat(epoch);
     }
 
     public async Task CloseAsync()
@@ -216,6 +224,7 @@ public sealed partial class Channel : IAsyncDisposable
         var closing = BeginClose();
         _closed.Cancel();
         CancelGeneration(); // 停当前代心跳。
+        ClearSubscriptions(); // 订阅随通道生命周期结束：关闭后不再分发任何推送。
 
         FailAllInflight(new NetworkException("通道已关闭"));
         FailAllQueued();
@@ -341,7 +350,7 @@ public sealed partial class Channel : IAsyncDisposable
         {
             throw new ArgumentException("Serializer 不能为空", nameof(options));
         }
-        if (options.Serializer.Version != FrameConst.Version && options.Serializer.Version != FrameConst.Version2)
+        if (options.Serializer.Version != FrameGen.Version && options.Serializer.Version != FrameGen.Version2)
         {
             throw new ArgumentException("Serializer Version 必须是 1 或 2", nameof(options));
         }

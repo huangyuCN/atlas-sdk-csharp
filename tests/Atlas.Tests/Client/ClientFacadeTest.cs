@@ -63,7 +63,7 @@ public sealed class ClientFacadeTest
 
         var received = new TaskCompletionSource<byte[]>(
             TaskCreationOptions.RunContinuationsAsynchronously);
-        var off = client.On("notify-op", (op, payload) => received.TrySetResult(payload));
+        var off = client.On("notify-op", (op, payload, _) => received.TrySetResult(payload));
         using (off)
         {
             await server.PushNotifyAsync("notify-op", new byte[] { 1, 2, 3 });
@@ -155,6 +155,6 @@ public sealed class ClientFacadeTest
         Assert.Equal(ChannelKind.Business, unknown.Kind); // 未知视图返回默认角色。
         await Assert.ThrowsAsync<NetworkException>(
             () => unknown.InvokeRawAsync("echo", Array.Empty<byte>(), CancellationToken.None));
-        using var off = unknown.On("op", (_, _) => { }); // 空退订句柄可 Dispose。
+        using var off = unknown.On("op", (_, _, _) => { }); // 空退订句柄可 Dispose。
     }
 }

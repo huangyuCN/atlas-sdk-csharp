@@ -15,14 +15,13 @@ using Xunit;
 
 namespace Atlas.Tests.Client;
 
-// GatewayOps 是 mock 网关协议 operation 共享常量（SmokeMockTest 外部测试类与
-// MockGatewayServer 分派共用——单一来源，避免两份字面量漂移；与 Go/TS mock
-// 网关的 op 名称逐字一致）。
+// GatewayOps 是 mock 网关协议 operation 共享常量：直接取生成物（SessionProtocolOps），
+// 本类只做别名，避免测试与协议两处手写字面量（与 Go/TS mock 网关的 op 名称逐字一致）。
 internal static class GatewayOps
 {
-    public const string Register = "/gateway.v1.GatewayAuth/Register";
-    public const string Login = "/gateway.v1.GatewayAuth/Login";
-    public const string Heartbeat = "/gateway.v1.GatewayAuth/Heartbeat";
+    public const string Register = Atlas.Gateway.V1.SessionProtocolOps.Register;
+    public const string Login = Atlas.Gateway.V1.SessionProtocolOps.Login;
+    public const string Heartbeat = Atlas.Gateway.V1.SessionProtocolOps.Heartbeat;
 }
 
 // SmokeMockTest 覆盖 mock 网关闭环：注册→登录→业务心跳→Notify 收推→传输 Ping 往返。
@@ -43,26 +42,25 @@ public sealed class SmokeMockTest
         var registerReply = (RegisterReply)serializer.Deserialize(registerResp, typeof(RegisterReply));
         Assert.Equal("p1", registerReply.PlayerId);
 
-        // 登录：player_id（注册返回）+ password → token + player_id + server_time。
-        var loginReq = new LoginRequest { PlayerId = registerReply.PlayerId, Password = "pw-1" };
+        // 登录：player_id（注册返回）+ password + client_version → token + player_id。
+        // 客户端版本单一来源（M1 上报）：mock 网关断言请求已携带 client_version。
+        var loginReq = new LoginRequest
+        {
+            PlayerId = registerReply.PlayerId,
+            Password = "pw-1",
+            ClientVersion = AtlasVersion.Value,
+        };
         var loginBytes = serializer.Serialize(loginReq);
         var loginResp = await channel.InvokeRawAsync(GatewayOps.Login, loginBytes, CancellationToken.None);
         var loginReply = (LoginReply)serializer.Deserialize(loginResp, typeof(LoginReply));
         Assert.Equal("p1", loginReply.PlayerId);
         Assert.False(string.IsNullOrEmpty(loginReply.Token));
-        Assert.True(loginReply.ServerTimeUnixMs > 0);
 
-        // 业务心跳：token + player_id + ts → 回显 ts + server_time。
-        var heartbeatReq = new HeartbeatRequest
-        {
-            Token = loginReply.Token,
-            PlayerId = "p1",
-            Ts = 1234567890L,
-        };
+        // 业务心跳：ts → 回 server_time（权威 proto：身份由连接/帧槽承载，消息体零身份字段）。
+        var heartbeatReq = new HeartbeatRequest { Ts = 1234567890L };
         var heartbeatBytes = serializer.Serialize(heartbeatReq);
         var heartbeatResp = await channel.InvokeRawAsync(GatewayOps.Heartbeat, heartbeatBytes, CancellationToken.None);
         var heartbeatReply = (HeartbeatReply)serializer.Deserialize(heartbeatResp, typeof(HeartbeatReply));
-        Assert.Equal(1234567890L, heartbeatReply.Ts);
         Assert.True(heartbeatReply.ServerTimeUnixMs > 0);
 
         // 网关应收到四种 op（顺序注册→登录→业务心跳；Ping 默认关闭）。
@@ -77,7 +75,7 @@ public sealed class SmokeMockTest
         var received = NewSignal();
 
         // 订阅业务通知 op（如匹配成功推送）。
-        channel.On("match.found", (op, payload) =>
+        channel.On("match.found", (op, payload, _) =>
         {
             Assert.Equal("match.found", op);
             var serializer = new JsonSerializer();
@@ -152,8 +150,8 @@ internal sealed class MockGatewayServer : IAsyncDisposable
     {
         var stream = await WaitForStreamAsync();
         var body = Body.BuildRequestBody(operation, payload);
-        var header = new Header { Type = MsgType.Notify, Version = FrameConst.Version, Seq = 1 };
-        await FrameIO.WriteFrameAsync(stream, header, body, FrameConst.MaxBodySize, _stop.Token);
+        var header = new Header { Type = MsgType.Notify, Version = FrameGen.Version, Seq = 1 };
+        await FrameIO.WriteFrameAsync(stream, header, body, FrameGen.MaxBodySize, _stop.Token);
     }
 
     public async ValueTask DisposeAsync()
@@ -202,7 +200,7 @@ internal sealed class MockGatewayServer : IAsyncDisposable
         }
         while (!_stop.IsCancellationRequested)
         {
-            var (header, body) = await FrameIO.ReadFrameAsync(stream, FrameConst.MaxBodySize, _stop.Token);
+            var (header, body) = await FrameIO.ReadFrameAsync(stream, FrameGen.MaxBodySize, _stop.Token);
             var (operation, _s, _rid, payload) = Body.ParseRequestBodyFull(body, header.Flags);
             void discard1() { _ = (_s, _rid); }
             discard1();
@@ -229,6 +227,7 @@ internal sealed class MockGatewayServer : IAsyncDisposable
                 {
                     var req = (LoginRequest)_serializer.Deserialize(payload, typeof(LoginRequest));
                     Assert.False(string.IsNullOrEmpty(req.PlayerId), "登录请求缺 player_id");
+                    Assert.False(string.IsNullOrEmpty(req.ClientVersion), "登录请求缺 client_version（M1）");
                     await WriteReplyAsync(
                         stream,
                         header.Seq,
@@ -236,7 +235,6 @@ internal sealed class MockGatewayServer : IAsyncDisposable
                         {
                             Token = "tok-" + req.PlayerId,
                             PlayerId = req.PlayerId,
-                            ServerTimeUnixMs = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds(),
                         }),
                         _stop.Token);
                     return;
@@ -244,13 +242,12 @@ internal sealed class MockGatewayServer : IAsyncDisposable
             case GatewayOps.Heartbeat:
                 {
                     var req = (HeartbeatRequest)_serializer.Deserialize(payload, typeof(HeartbeatRequest));
-                    Assert.False(string.IsNullOrEmpty(req.Token), "业务心跳缺 token");
+                    Assert.True(req.Ts > 0, "业务心跳缺 ts");
                     await WriteReplyAsync(
                         stream,
                         header.Seq,
                         _serializer.Serialize(new HeartbeatReply
                         {
-                            Ts = req.Ts,
                             ServerTimeUnixMs = (ulong)DateTimeOffset.UtcNow.ToUnixTimeMilliseconds(),
                         }),
                         _stop.Token);
@@ -268,8 +265,8 @@ internal sealed class MockGatewayServer : IAsyncDisposable
         reply[0] = 0;
         WriteUInt32(reply, 1, (uint)data.Length);
         Array.Copy(data, 0, reply, 5, data.Length);
-        var header = new Header { Type = MsgType.Response, Version = FrameConst.Version, Seq = sequence };
-        await FrameIO.WriteFrameAsync(stream, header, reply, FrameConst.MaxBodySize, token);
+        var header = new Header { Type = MsgType.Response, Version = FrameGen.Version, Seq = sequence };
+        await FrameIO.WriteFrameAsync(stream, header, reply, FrameGen.MaxBodySize, token);
     }
 
     private async Task<Stream> WaitForStreamAsync()

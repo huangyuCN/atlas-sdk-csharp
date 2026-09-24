@@ -147,11 +147,20 @@ public sealed class AtlasClient : IAsyncDisposable, IAtlasInvoker
         return _business.InvokeRawAsync(operation, payload, cancellationToken);
     }
 
-    // InvokeRawAsync（带调用级选项）：显式幂等键 / 本次不携带（逃生门）。
+    // InvokeRawAsync（带调用级选项）：显式幂等键 / 本次不携带（逃生门）；
+    // options 为 null 等价于无选项重载（IAtlasInvoker 重载语义）。
     public Task<byte[]> InvokeRawAsync(
-        string operation, byte[]? payload, InvokeOptions options, CancellationToken cancellationToken)
+        string operation, byte[]? payload, InvokeOptions? options, CancellationToken cancellationToken)
     {
         return _business.InvokeRawAsync(operation, payload, options, cancellationToken);
+    }
+
+    // OnAny 订阅业务通道的全部推送 op（通配分发；语义同 On，对齐 TS 仓 onAny）。
+    // 会话状态机经它把每个推送交给接缝识别（接缝的 Kicked(op, PushEnvelope) 需要 op
+    // 与帧头 version 原样传入）。
+    public NotifySubscription OnAny(NotifyHandler handler)
+    {
+        return _business.OnAny(handler);
     }
 
     // On 订阅 Notify 帧（默认业务通道），返回退订句柄。

@@ -6,6 +6,17 @@ namespace Atlas.Frame;
 
 public static class Body
 {
+    // body 段结构上限：唯一来源是框架仓 gen-frame 生成物（FrameGen，由 scripts/gen-dto.sh
+    // 逐字节复制），本处只做引用——手写副本会与服务端漂移。
+    // MaxOperationLen 是 body 内 operation 段的最大长度（服务端引擎解析上限对齐）。
+    public const int MaxOperationLen = FrameGen.MaxOperationLen;
+
+    // MaxSessionLen 是 body 内会话槽（凭据）段的最大长度。
+    public const int MaxSessionLen = FrameGen.MaxSessionLen;
+
+    // MaxRequestIDLen 是 body 内请求幂等键段的最大长度（与服务端引擎解析上限对齐）。
+    public const int MaxRequestIDLen = FrameGen.MaxRequestIDLen;
+
     // [opLen:u16 大端][operation][payload]；与服务端 BuildRawBody 一致。
     public static byte[] BuildRequestBody(string operation, byte[]? payload)
     {
@@ -39,51 +50,52 @@ public static class Body
         }
 
         var operationBytes = Encoding.UTF8.GetBytes(operation);
-        if (operationBytes.Length > FrameConst.MaxOperationLen)
+        if (operationBytes.Length > MaxOperationLen)
         {
-            throw new ProtocolException($"operation 长度 {operationBytes.Length} 超上限 {FrameConst.MaxOperationLen}");
+            throw new ProtocolException($"operation 长度 {operationBytes.Length} 超上限 {MaxOperationLen}");
         }
 
-        var sessionBytes = string.IsNullOrEmpty(session) ? Array.Empty<byte>() : Encoding.UTF8.GetBytes(session);
-        if (sessionBytes.Length > FrameConst.MaxSessionLen)
-        {
-            throw new ProtocolException($"session 长度 {sessionBytes.Length} 超上限 {FrameConst.MaxSessionLen}");
-        }
-
-        var requestIDBytes = string.IsNullOrEmpty(requestID) ? Array.Empty<byte>() : Encoding.UTF8.GetBytes(requestID);
-        if (requestIDBytes.Length > FrameConst.MaxRequestIDLen)
-        {
-            throw new ProtocolException($"requestID 长度 {requestIDBytes.Length} 超上限 {FrameConst.MaxRequestIDLen}");
-        }
-
+        var sessionBytes = ToSegment(session, MaxSessionLen, "session");
+        var requestIDBytes = ToSegment(requestID, MaxRequestIDLen, "requestID");
         var payloadLength = payload?.Length ?? 0;
         var body = new byte[2 + operationBytes.Length + payloadLength
             + (sessionBytes.Length > 0 ? 2 + sessionBytes.Length : 0)
             + (requestIDBytes.Length > 0 ? 2 + requestIDBytes.Length : 0)];
-        body[0] = (byte)(operationBytes.Length >> 8);
-        body[1] = (byte)operationBytes.Length;
-        Buffer.BlockCopy(operationBytes, 0, body, 2, operationBytes.Length);
-        var offset = 2 + operationBytes.Length;
-        if (sessionBytes.Length > 0)
-        {
-            body[offset] = (byte)(sessionBytes.Length >> 8);
-            body[offset + 1] = (byte)sessionBytes.Length;
-            Buffer.BlockCopy(sessionBytes, 0, body, offset + 2, sessionBytes.Length);
-            offset += 2 + sessionBytes.Length;
-        }
-        if (requestIDBytes.Length > 0)
-        {
-            body[offset] = (byte)(requestIDBytes.Length >> 8);
-            body[offset + 1] = (byte)requestIDBytes.Length;
-            Buffer.BlockCopy(requestIDBytes, 0, body, offset + 2, requestIDBytes.Length);
-            offset += 2 + requestIDBytes.Length;
-        }
+        var offset = WriteSegment(body, 0, operationBytes);
+        offset = WriteSegment(body, offset, sessionBytes);
+        offset = WriteSegment(body, offset, requestIDBytes);
         if (payloadLength > 0)
         {
             Buffer.BlockCopy(payload!, 0, body, offset, payloadLength);
         }
 
         return body;
+    }
+
+    // ToSegment 把可选文本段转为字节并校验长度上限（空段 = 空数组，不写入 body）。
+    private static byte[] ToSegment(string? text, int limit, string name)
+    {
+        var bytes = string.IsNullOrEmpty(text) ? Array.Empty<byte>() : Encoding.UTF8.GetBytes(text);
+        if (bytes.Length > limit)
+        {
+            throw new ProtocolException($"{name} 长度 {bytes.Length} 超上限 {limit}");
+        }
+
+        return bytes;
+    }
+
+    // WriteSegment 写入 [len:u16 大端][bytes] 段并返回新偏移（空段原样返回偏移）。
+    private static int WriteSegment(byte[] body, int offset, byte[] segment)
+    {
+        if (segment.Length == 0)
+        {
+            return offset;
+        }
+
+        body[offset] = (byte)(segment.Length >> 8);
+        body[offset + 1] = (byte)segment.Length;
+        Buffer.BlockCopy(segment, 0, body, offset + 2, segment.Length);
+        return offset + 2 + segment.Length;
     }
 
     // ParseRequestBody 解析帧 body，返回 operation 与 payload（不解析会话槽，
@@ -107,9 +119,9 @@ public static class Body
         }
 
         var operationLength = (body[0] << 8) | body[1];
-        if (operationLength > FrameConst.MaxOperationLen)
+        if (operationLength > MaxOperationLen)
         {
-            throw new ProtocolException($"operation 长度 {operationLength} 超上限 {FrameConst.MaxOperationLen}");
+            throw new ProtocolException($"operation 长度 {operationLength} 超上限 {MaxOperationLen}");
         }
 
         if (body.Length < 2 + operationLength)
@@ -119,7 +131,7 @@ public static class Body
 
         var operation = Encoding.UTF8.GetString(body, 2, operationLength);
         var restOffset = 2 + operationLength;
-        if ((flags & FrameConst.FlagSession) == 0)
+        if ((flags & FrameGen.FlagSession) == 0)
         {
             return (operation, "", ParseRest(body, restOffset));
         }
@@ -147,9 +159,9 @@ public static class Body
             throw new ProtocolException("body 过短，缺少 opLen");
         }
         var operationLength = (body[0] << 8) | body[1];
-        if (operationLength > FrameConst.MaxOperationLen)
+        if (operationLength > MaxOperationLen)
         {
-            throw new ProtocolException($"operation 长度 {operationLength} 超上限 {FrameConst.MaxOperationLen}");
+            throw new ProtocolException($"operation 长度 {operationLength} 超上限 {MaxOperationLen}");
         }
         if (body.Length < 2 + operationLength)
         {
@@ -158,7 +170,7 @@ public static class Body
         var operation = Encoding.UTF8.GetString(body, 2, operationLength);
         var restOffset = 2 + operationLength;
         var session = "";
-        if ((flags & FrameConst.FlagSession) != 0)
+        if ((flags & FrameGen.FlagSession) != 0)
         {
             if (body.Length < restOffset + 2)
             {
@@ -173,7 +185,7 @@ public static class Body
             restOffset += 2 + sessionLength;
         }
         var requestID = "";
-        if ((flags & FrameConst.FlagRequestID) != 0)
+        if ((flags & FrameGen.FlagRequestID) != 0)
         {
             if (body.Length < restOffset + 2)
             {
@@ -194,7 +206,7 @@ public static class Body
     // flags 置位 FlagRequestID 时存在）。
     private static byte[] RequestIDRest(byte[] body, int offset, byte flags)
     {
-        if ((flags & FrameConst.FlagRequestID) == 0)
+        if ((flags & FrameGen.FlagRequestID) == 0)
         {
             return ParseRest(body, offset);
         }

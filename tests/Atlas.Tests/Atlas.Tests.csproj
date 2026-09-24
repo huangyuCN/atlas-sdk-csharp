@@ -13,7 +13,16 @@
     <ProjectReference Include="../../src/Atlas/Atlas.csproj" />
     <ProjectReference Include="..\..\src\Atlas.Unity\Atlas.Unity.csproj" />
   </ItemGroup>
+  <!-- 生成物（examples/Smoke/Proto/gen，scripts/gen-dto.sh 从模板 descriptor set 产出）：
+       IMessage 族（protoc csharp_out）+ POCO/stub/协议描述符族（protoc plugin atlas client）；
+       另链入项目侧接缝实现（examples/Smoke/GatewaySessionProtocol.cs）——测试与冒烟
+       消费同一份生成物素材，防两处漂移。 -->
   <ItemGroup>
-    <Compile Include="../../examples/Smoke/Proto/gen/Auth.cs" Link="Generated/Auth.cs" />
+    <Compile Include="../../examples/Smoke/Proto/gen/**/*.cs">
+      <Link>Generated/%(RecursiveDir)%(Filename)%(Extension)</Link>
+    </Compile>
+    <Compile Include="../../examples/Smoke/GatewaySessionProtocol.cs">
+      <Link>Generated/GatewaySessionProtocol.cs</Link>
+    </Compile>
   </ItemGroup>
 </Project>

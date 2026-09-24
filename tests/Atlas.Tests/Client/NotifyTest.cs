@@ -20,11 +20,13 @@ public sealed class NotifyTest
         var received = NewSignal();
         string? receivedOp = null;
         string? receivedPayload = null;
+        byte receivedVersion = 0;
 
-        channel.On("match.found", (op, payload) =>
+        channel.On("match.found", (op, payload, version) =>
         {
             receivedOp = op;
             receivedPayload = Encoding.UTF8.GetString(payload);
+            receivedVersion = version;
             received.TrySetResult(true);
         });
 
@@ -35,6 +37,29 @@ public sealed class NotifyTest
         // 记录到字段后主流程外部断言，失败即真实测试失败。
         Assert.Equal("match.found", receivedOp);
         Assert.Equal("room-1", receivedPayload);
+        // 帧头载荷编码版本随回调下发（业务侧据此选解码器：ver=1 protojson / ver=2 protobuf）。
+        Assert.Equal(FrameGen.Version, receivedVersion);
+    }
+
+    // CloseAsync_DropsSubscriptions 验证关闭即释放订阅表：关闭后推送不再分发。
+    [Fact]
+    public async Task CloseAsync_DropsSubscriptions_NoDeliveryAfterClose()
+    {
+        await using var server = new FakeServer();
+        var channel = await ConnectAsync(server, 500);
+        var count = 0;
+        channel.On("match.found", (_, _, _) => Interlocked.Increment(ref count));
+        channel.OnAny((_, _, _) => Interlocked.Increment(ref count));
+
+        await server.PushNotifyAsync("match.found", Encoding.UTF8.GetBytes("before"));
+        await WaitUntilAsync(() => Volatile.Read(ref count) >= 2, TimeSpan.FromSeconds(2));
+
+        await channel.CloseAsync();
+        await server.PushNotifyAsync("match.found", Encoding.UTF8.GetBytes("after"));
+        await Task.Delay(200);
+
+        Assert.Equal(2, Volatile.Read(ref count)); // 关闭后不再收到（订阅已随通道释放）。
+        await channel.DisposeAsync();
     }
 
     [Fact]
@@ -45,8 +70,8 @@ public sealed class NotifyTest
         var otherReceived = NewSignal();
         var ownReceived = NewSignal();
 
-        channel.On("match.found", (_, _) => ownReceived.TrySetResult(true));
-        channel.On("other.op", (_, _) => otherReceived.TrySetResult(true));
+        channel.On("match.found", (_, _, _) => ownReceived.TrySetResult(true));
+        channel.On("other.op", (_, _, _) => otherReceived.TrySetResult(true));
 
         // 推其他 op：订阅 match.found 的 handler 不应触发。
         await server.PushNotifyAsync("other.op", Encoding.UTF8.GetBytes("x"));
@@ -68,7 +93,7 @@ public sealed class NotifyTest
         var received = NewSignal();
         var count = 0;
 
-        var subscription = channel.On("match.found", (_, _) =>
+        var subscription = channel.On("match.found", (_, _, _) =>
         {
             Interlocked.Increment(ref count);
             received.TrySetResult(true);
@@ -93,7 +118,7 @@ public sealed class NotifyTest
         await using var channel = await ConnectAsync(server, 500);
         var count = 0;
 
-        NotifyHandler handler = (_, _) => Interlocked.Increment(ref count);
+        NotifyHandler handler = (_, _, _) => Interlocked.Increment(ref count);
         var first = channel.On("match.found", handler);
         var second = channel.On("match.found", handler);
 
@@ -113,8 +138,8 @@ public sealed class NotifyTest
         await using var channel = await ConnectAsync(server, 500);
         var goodReceived = NewSignal();
 
-        channel.On("match.found", (_, _) => throw new InvalidOperationException("handler 崩溃"));
-        channel.On("match.found", (_, _) => goodReceived.TrySetResult(true));
+        channel.On("match.found", (_, _, _) => throw new InvalidOperationException("handler 崩溃"));
+        channel.On("match.found", (_, _, _) => goodReceived.TrySetResult(true));
 
         await server.PushNotifyAsync("match.found", Array.Empty<byte>());
 
@@ -128,7 +153,7 @@ public sealed class NotifyTest
         await using var channel = await ConnectAsync(server, 500);
         var received = NewSignal();
 
-        channel.On("match.found", (_, _) => received.TrySetResult(true));
+        channel.On("match.found", (_, _, _) => received.TrySetResult(true));
 
         // 推 Notify 后普通 Invoke 仍正常（Notify 不参与请求匹配）。
         var echo = channel.InvokeRawAsync("echo", new byte[] { 1 }, CancellationToken.None);

@@ -90,17 +90,49 @@ Google.Protobuf、KcpSharp 等依赖。
 
 ## 快速开始
 
-### DTO 生成（protoc-gen-csharp）
+### 生成物来源（模板仓 descriptor set）
 
-DTO 为 protoc 官方 C# 产物（`IMessage`），一个 `.proto` 对应一个 `.pb.cs`：
+本 SDK **不携带任何手写协议副本**：帧常量、会话 stub/DTO 全部由生成脚本从
+**模板仓**（`atlas-game-layout`）导出的 descriptor set 生成：
 
 ```bash
-protoc --csharp_out=./Gen api/gateway/v1/auth.proto
+ATLAS_LAYOUT_DIR=../atlas-game-layout ATLAS_DIR=../atlas bash scripts/gen-dto.sh
 ```
 
-> ver=1 的线上 JSON 由 `JsonSerializer`（Google.Protobuf protojson）直接序列化
-> 消息对象——字段名 camelCase、64 位整数为字符串等规则由官方实现保证，无需
-> 手写 DTO 或 json tag。
+产出两类（同一份 IDL，两条编码路径）：
+
+| 产物 | 生成方式 | 用途 |
+|------|----------|------|
+| `src/Atlas/Frame/Gen/FrameGen.cs` | 复制框架 `transport/frame/gen/csharp/FrameGen.cs` | 帧协议常量（单一来源） |
+| `examples/Smoke/Proto/gen/imessage/*.cs` | `--csharp_out`（`IMessage`） | ver=2 protobuf 二进制路径 |
+| `examples/Smoke/Proto/gen/api/**/opclient/*.client.g.cs` | `--atlas-client_out`（POCO + 强类型 stub + 协议描述符） | ver=1 protojson 路径、会话 op 与提取器 |
+
+> **序列化经插槽注入**：生成的 stub 构造为 `(IAtlasInvoker inv, ISerializer ser)`，
+> DTO ↔ payload 一律走 `ISerializer.Serialize(object)` / `Deserialize(byte[], Type)`，
+> 产物内**没有** `System.Text.Json` 直调（R12）。`JsonSerializer` 提供 POCO 分支，
+> `ProtobufSerializer` 仍只接受 `IMessage`（ver=2 边界）。
+
+### 会话接缝（ISessionProtocol）
+
+会话状态机（登录/注册/恢复/登出/心跳 + 重连）**只依赖接缝**，op 名与三提取器
+（token / playerID / 过期时间）以及「被挤下线」识别全部来自生成物：
+
+```csharp
+var session = new Session(new SessionOptions
+{
+    Protocol = GatewaySessionProtocol.Instance,   // 项目侧实现：op/提取器取自生成物
+    HeartbeatIntervalMs = 30_000,
+});
+session.Bind(client);                             // 一行接入（client 即 IAtlasInvoker）
+var creds = await session.LoginAsync(ct, new LoginRequest { PlayerId = "p1", Password = "***" });
+// session.Dispose();                             // 退订推送并解除绑定（幂等）；重复 Bind 会自动先退订旧订阅
+```
+
+接缝成员（三语言同职责）：`Ops`（5 个会话 op）、`Token`/`PlayerId`/`ExpiresAt`
+（解码钩子，无该字段返回零值）、`Kicked(op, PushEnvelope)`（信封含 `Op`/`Version`/
+`Body`：`Version` 是帧头载荷编码版本（1 = protojson、2 = protobuf wire），`Body` 为
+**未解码的推送原始字节**——实现方按 `Version` 选解码器（生成的 `KickedNotify`）取
+reason；**op 命中即 `Ok=true`**，取不到原因时 reason 为空串但状态机照常清凭据）。
 
 ### 连接、请求与推送（TCP）
 
@@ -111,7 +143,8 @@ using System.Threading.Tasks;
 using Atlas.Client;
 using Atlas.Serialization;
 using Atlas.Transport;
-using Gateway.V1;
+using Atlas.Gateway.V1;   // 生成物命名空间（模板 descriptor set 生成）
+using Atlas.Battle.V1;    // 同上：战斗域 stub
 
 // 1) 拨号：构造 Channel（dial 工厂 + 选项），Connect 后即可收发。
 var channel = new Channel(
@@ -125,21 +158,24 @@ var channel = new Channel(
 await channel.ConnectAsync(CancellationToken.None);
 
 // 2) 订阅服务端推送（handler 默认线程池执行；退订句柄 Dispose）。
-var sub = channel.On("/gateway.v1.GatewayAuth/Notify", (op, payload) =>
-    Console.WriteLine($"收到推送: {op} {payload.Length} bytes"));
+//    op 名不要手写：用生成物的常量（会话推送见 SessionPushOps.KickedNotify）；
+//    第三个参数是帧头载荷编码版本（1 = protojson、2 = protobuf wire），据此选解码器。
+var sub = channel.OnAny((op, payload, version) =>
+    Console.WriteLine($"收到推送: {op} v{version} {payload.Length} bytes"));
 sub.Dispose(); // 退订
 
-// 3) 请求-响应：DTO 为 protoc 生成的 IMessage，经 Serializer 自动编解码。
-var serializer = new JsonSerializer();
-var request = new LoginRequest { PlayerId = "p1", Password = "***" };
-var respBytes = await channel.InvokeRawAsync(
-    "/gateway.v1.GatewayAuth/Login",
-    serializer.Serialize(request),
-    CancellationToken.None);
-var reply = (LoginReply)serializer.Deserialize(respBytes, typeof(LoginReply));
-Console.WriteLine($"登录成功: {reply.PlayerId}");
+// 3) 会话经接缝：op 名与凭据提取全部取自生成物（见「会话接缝」一节）。
+var session = new Session(new SessionOptions { Protocol = GatewaySessionProtocol.Instance });
+session.Bind(channel);                              // Channel 即 IAtlasInvoker
+var creds = await session.LoginAsync(ct, new LoginRequest { PlayerId = "p1", Password = "***" });
+Console.WriteLine($"登录成功: {creds.PlayerId}");
 
-// 4) 优雅关闭（取消 in-flight、停心跳与读循环；幂等）。
+// 4) 业务 op：用生成的强类型 stub（构造注入 IAtlasInvoker + ISerializer）；
+//    DTO 与 op 名均来自生成物，编解码走插槽，无 System.Text.Json 直调。
+var battle = new BattleService(channel, new JsonSerializer());
+var joined = await battle.JoinBattleAsync(new JoinBattleReq { BattleId = "b-1" });
+
+// 5) 优雅关闭（取消 in-flight、停心跳与读循环；幂等）。
 await channel.CloseAsync();
 ```
 
@@ -176,10 +212,15 @@ var battle = client.Channel(ChannelKind.Battle);     // 战斗通道视图
 
 ## 编码语义（json = protojson）
 
-C# SDK 全 Google.Protobuf 官方栈：DTO 为 `protoc-gen-csharp` 产出的 `IMessage`，
-**一套消息类型同时服务 ver=1（protojson JSON）与 ver=2（protobuf 二进制）**。
-`JsonSerializer` 即严格 protojson（`JsonFormatter`/`JsonParser`）——与 Go/TS SDK
-的编码差异见 [docs/encoding.md](docs/encoding.md)。
+C# SDK 覆盖两条编码路径，同一份 IDL 生成两套类型：
+
+- **ver=1（protojson JSON）**：用 `--atlas-client_out` 生成的 **POCO + stub**（零
+  protobuf 运行时依赖），由 `JsonSerializer` 的 POCO 分支按 protojson 语义
+  （camelCase 字段名、64 位整数为字符串、枚举名下发、零值省略）编解码；
+- **ver=2（protobuf 二进制）**：用 `--csharp_out` 生成的 `IMessage`，由
+  `ProtobufSerializer` 编解码（该路径只接受 `IMessage`，属 R12 的既定边界）。
+
+与 Go/TS SDK 的编码差异见 [docs/encoding.md](docs/encoding.md)。
 
 ## 配置项（ChannelOptions）
 
