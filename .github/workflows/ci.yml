@@ -79,7 +79,14 @@ jobs:
           ATLAS_LAYOUT_DIR: ${{ github.workspace }}/atlas-game-layout
         run: |
           bash scripts/gen-dto.sh
-          git diff --exit-code src/Atlas/Frame/Gen examples/Smoke/Proto/gen
+          # 口径与 sdk-go/sdk-ts 统一：整仓检查（未跟踪的新产物同样算改动）。
+          # 上游两仓检出在本仓工作区内（path: atlas / atlas-game-layout），其未跟踪目录
+          # 不代表本仓产物改动，必须排除（':!' 为 git pathspec 排除语法）。
+          if [ -n "$(git status --porcelain -- . ':!atlas' ':!atlas-game-layout')" ]; then
+            echo "::error::重生成产生未入库改动（生成物与上游不同源）"
+            git status --porcelain -- . ':!atlas' ':!atlas-game-layout'
+            exit 1
+          fi
 
       - name: Restore
         run: dotnet restore Atlas.sln

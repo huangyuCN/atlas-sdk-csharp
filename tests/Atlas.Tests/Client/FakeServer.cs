@@ -87,6 +87,10 @@ internal sealed class FakeServer : IAsyncDisposable
         }
     }
 
+    // PushNotifyAsync 推送一条 Notify 帧。「关闭后不再投递」类用例会在客户端
+    // CloseAsync 之后仍调用本方法，此时服务端连接流可能已被读循环随连接释放——
+    // 该用例断言的是客户端不再分发，而非服务端写入成功，故写入失败按预期竞态
+    // 吞掉（对齐 ServeOneAsync/DisposeAsync 的容错口径）。
     public async Task PushNotifyAsync(string operation, byte[] payload)
     {
         var stream = await WaitForStreamAsync();
@@ -96,6 +100,14 @@ internal sealed class FakeServer : IAsyncDisposable
         try
         {
             await FrameIO.WriteFrameAsync(stream, header, body, FrameGen.MaxBodySize, _stop.Token);
+        }
+        catch (ObjectDisposedException)
+        {
+            // 连接流已随断开释放：没有写入目标，忽略。
+        }
+        catch (IOException)
+        {
+            // 管道已断（对端关闭/复位）：写入不可能成功，忽略。
         }
         finally
         {
