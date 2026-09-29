@@ -21,8 +21,8 @@ namespace Atlas.Tests.Client;
 public sealed class SessionHeartbeatTest
 {
     // 会话心跳业务 op（服务端命中 BusinessErrorOps 时回业务拒绝）。
-    private const string SessionOp = "/gateway.v1.GatewayAuth/Heartbeat";
-    private const string SessionOpBoom = "/gateway.v1.GatewayAuth/Heartbeat-boom";
+    private const string SessionOp = "/gateway.v1.Session/Heartbeat";
+    private const string SessionOpBoom = "/gateway.v1.Session/Heartbeat-boom";
 
     // 快速参数：关闭传输心跳隔离观测，短会话心跳周期/超时让测试快速收敛。
     private static ChannelOptions FastOptions(Action<ChannelOptions>? tune = null)

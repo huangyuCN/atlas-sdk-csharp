@@ -6,6 +6,9 @@ using Atlas.Errors;
 
 namespace Atlas.Frame;
 
+// 帧 I/O 入口：字节层编解码唯一实现是生成物（src/Atlas/Frame/Gen/FrameCodec.cs，
+// 由框架仓 gen-frame 产出、scripts/gen-dto.sh 快照），本文件只保留流式读写、
+// 出站拦截（EncodeMessage 前的 Header.Check）与错误类型收敛（ProtocolException）。
 public static class FrameIO
 {
     // ReadFull 读满指定字节数，处理 TCP 的半包读取。
@@ -35,8 +38,8 @@ public static class FrameIO
 
         var headerBytes = new byte[FrameGen.HeaderSize];
         await ReadFullAsync(stream, headerBytes, headerBytes.Length, cancellationToken);
-        var header = Header.Decode(headerBytes);
-        Header.Check(header, maxBodySize);
+        // 头校验（含长度上限）先于 body 读取：超限头/坏头立即按协议错误拒绝（golden 口径）。
+        var header = Header.DecodeChecked(headerBytes, maxBodySize);
 
         var body = new byte[(int)header.Length];
         if (body.Length > 0)
@@ -62,18 +65,12 @@ public static class FrameIO
             throw new ArgumentNullException(nameof(body));
         }
 
-        header = PrepareHeader(header, body.Length);
-        Header.Check(header, maxBodySize);
-
-        var headerBytes = header.Encode();
-        var output = new byte[headerBytes.Length + body.Length];
-        Buffer.BlockCopy(headerBytes, 0, output, 0, headerBytes.Length);
-        Buffer.BlockCopy(body, 0, output, headerBytes.Length, body.Length);
+        var output = EncodeMessage(header, body, maxBodySize);
         await stream.WriteAsync(output.AsMemory(), cancellationToken);
     }
 
     // EncodeMessage 将 header 与 body 编码为完整帧字节（消息边界传输体，如 WebSocket：
-    // 一条消息 = 一个完整帧）。与 Go frame.Encode 语义一致：长度超限返回协议错误，
+    // 一条消息 = 一个完整帧）。出站先按生成物口径校验（非法头/超限 body 抛 ProtocolException），
     // Magic/Version 零值按协议默认补齐，Length 以实际 body 长度为准。
     public static byte[] EncodeMessage(Header header, byte[] body, int maxBodySize)
     {
@@ -82,42 +79,30 @@ public static class FrameIO
             throw new ArgumentNullException(nameof(body));
         }
 
-        header = PrepareHeader(header, body.Length);
-        Header.Check(header, maxBodySize);
-
-        var headerBytes = header.Encode();
-        var output = new byte[headerBytes.Length + body.Length];
-        Buffer.BlockCopy(headerBytes, 0, output, 0, headerBytes.Length);
-        Buffer.BlockCopy(body, 0, output, headerBytes.Length, body.Length);
-        return output;
+        var prepared = PrepareHeader(header, body.Length);
+        Header.Check(prepared, maxBodySize);
+        return FrameCodec.Encode(prepared.ToWire(), body, maxBodySize);
     }
 
     // DecodeMessage 从一条完整消息解析帧（与 EncodeMessage 对应；WS 读侧）。
     // 消息长度与帧头 bodyLen 不一致即协议非法——消息边界传输下已失步，由上层
-    // 按协议错误终止连接（对齐 Go frame.Decode）。
+    // 按协议错误终止连接（转发生成物 DecodeMessage，口径与 Go frame.DecodeMessage 一致）。
     public static (Header Header, byte[] Body) DecodeMessage(byte[] message, int maxBodySize)
     {
         if (message == null)
         {
             throw new ArgumentNullException(nameof(message));
         }
-        if (message.Length < FrameGen.HeaderSize)
-        {
-            throw new ProtocolException($"消息短于帧头: {message.Length} < {FrameGen.HeaderSize}");
-        }
 
-        var headerBytes = new byte[FrameGen.HeaderSize];
-        Array.Copy(message, headerBytes, headerBytes.Length);
-        var header = Header.Decode(headerBytes);
-        Header.Check(header, maxBodySize);
-        if ((ulong)(message.Length - FrameGen.HeaderSize) != header.Length)
+        try
         {
-            throw new ProtocolException($"消息长度与 bodyLen 不一致: {message.Length - FrameGen.HeaderSize} != {header.Length}");
+            var (header, body) = FrameCodec.DecodeMessage(message, maxBodySize);
+            return (Header.FromWire(header), body);
         }
-
-        var body = new byte[message.Length - FrameGen.HeaderSize];
-        Buffer.BlockCopy(message, FrameGen.HeaderSize, body, 0, body.Length);
-        return (header, body);
+        catch (FrameCodecException exception)
+        {
+            throw new ProtocolException(exception.Message);
+        }
     }
 
     // 写帧以实际 body 长度为准，并补齐协议默认 magic/version，与 Go Frame.Write 一致。

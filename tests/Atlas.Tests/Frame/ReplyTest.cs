@@ -14,10 +14,10 @@ public sealed class ReplyTest
     {
         var payload = Encoding.UTF8.GetBytes("{\"x\":1}");
 
-        var body = Body.BuildRequestBody("/gateway.v1.GatewayAuth/Login", payload);
+        var body = Body.BuildRequestBody("/gateway.v1.Session/Login", payload);
         var (operation, actualPayload) = Body.ParseRequestBody(body);
 
-        Assert.Equal("/gateway.v1.GatewayAuth/Login", operation);
+        Assert.Equal("/gateway.v1.Session/Login", operation);
         Assert.Equal(payload, actualPayload);
     }
 

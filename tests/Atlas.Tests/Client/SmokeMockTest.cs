@@ -25,7 +25,8 @@ internal static class GatewayOps
 }
 
 // SmokeMockTest 覆盖 mock 网关闭环：注册→登录→业务心跳→Notify 收推→传输 Ping 往返。
-// mock 网关按 auth.proto 业务语义回响应（对标 Go/TS 的 mock-gateway；真机冒烟在 M3/M4）。
+// mock 网关按 v2 会话协议（模板 api/gateway/v1/session.proto）业务语义回响应
+//（对标 Go/TS 的 mock-gateway；真机冒烟在 M3/M4）。
 public sealed class SmokeMockTest
 {
     [Fact]
@@ -123,7 +124,7 @@ public sealed class SmokeMockTest
 }
 
 // MockGatewayServer 是模拟网关业务语义的 TCP 回环服务端：按 operation 分派
-// 业务响应（auth.proto DTO，protojson 编解码），Ping 回空包；支持主动推 Notify。
+// 业务响应（会话协议 session.proto 生成的 DTO，protojson 编解码），Ping 回空包；支持主动推 Notify。
 internal sealed class MockGatewayServer : IAsyncDisposable
 {
     private readonly TcpListener _listener = new(IPAddress.Loopback, 0);

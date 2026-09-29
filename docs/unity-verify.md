@@ -55,6 +55,11 @@ Unity 引用 UPM 包 = 引用 `Plugins/` 下的预编译 dll（`com.huangyucn.at
 [UPM 验证] mock 闭环通过（TCP 连接 + Invoke + Ping 全链路）
 ```
 
+> 上框为 2026-09-07 那次验证的原始控制台输出（历史记录，勿照抄）：其中那条会话 op
+> 名属 v0.x 时代的旧协议名；v2 起会话协议为 `/gateway.v1.Session/*`（模板
+> `api/gateway/v1/session.proto`，op 名取生成物 `SessionProtocolOps.Register`，
+> 即 `/gateway.v1.Session/Register`）。
+
 这证明 UPM 包产物（`Atlas.dll` + 7 个 vendored 依赖 dll）**编译面与运行面均可用**，
 Unity 编辑器脚本引用后将执行同一套 API 路径。
 

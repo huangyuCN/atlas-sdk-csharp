@@ -81,8 +81,9 @@ atlas-sdk-go      ← 最后评估：ver=1 plain struct + sdkgen 是否随官方
 
 - **不强制现有 Go/TS 用户迁移**：已交付形态冻结为历史版本，协议层与线上互通
   不受影响（编码差异见 §3，服务端兼容）。
-- **`atlas sdk gen` 维持现状**：Go/TS 后端保留供存量项目；C# 不引入生成器后端
-  （DTO 走官方 protoc-gen-csharp），主仓零改动。
+- **`atlas sdk gen` 已退役**（2026-09-07：Go/TS 转官方生成器后，主仓 `atlas sdk`
+  命令与 sdkgen 包一并删除）：Go/TS 存量项目冻结使用既有生成物，不再演进；C# 不引入
+  生成器后端（DTO 走官方 protoc-gen-csharp），主仓零改动。
 
 ## 5. 验证记录
 

@@ -25,7 +25,7 @@ var client = new AtlasClient(
         Options = new ChannelOptions { Serializer = new JsonSerializer() },
     });
 await client.ConnectAsync(CancellationToken.None);
-var reply = await client.InvokeRawAsync("/gateway.v1.GatewayAuth/Login", payload, CancellationToken.None);
+var reply = await client.InvokeRawAsync("/gateway.v1.Session/Login", payload, CancellationToken.None);
 ```
 
 ### Unity 主线程调度

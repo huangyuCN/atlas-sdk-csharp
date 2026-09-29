@@ -2,13 +2,13 @@
 # gen-dto：从上游生成物/描述符刷新本仓的全部「协议事实」，单一来源、零手写副本。
 #
 # 输入（只读消费，不在本仓生成协议）：
-#   - 框架仓帧协议生成物：$ATLAS_DIR/transport/frame/gen/csharp/FrameGen.cs
+#   - 框架仓帧协议生成物：$ATLAS_DIR/transport/frame/gen/csharp/{FrameGen,FrameCodec}.cs
 #   - 模板仓会话协议：$ATLAS_LAYOUT_DIR/api/gateway/v1/session.proto
 #     （session.proto 导入框架仓的 atlas route 注解，故导出 descriptor set 必须
 #      同时给两个 include 根）
 #   - 框架仓生成器：$ATLAS_DIR/bin/protoc-gen-atlas-client（缺失时用 go build 构建）
 # 输出（全部入库，CI 有「重生成无 diff」门禁）：
-#   1. src/Atlas/Frame/Gen/FrameGen.cs                        帧协议常量快照（逐字节复制）
+#   1. src/Atlas/Frame/Gen/FrameGen.cs + FrameCodec.cs        帧协议常量与编解码快照（逐字节复制）
 #   2. examples/Smoke/Proto/gen/imessage/*.cs  protoc --csharp_out 的 IMessage DTO
 #      （Message 路径：-serializer protobuf 用；含会话协议 + 战斗域契约）
 #   3. examples/Smoke/Proto/gen/api/**/opclient/*_client.g.cs 参数化插件的 POCO DTO +
@@ -33,10 +33,11 @@ done
 
 OUT=examples/Smoke/Proto/gen
 
-# 1) 帧协议常量：框架生成物逐字节复制到仓内固定路径（SDK 侧只引用 FrameGen，无手写副本）。
+# 1) 帧协议常量与编解码：框架生成物逐字节复制到仓内固定路径（SDK 侧只引用生成物，无手写副本）。
 mkdir -p src/Atlas/Frame/Gen
 cp "$ATLAS_DIR/transport/frame/gen/csharp/FrameGen.cs" src/Atlas/Frame/Gen/FrameGen.cs
-echo "帧协议常量 → src/Atlas/Frame/Gen/FrameGen.cs"
+cp "$ATLAS_DIR/transport/frame/gen/csharp/FrameCodec.cs" src/Atlas/Frame/Gen/FrameCodec.cs
+echo "帧协议常量/编解码 → src/Atlas/Frame/Gen/{FrameGen,FrameCodec}.cs"
 
 # 2) 会话协议 descriptor set：模板仓导出（两个 include 根：模板仓 + 框架仓注解）。
 DESC="$(mktemp -t atlas-gateway-desc.XXXXXX)"
