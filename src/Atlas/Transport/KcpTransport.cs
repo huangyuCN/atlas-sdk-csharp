@@ -30,9 +30,11 @@ public sealed class KcpTransport : ITransport
 
     private readonly KcpConversation _conversation;
     private readonly Socket _socket;
-    private readonly IKcpTransport<KcpConversation>? _transport;
+    // 会话承载：普通形态是 KcpSharp 的 socket 承载；直连接入层形态是带 flow-id 前缀的
+    // 自实现承载（UdpFlowKcpTransport）。两者都只在关闭时释放，故按 IDisposable 保存。
+    private readonly IDisposable? _transport;
 
-    private KcpTransport(Socket socket, IKcpTransport<KcpConversation> transport, KcpConversation conversation)
+    private KcpTransport(Socket socket, IDisposable? transport, KcpConversation conversation)
     {
         _socket = socket;
         _transport = transport;
@@ -54,6 +56,45 @@ public sealed class KcpTransport : ITransport
         try
         {
             var (transport, conversation) = CreateConversation(socket, address, port);
+            return new KcpTransport(socket, transport, conversation);
+        }
+        catch
+        {
+            socket.Dispose();
+            throw;
+        }
+    }
+
+    // ConnectDirectAsync 建立直连接入层 KCP 面的帧传输，顺序不可换：
+    //   ① 同一 UDP socket 上先发 hello 段（首包）并等接入层回 8 字节 flow-id
+    //      （KCP 报文若先行会被接入层当作坏 hello 拒绝）；
+    //   ② 再启动 KCP 会话：收发都带 flow-id 前缀（KcpSharp 自带承载不带前缀，故用自实现承载）。
+    // 握手无回应 = 接入层拒绝（ProtocolException，不重试）；连接被拒/不可达 = 网络错误（可重试）。
+    public static async Task<ITransport> ConnectDirectAsync(
+        string host,
+        int port,
+        byte[] hello,
+        int helloTimeoutMs,
+        CancellationToken cancellationToken)
+    {
+        if (string.IsNullOrEmpty(host))
+        {
+            throw new ArgumentException("host 不能为空", nameof(host));
+        }
+
+        var address = await ResolveAddressAsync(host).ConfigureAwait(false);
+        cancellationToken.ThrowIfCancellationRequested();
+
+        var socket = CreateBoundSocket();
+        var remote = new IPEndPoint(address, port);
+        try
+        {
+            // 连到接入层（connected UDP）：握手与后续 KCP 报文都在同一 socket 上与同一对端往返。
+            socket.Connect(remote);
+            var flowId = await EdgeHandshake.ExchangeFlowIdAsync(
+                socket, hello, helloTimeoutMs, cancellationToken).ConfigureAwait(false);
+            var transport = new UdpFlowKcpTransport(socket, remote, flowId);
+            var conversation = transport.Start(NewConversationId(), BuildOptions());
             return new KcpTransport(socket, transport, conversation);
         }
         catch
@@ -86,11 +127,10 @@ public sealed class KcpTransport : ITransport
         return socket;
     }
 
-    // CreateConversation 构造 KCP 会话（参数对齐服务端 kcp-go 默认基线）。
-    private static (IKcpTransport<KcpConversation> Transport, KcpConversation Conversation)
-        CreateConversation(Socket socket, IPAddress address, int port)
+    // BuildOptions 返回与服务端 kcp-go 默认基线对齐的会话参数（明文、无 FEC、消息模式）。
+    private static KcpConversationOptions BuildOptions()
     {
-        var options = new KcpConversationOptions
+        return new KcpConversationOptions
         {
             NoDelay = false,              // kcp-go nodelay=0
             UpdateInterval = 40,          // kcp-go interval=40（毫秒）
@@ -102,12 +142,21 @@ public sealed class KcpTransport : ITransport
             Mtu = 1400,                   // kcp-go mtu
             StreamMode = false,           // 消息模式（kcp-go 默认，互通关键）
         };
+    }
 
-        // 随机 conv（0x10000000..0x7FFFFFFF），与服务端按 conv 匹配对话
-        //（kcp-go 客户端 DialWithOptions 亦用随机 conv）。
-        int conv = unchecked((int)(uint)new Random().Next(0x10000000, 0x7FFFFFFF));
+    // NewConversationId 取随机 conv（0x10000000..0x7FFFFFFF）：与服务端按 conv 匹配对话
+    //（kcp-go 客户端 DialWithOptions 亦用随机 conv）。
+    private static int NewConversationId()
+    {
+        return unchecked((int)(uint)new Random().Next(0x10000000, 0x7FFFFFFF));
+    }
+
+    // CreateConversation 构造 KCP 会话（参数对齐服务端 kcp-go 默认基线）。
+    private static (IKcpTransport<KcpConversation> Transport, KcpConversation Conversation)
+        CreateConversation(Socket socket, IPAddress address, int port)
+    {
         var transport = KcpSocketTransport.CreateConversation(
-            socket, new IPEndPoint(address, port), conv, options);
+            socket, new IPEndPoint(address, port), NewConversationId(), BuildOptions());
         // Connection 在 Start 后才可用（KcpSocketTransport 状态机要求）。
         transport.Start();
         return (transport, transport.Connection);

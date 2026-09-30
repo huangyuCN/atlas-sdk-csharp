@@ -1,5 +1,6 @@
 using System;
 using System.IO;
+using System.Net.Sockets;
 using System.Net.WebSockets;
 using System.Threading;
 using System.Threading.Tasks;
@@ -16,6 +17,10 @@ public sealed class WsTransport : ITransport
 {
     // defaultHandshakeTimeout 是 WS 握手超时（ClientWebSocket 默认无超时，显式兜底防永久挂起）。
     private static readonly TimeSpan DefaultHandshakeTimeout = TimeSpan.FromSeconds(10);
+
+    // RejectedMessage 是接入层拒绝 WS 升级的稳定报错前缀（Atlas.Battle.DirectErrors 引用同一字面量）：
+    // 直连接入层时 TCP 已连通但升级未完成 = 接入层拒绝（无应用层回执），与网络不可达必须分开。
+    public const string RejectedMessage = "接入层拒绝 WS 升级";
 
     private readonly ClientWebSocket _socket;
     // 写互斥（对齐 Go wsTransport 的 writeMu）：ClientWebSocket.SendAsync 要求单写者，
@@ -59,6 +64,62 @@ public sealed class WsTransport : ITransport
     public static async Task<ITransport> ConnectAsync(string url, CancellationToken cancellationToken)
     {
         return await ConnectUrlAsync(url, cancellationToken);
+    }
+
+    // ConnectDirectAsync 直连接入层 WS 面：票据已由调用方放进 URL query 或 ticketHeader
+    //（接入层两种都接受：query 优先、其次头）。握手失败按「接入层拒绝」（协议错误、不可重试）
+    // 与「网络不可达」（网络错误、可重试）分开——用同一张废票重试必然再被拒。
+    public static async Task<ITransport> ConnectDirectAsync(
+        string url,
+        string? ticketHeader,
+        CancellationToken cancellationToken)
+    {
+        var socket = new ClientWebSocket();
+        if (!string.IsNullOrEmpty(ticketHeader))
+        {
+            socket.Options.SetRequestHeader(EdgeHandshake.TicketHeaderKey, ticketHeader);
+        }
+        try
+        {
+            using var handshakeCts = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
+            handshakeCts.CancelAfter(DefaultHandshakeTimeout);
+            await socket.ConnectAsync(new Uri(url), handshakeCts.Token);
+            return new WsTransport(socket);
+        }
+        catch (Exception exception)
+        {
+            socket.Dispose();
+            throw ClassifyDirectFailure(exception, url, cancellationToken);
+        }
+    }
+
+    // ClassifyDirectFailure 分类直连握手失败：异常链里含 SocketException（连接被拒/不可达/
+    // DNS 失败）= 网络错误（可重试）；否则 TCP 已连通但升级未完成 = 接入层拒绝（不可重试）。
+    private static Atlas.Errors.AtlasException ClassifyDirectFailure(
+        Exception exception, string url, CancellationToken cancellationToken)
+    {
+        if (exception is OperationCanceledException && !cancellationToken.IsCancellationRequested)
+        {
+            return new NetworkException($"WebSocket 握手超时: {url}", exception);
+        }
+        if (ContainsSocketException(exception))
+        {
+            return new NetworkException($"WebSocket 连接失败: {url}", exception);
+        }
+        return new ProtocolException($"{RejectedMessage}: {url}", exception);
+    }
+
+    // ContainsSocketException 沿 InnerException 链查找 SocketException（网络层失败的标志）。
+    private static bool ContainsSocketException(Exception? exception)
+    {
+        for (var current = exception; current != null; current = current.InnerException)
+        {
+            if (current is SocketException)
+            {
+                return true;
+            }
+        }
+        return false;
     }
 
     private static async Task<ITransport> ConnectUrlAsync(string url, CancellationToken cancellationToken)

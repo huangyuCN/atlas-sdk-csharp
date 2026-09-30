@@ -95,7 +95,8 @@ public sealed partial class Channel : IAsyncDisposable
         _dial = dial ?? throw new ArgumentNullException(nameof(dial));
         _options = options ?? throw new ArgumentNullException(nameof(options));
         ValidateOptions(_options);
-        _frameSessionSlot = _options.TransportKind == TransportKind.Udp
+        _frameSessionSlot = _options.ForceFrameSessionSlot
+            || _options.TransportKind == TransportKind.Udp
             || _options.TransportKind == TransportKind.Kcp;
         OnRelogin = _options.OnReconnected;
         // 默认 Error 级 stderr；显式 Silence（LogSilence）或注入 Logger 时按注入。
@@ -279,21 +280,28 @@ public sealed partial class Channel : IAsyncDisposable
         _writeLock.Dispose();
     }
 
+    // DialAsync 执行一次拨号并记录失败原因（_dialFault）：重连循环据此判定「不可重试的
+    // 拨号失败」（如接入层拒绝 hello）并终止，而不是拿同一张废票无限退避重拨。
     private async Task<ITransport> DialAsync(CancellationToken cancellationToken)
     {
         try
         {
-            return await _dial(cancellationToken) ?? throw new NetworkException("拨号返回空传输");
+            var transport = await _dial(cancellationToken) ?? throw new NetworkException("拨号返回空传输");
+            _dialFault = null;
+            return transport;
         }
-        catch (AtlasException)
+        catch (AtlasException exception)
         {
+            _dialFault = exception;
             SetState(ClientState.Disconnected);
             throw;
         }
         catch (Exception exception)
         {
+            var wrapped = new NetworkException("拨号失败", exception);
+            _dialFault = wrapped;
             SetState(ClientState.Disconnected);
-            throw new NetworkException("拨号失败", exception);
+            throw wrapped;
         }
     }
 

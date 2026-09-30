@@ -73,17 +73,40 @@ public sealed class ClientFacadeTest
 
     // 双通道 Client：状态聚合向下降级——业务 Connected、战斗 Reconnecting 时
     // Client.State == Reconnecting（取最劣）。
+    // 稳定性（终验抖动修复，2026-09-30）：被踢后的 Reconnecting 是**瞬时窗口**——快退避
+    // （BackoffBaseMs=10）+ 服务端仍在，一次退避即重连成功，实测窗口仅 8~25ms。旧写法
+    // 「踢线后每 10ms 轮询状态」要靠轮询撞上该窗口：invoke 失败经线程池续体恢复
+    //（RunContinuationsAsynchronously），续体若在窗口结束后才被调度，轮询永远看不到
+    // Reconnecting，2s 后断言得 Expected: Reconnecting / Actual: Connected（全量并发下必红；
+    // 单跑因续体及时而通过）。经 1ms 采样核验：窗口内战斗通道恒为 Reconnecting 且
+    // Client.State 同步降级为 Reconnecting（25/25 轮），聚合逻辑无缺陷——属测试等待式
+    // 断言抖动，故改为**事件驱动**：被踢后的重连拨号挂起并发出「重连已开始」信号，
+    // 状态稳定停在 Reconnecting 再断言；断言本身未放宽。
     [Fact]
     public async Task DualClient_StateAggregation_TakesWorst()
     {
         await using var businessServer = new FakeServer();
         await using var battleServer = new FakeServer();
+        var reconnectStarted = new TaskCompletionSource<bool>(
+            TaskCreationOptions.RunContinuationsAsynchronously);
+        var kicked = false;
         var client = new AtlasClient(
             new ChannelConfig(ChannelKind.Business, token => TcpTestTransport.ConnectAsync(businessServer.Port, token))
             {
                 Options = FastOptions(),
             },
-            new ChannelConfig(ChannelKind.Battle, token => TcpTestTransport.ConnectAsync(battleServer.Port, token))
+            new ChannelConfig(ChannelKind.Battle, async token =>
+            {
+                if (kicked)
+                {
+                    // 踢线后的重连拨号：发出信号并挂起到通道关闭（CloseAsync 取消令牌）——
+                    // 此刻状态已置 Reconnecting 且不会再前进，断言不依赖时序窗口。
+                    reconnectStarted.TrySetResult(true);
+                    await Task.Delay(Timeout.Infinite, token);
+                    throw new NetworkException("战斗通道重连拨号被测试挂起");
+                }
+                return await TcpTestTransport.ConnectAsync(battleServer.Port, token);
+            })
             {
                 Options = FastOptions(),
             });
@@ -95,15 +118,12 @@ public sealed class ClientFacadeTest
             // 踢掉战斗通道：战斗进入重连（Reconnecting）→ 聚合降级为 Reconnecting。
             var battleView = client.Channel(ChannelKind.Battle);
             Assert.NotNull(battleView);
+            kicked = true; // 只影响后续拨号（当前连接不受影响）。
             await Assert.ThrowsAsync<NetworkException>(
                 () => battleView.InvokeRawAsync("kick", Array.Empty<byte>(), CancellationToken.None));
 
-            // 等待战斗通道进入重连。
-            var deadline = DateTime.UtcNow.AddSeconds(2);
-            while (battleView.State != ClientState.Reconnecting && DateTime.UtcNow < deadline)
-            {
-                await Task.Delay(10);
-            }
+            // 事件驱动等待：重连拨号已发起（上限 5s 兜底；不靠轮询撞瞬时窗口）。
+            await reconnectStarted.Task.WaitAsync(TimeSpan.FromSeconds(5));
             Assert.Equal(ClientState.Reconnecting, battleView.State);
             Assert.Equal(ClientState.Reconnecting, client.State); // 聚合取最劣（战斗 Reconnecting）。
             Assert.Equal(ClientState.Connected, client.Channel(ChannelKind.Business).State); // 业务仍 Connected。

@@ -80,6 +80,20 @@ public sealed class ChannelOptions
     // 长连接按连接绑定身份、不携带会话槽（对齐 Go frameSessionSlot 推导）。
     public TransportKind TransportKind { get; set; }
 
+    // ForceFrameSessionSlot 强制请求帧携带帧会话槽（直连战斗帧面必须逐帧带票：即使 WS 是
+    // 长连接，经接入层透传后 battle 帧面仍按帧槽验票）。默认 false = 按传输类型推导
+    //（UDP/KCP 带槽、TCP/WS 不带），老路径行为不变。
+    public bool ForceFrameSessionSlot { get; set; }
+
+    // DialFailureAbortsReconnect 判定「拨号失败是否终止重连」：接入层拒绝 hello（票据无效/
+    // 过期）时，用同一张票重试必然再被拒——重连循环应立即终止而不是无限退避重拨。
+    // null（默认）= 全部按可重试处理，老路径行为不变。
+    public Func<Exception, bool>? DialFailureAbortsReconnect { get; set; }
+
+    // OnReconnectAborted 是重连因不可重试的拨号失败而终止时的回调（参数为终止原因）：
+    // 上层据此重新匹配 / 报错。回调异常被隔离（不影响重连终止）。
+    public Action<Exception>? OnReconnectAborted { get; set; }
+
     // SessionTokenProvider 是会话凭据提供者（Session 对象装配；业务层亦可自给）：
     // 无连接传输（UDP/KCP）的请求帧据此自动携带会话槽（FrameGen.FlagSession），
     // 服务端按凭据验证身份；长连接（TCP/WS）不携带。闭包返回空串表示当前无会话

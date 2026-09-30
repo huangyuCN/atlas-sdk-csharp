@@ -11,6 +11,9 @@ namespace Atlas.Client;
 // 重连排队（入队/重发/超时/关闭结算）见 Channel.Queue.cs。
 public sealed partial class Channel
 {
+    // _dialFault 是最近一次拨号失败原因（成功即清空；仅 _gate 外单线程重连路径读写）。
+    private Exception? _dialFault;
+
     // RunReconnectLoopAsync 在 ReadLoopAsync 退出（网络错误、非协议致命、非关闭）
     // 后被调用：指数退避拨号直至成功或通道关闭。期间状态 Reconnecting、
     // Invoke 排队；成功后进入 settleGeneration（对齐 Go）：
@@ -39,6 +42,10 @@ public sealed partial class Channel
                     if (_isClosed)
                     {
                         return;
+                    }
+                    if (TryAbortReconnect())
+                    {
+                        return; // 不可重试的拨号失败（接入层拒绝）：终止，不无限重拨。
                     }
                     SetState(ClientState.Reconnecting);
                     backoff = NextBackoff(backoff);
@@ -287,9 +294,9 @@ public sealed partial class Channel
             }
             catch (AtlasException)
             {
-                if (_isClosed)
+                if (_isClosed || TryAbortReconnect())
                 {
-                    return null;
+                    return null; // 已关闭，或不可重试的拨号失败：终止重连。
                 }
                 // 拨号失败：置 Reconnecting 继续退避重试（对齐 Go reconnectFrom）。
                 SetState(ClientState.Reconnecting);
@@ -346,6 +353,34 @@ public sealed partial class Channel
         {
             SetHookBypass(false);
         }
+    }
+
+    // TryAbortReconnect 处理「不可重试的拨号失败」（判定函数由调用方配置，如接入层拒绝
+    // hello：票据无效/过期，同一张票重试必然再被拒）：置 Disconnected、回调上层
+    //（OnReconnectAborted，异常隔离），返回 true 令调用方终止重连。
+    // 判定函数未配置（null）或判定为可重试时恒返回 false——老路径行为不变。
+    private bool TryAbortReconnect()
+    {
+        var fault = _dialFault;
+        var classify = _options.DialFailureAbortsReconnect;
+        if (fault == null || classify == null || !classify(fault))
+        {
+            return false;
+        }
+        SetState(ClientState.Disconnected);
+        var callback = _options.OnReconnectAborted;
+        if (callback != null)
+        {
+            try
+            {
+                callback(fault);
+            }
+            catch (Exception)
+            {
+                // 上层回调异常隔离：不影响重连终止与通道状态。
+            }
+        }
+        return true;
     }
 
     // NextBackoff 计算下一轮退避时长（×2 封顶）。
