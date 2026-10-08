@@ -17,6 +17,10 @@ public static class BattleOps
     // SyncFrames 断线重连补帧（携带 last_seen_frame 按帧区间拉取缺失帧）。
     public const string SyncFrames = "/battle.v1.BattleService/SyncFrames";
 
+    // Ping 直连保活探针（returns Empty 即 Tell：无业务回执、不改对局状态）：
+    // 无输入期间周期发送，让帧面保持活跃（数据报面靠帧面空闲读超时判活跃）。
+    public const string Ping = "/battle.v1.BattleService/Ping";
+
     // FrameBroadcast 服务端推送：帧广播下行。
     public const string FrameBroadcast = "/battle.v1.FrameBroadcast";
 

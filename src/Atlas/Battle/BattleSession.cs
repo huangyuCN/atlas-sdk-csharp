@@ -29,6 +29,9 @@ public sealed partial class BattleSession : IAsyncDisposable
     private readonly EdgeTransport _face;
     // hello 段在装配期编码一次（重连时原样重发同一张票）。
     private readonly byte[] _hello;
+    // _logger 是调试日志实现（默认 Error 级 stderr；LogSilence=静默哨兵），
+    // 与通道同口径——保活探针失败按 Warn 记（默认级别下不打印，由事件上报）。
+    private readonly SDKLogger _logger;
     private Channel? _channel;
     private int _closed;
 
@@ -39,6 +42,9 @@ public sealed partial class BattleSession : IAsyncDisposable
         _face = face;
         Address = address;
         _hello = EdgeWire.EncodeHello(plan.Ticket);
+        _logger = options.LogSilence
+            ? SDKLoggerFactory.Silent()
+            : options.Logger ?? SDKLoggerFactory.Of(LogLevel.Error, options.LogSink);
     }
 
     // Create 装配直连战斗会话：校验选项 + 按 endpoints 选面（可配置优先面）；
@@ -96,6 +102,7 @@ public sealed partial class BattleSession : IAsyncDisposable
         try
         {
             await channel.ConnectAsync(cancellationToken).ConfigureAwait(false);
+            StartHeartbeat(); // 连接就绪才起表：周期到点即发保活探针（未连接不探测）。
         }
         catch
         {
@@ -117,6 +124,7 @@ public sealed partial class BattleSession : IAsyncDisposable
             await channel.ConnectAsync(cancellationToken).ConfigureAwait(false);
             await JoinBattleAsync(cancellationToken).ConfigureAwait(false);
             await SyncFramesAsync(LastSeenFrame, cancellationToken).ConfigureAwait(false);
+            StartHeartbeat(); // 幂等：显式重连后同样要保活（首次 Connect 已起表则原样复用）。
         }
         catch
         {
@@ -181,10 +189,12 @@ public sealed partial class BattleSession : IAsyncDisposable
             + "\",\"payload\":\"" + Convert.ToBase64String(input ?? Array.Empty<byte>()) + "\"}}");
     }
 
-    // CloseAsync 关闭会话（幂等）：停止重连、结算在途请求、关闭连接。关闭后不可再连接。
+    // CloseAsync 关闭会话（幂等）：停保活心跳、停止重连、结算在途请求、关闭连接。
+    // 关闭后不再发任何帧（含探针），也不可再连接。
     public async Task CloseAsync()
     {
         Interlocked.Exchange(ref _closed, 1);
+        await StopHeartbeatAsync().ConfigureAwait(false); // 停表并等循环退出：不留悬挂定时器。
         await CloseChannelAsync().ConfigureAwait(false);
     }
 

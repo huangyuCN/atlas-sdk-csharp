@@ -144,9 +144,11 @@ public sealed partial class BattleSession
         RaiseFailed(exception);
     }
 
-    // FailSessionAsync 终止会话：关闭通道（打断重连循环、结算排队请求）并回调 Failed。
+    // FailSessionAsync 终止会话：停保活心跳（会话已废，探针不再有意义）、关闭通道
+    //（打断重连循环、结算排队请求）并回调 Failed。
     private async Task FailSessionAsync(Exception exception)
     {
+        await StopHeartbeatAsync().ConfigureAwait(false);
         await CloseChannelAsync().ConfigureAwait(false);
         RaiseFailed(exception);
     }

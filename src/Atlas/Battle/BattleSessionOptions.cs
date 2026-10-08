@@ -34,9 +34,18 @@ public sealed class BattleSessionOptions
     // InvokeTimeoutMs 是单次帧请求的等待回执超时。
     public int InvokeTimeoutMs { get; set; } = 10_000;
 
-    // HeartbeatIntervalMs 是传输心跳周期（缺省 0 = 关闭）：战斗帧流量本身就是保活，
-    // 需要主动判活（如长时间无输入）时再打开。
+    // HeartbeatIntervalMs 是**传输心跳**周期（缺省 0 = 关闭）：通道级判活探针
+    //（/atlas.internal.Heartbeat/Ping），失败累计即判死链并触发重连。
     public int HeartbeatIntervalMs { get; set; }
+
+    // HeartbeatInterval 是**直连保活心跳**周期（缺省 2s；TimeSpan.Zero = 关闭）：
+    // 无输入期间周期发送 battle 域探针（battle.v1.BattleService/Ping，Tell 无回执），
+    // 让帧面保持活跃。服务端掉线窗口 offline_timeout 缺省 15s，数据报面（UDP/KCP）
+    // 的空闲读超时取其 1/3（缺省 5s）——**周期必须严格小于该值**，否则两拍之间
+    // 就会被判掉线，且 NAT 映射失效后下行帧收不到（表现为「连接还在但没数据」）。
+    // 与 HeartbeatIntervalMs 的分工：后者证明本代链路存活（失败即重连），
+    // 本项维持服务端帧面活跃（失败只记账，不终止会话）。
+    public TimeSpan HeartbeatInterval { get; set; } = TimeSpan.FromSeconds(2);
 
     // AutoReconnect 为 true 时断线后自动重新 hello 并重新入局（缺省开启）。
     public bool AutoReconnect { get; set; } = true;
@@ -75,6 +84,11 @@ public sealed class BattleSessionOptions
         if (InvokeTimeoutMs <= 0)
         {
             throw new ArgumentException("InvokeTimeoutMs 必须大于 0", nameof(InvokeTimeoutMs));
+        }
+        if (HeartbeatInterval < TimeSpan.Zero)
+        {
+            throw new ArgumentException(
+                "HeartbeatInterval 不得为负（TimeSpan.Zero = 关闭保活心跳）", nameof(HeartbeatInterval));
         }
         if (QueueSize <= 0)
         {
