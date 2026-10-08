@@ -65,7 +65,8 @@ internal sealed class BusinessPlayer : IAsyncDisposable
         };
         var client = new AtlasClient(new ChannelConfig(
             ChannelKind.Business,
-            token => TcpTransport.ConnectAsync(host, port, token)) { Options = options });
+            token => TcpTransport.ConnectAsync(host, port, token))
+        { Options = options });
         await client.ConnectAsync(ct).ConfigureAwait(false);
         var player = new BusinessPlayer(client, tag);
         client.On(BusinessOps.MatchStartedNotify, player.OnMatchStarted);
