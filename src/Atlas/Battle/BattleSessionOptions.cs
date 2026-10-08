@@ -47,6 +47,16 @@ public sealed class BattleSessionOptions
     // 本项维持服务端帧面活跃（失败只记账，不终止会话）。
     public TimeSpan HeartbeatInterval { get; set; } = TimeSpan.FromSeconds(2);
 
+    // EndDrainWindow 是对局结束后的**收尾窗口**（缺省 2s；TimeSpan.Zero = 立即关连接）：
+    // 收到结束信号（业务拒绝 BATTLE_ENDED 或结算结束通知）后 SDK 立即停心跳与业务发帧，
+    // 但连接再保留这么久，用于收完在途回执与尾随推送（最后一帧广播、重复的结算通知），
+    // 窗口到点自动关连接（同时终止自动重连，终态不再 hello/入局/补帧）。取值依据：
+    //   - 服务端关闭连接前对每条未确认连接重投 EndRetries=2 次结算通知、每玩家最多
+    //     MaxEndReplays=5 次补投：重复/尾随通知落在窗口内是常态；
+    //   - 数据报面（UDP/KCP）无保序无重传：更早发出的请求回执可能落后结束通知若干拍；
+    //   - 2s 与缺省保活周期同量级，远小于服务端 offline_timeout（缺省 15s）/3，不拖住回收。
+    public TimeSpan EndDrainWindow { get; set; } = TimeSpan.FromSeconds(2);
+
     // AutoReconnect 为 true 时断线后自动重新 hello 并重新入局（缺省开启）。
     public bool AutoReconnect { get; set; } = true;
 
@@ -89,6 +99,11 @@ public sealed class BattleSessionOptions
         {
             throw new ArgumentException(
                 "HeartbeatInterval 不得为负（TimeSpan.Zero = 关闭保活心跳）", nameof(HeartbeatInterval));
+        }
+        if (EndDrainWindow < TimeSpan.Zero)
+        {
+            throw new ArgumentException(
+                "EndDrainWindow 不得为负（TimeSpan.Zero = 对局结束即关连接）", nameof(EndDrainWindow));
         }
         if (QueueSize <= 0)
         {

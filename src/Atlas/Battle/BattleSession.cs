@@ -92,6 +92,7 @@ public sealed partial class BattleSession : IAsyncDisposable
     public async Task ConnectAsync(CancellationToken cancellationToken = default)
     {
         ThrowIfClosed();
+        ThrowIfEnded();
         if (Volatile.Read(ref _channel) != null)
         {
             throw new NetworkException(DirectErrors.SessionAlreadyConnected);
@@ -116,6 +117,7 @@ public sealed partial class BattleSession : IAsyncDisposable
     public async Task ReconnectAsync(CancellationToken cancellationToken = default)
     {
         ThrowIfClosed();
+        ThrowIfEnded();
         await CloseChannelAsync().ConfigureAwait(false);
         var channel = NewChannel();
         _channel = channel;
@@ -189,12 +191,14 @@ public sealed partial class BattleSession : IAsyncDisposable
             + "\",\"payload\":\"" + Convert.ToBase64String(input ?? Array.Empty<byte>()) + "\"}}");
     }
 
-    // CloseAsync 关闭会话（幂等）：停保活心跳、停止重连、结算在途请求、关闭连接。
+    // CloseAsync 关闭会话（幂等）：停保活心跳、停收尾窗口、停止重连、结算在途请求、关闭连接。
     // 关闭后不再发任何帧（含探针），也不可再连接。
     public async Task CloseAsync()
     {
         Interlocked.Exchange(ref _closed, 1);
+        CancelEndDrain(); // 结束后的收尾窗口不等它到点：关闭优先。
         await StopHeartbeatAsync().ConfigureAwait(false); // 停表并等循环退出：不留悬挂定时器。
+        await AwaitEndDrainAsync().ConfigureAwait(false); // 等收尾任务退出（含它的关连接）。
         await CloseChannelAsync().ConfigureAwait(false);
     }
 
@@ -203,13 +207,30 @@ public sealed partial class BattleSession : IAsyncDisposable
         await CloseAsync().ConfigureAwait(false);
     }
 
-    // InvokeAsync 发一次帧请求（未连接/已关闭即失败，不静默丢弃）。
+    // InvokeAsync 发一次帧请求（已关闭/已结束/未连接即失败，不静默丢弃、不写线）。
     private Task<byte[]> InvokeAsync(string operation, byte[]? payload, CancellationToken cancellationToken)
     {
         ThrowIfClosed();
+        ThrowIfEnded();
         var channel = Volatile.Read(ref _channel)
             ?? throw new NetworkException($"{DirectErrors.SessionClosed}: 尚未连接（先 ConnectAsync）");
-        return channel.InvokeRawAsync(operation, payload, cancellationToken);
+        return GuardEndedAsync(channel.InvokeRawAsync(operation, payload, cancellationToken));
+    }
+
+    // GuardEndedAsync 观察一次帧调用的结果：服务端以 BATTLE_ENDED 拒绝（该局已结束）即进入
+    // 终态（停心跳、停发、收尾窗口），并把拒绝原样上抛——调用方看到的是可判定的业务拒绝，
+    // 而不是「重试到超时」。首个结束信号生效，重复拒绝幂等。
+    private async Task<byte[]> GuardEndedAsync(Task<byte[]> call)
+    {
+        try
+        {
+            return await call.ConfigureAwait(false);
+        }
+        catch (BusinessException exception) when (exception.Reason == DirectErrors.BattleEndedReason)
+        {
+            EnterEnded(DirectErrors.BattleEndedReason);
+            throw;
+        }
     }
 
     // CloseChannelAsync 关闭并摘下当前通道（幂等：无通道时直接返回）。
@@ -235,12 +256,6 @@ public sealed partial class BattleSession : IAsyncDisposable
     {
         TrackLastSeenFrame(payload, version);
         FrameBroadcast?.Invoke(new BattlePush(op, payload, version));
-    }
-
-    // OnBattleEnd 分发战斗结束推送。
-    private void OnBattleEnd(string op, byte[] payload, byte version)
-    {
-        BattleEnd?.Invoke(new BattlePush(op, payload, version));
     }
 
     // TrackLastSeenFrame 从帧广播载荷尽力取帧号（ver=1 protojson：{"frame":{"frameId":"9"}}）

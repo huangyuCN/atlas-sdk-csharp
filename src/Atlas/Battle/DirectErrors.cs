@@ -42,4 +42,15 @@ public static class DirectErrors
 
     // TicketInvalidReason 票非法/被篡改的帧面业务拒绝 reason（与过期分开，处置不同）。
     public const string TicketInvalidReason = "BATTLE_TICKET_INVALID";
+
+    // BattleEndedReason 已结束对局的帧面业务拒绝 reason（服务端稳定 reason，与票类 reason 互斥）：
+    // SDK 据此进入终态并停发（帧输入/补帧/心跳），而不是重试到超时——票废才重取票。
+    public const string BattleEndedReason = "BATTLE_ENDED";
+
+    // BattleEndNotifyReason 终态由**结算结束通知**触发（非业务拒绝）时的来源标记：
+    // 与 BattleEndedReason 分开，便于上层与排障区分「服务端拒绝先到 vs 结算推送先到」。
+    public const string BattleEndNotifyReason = "BATTLE_END_NOTIFY";
+
+    // SessionEnded 会话已进入终态（对局已结束）：终态下的发帧/补帧/入局/重连一律拒发（不写线）。
+    public const string SessionEnded = "战斗已结束";
 }

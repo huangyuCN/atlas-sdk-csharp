@@ -14,14 +14,16 @@ namespace Atlas.E2E;
 //   2. 战斗链路：按面直连接入层（ws 7100 / kcp 7101 / udp 7102），跑
 //      JoinBattle → SendFrameInput → SyncFrames → 收到帧广播，三面各跑一次；
 //   3. 保活验收：局中「只发心跳、不发输入」的静默窗口，断言未被判出局且之后仍能发帧/补帧；
-//      同参数关掉保活心跳再跑一次作对照。
+//      同参数关掉保活心跳再跑一次作对照；
+//   4. 结束语义验收：跑到对局**自然结算**（帧数上限），断言终态（HasEnded）后不再发送
+//      （心跳停表 + 发帧/补帧被拒发）、结算结束通知重复投递时事件仍只触发一次。
 //
 // 用法（环境变量门控；未设置 ATLAS_E2E_SERVER 即不运行，绝无默认外网目标）：
 //   ATLAS_E2E_SERVER=10.10.9.36 dotnet run --project examples/E2E
 //   ATLAS_E2E_SERVER=10.10.9.36 dotnet run --project examples/E2E -- -faces kcp,udp,ws -quiet-ms 8000
 // 命令行：-server / -faces / -quiet-ms / -heartbeat-ms / -closure-only / -keepalive-only /
-//         -skip-control / -debug
-// 退出码：0 = 三面闭环与保活验收全部通过；1 = 存在未通过项；2 = 未指定目标服务器。
+//         -end-only / -skip-control / -skip-end / -debug
+// 退出码：0 = 各阶段全部通过；1 = 存在未通过项；2 = 未指定目标服务器。
 public static class Program
 {
     public static async Task<int> Main(string[] args)
@@ -53,7 +55,7 @@ public static class Program
             Console.WriteLine($"[e2e] 存在未通过项：{string.Join("；", failures)}");
             return 1;
         }
-        Console.WriteLine($"跨机闭环全部通过（C# SDK → {config.Server}：业务链路 + 三面经接入层直连 + 保活验收）");
+        Console.WriteLine($"跨机闭环全部通过（C# SDK → {config.Server}：业务链路 + 三面经接入层直连 + 保活验收 + 结束语义）");
         return 0;
     }
 
@@ -80,6 +82,15 @@ public static class Program
             if (!await check.RunAsync(EdgeTransport.Kcp, pair.Plan, false, ct).ConfigureAwait(false))
             {
                 failures.Add("对照未观察到掉线");
+            }
+        }
+        if (config.RunEnd)
+        {
+            // 结束语义验收跑在清单首面（每面一局；同一局的结束只能验一次）。
+            await using var pair = await MatchPair.CreateAsync(config, "end", ct).ConfigureAwait(false);
+            if (!await new EndSemanticsCheck(config).RunAsync(config.Faces[0], pair.Plan, ct).ConfigureAwait(false))
+            {
+                failures.Add("对局结束语义未通过");
             }
         }
     }
@@ -132,6 +143,7 @@ public static class Program
         Console.WriteLine("  -quiet-ms 8000      保活静默窗口（只发心跳、不发输入的时长）");
         Console.WriteLine("  -heartbeat-ms 2000  保活心跳周期（缺省 2s，须 < offline_timeout/3 = 5s）");
         Console.WriteLine("  -closure-only       只跑三面闭环；-keepalive-only 只跑保活；-skip-control 跳过对照");
+        Console.WriteLine("  -end-only           只跑对局结束语义验收；-skip-end 跳过结束语义验收");
         Console.WriteLine("  -debug              打开战斗会话 Debug 级收发打点（排障）");
     }
 }

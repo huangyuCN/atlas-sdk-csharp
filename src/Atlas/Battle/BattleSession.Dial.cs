@@ -72,9 +72,24 @@ public sealed partial class BattleSession
         return channel;
     }
 
+    // DialOverride 仅供 Atlas.Tests 注入假传输（断言「终态后零写入」「心跳停表」等线级事实），
+    // 不改变生产拨号路径（null = 按选定面真实拨号）。
+    internal Func<CancellationToken, Task<ITransport>>? DialOverride { get; set; }
+
     // DialAsync 按选定面直连接入层（每次重连都重新 hello；票仍来自成局通知）。
+    // 终态（对局已结束）拒绝拨号：重连循环据此终止（ProtocolException 走 DialFailureAbortsReconnect），
+    // 于是收尾窗口内既不会重拨、也不会有任何线写入（终态不再 hello/入局/补帧）。
     private Task<ITransport> DialAsync(CancellationToken cancellationToken)
     {
+        if (HasEnded)
+        {
+            throw new ProtocolException(
+                $"{DirectErrors.SessionEnded}（{EndedReason ?? ""}）：不再重连");
+        }
+        if (DialOverride != null)
+        {
+            return DialOverride(cancellationToken);
+        }
         switch (Face)
         {
             case EdgeTransport.Ws:
@@ -116,14 +131,27 @@ public sealed partial class BattleSession
     }
 
     // RejoinAsync 是重连钩子：新一代连接就绪后重新入局 + 以 LastSeenFrame 补帧。
-    // 票过期/无效（不可重试的业务拒绝）→ 终止会话并回调 Failed；其余失败原样上抛，
-    // 由 Channel 弃用本代连接、退避重连后再试（网络类失败仍可重试）。
+    // 对局已结束（BATTLE_ENDED：服务端在懒激活前先补投留档结果再拒绝）→ 终态收口并立即
+    // 停重连（终态不再 hello/入局/补帧）；票过期/无效（不可重试的业务拒绝）→ 终止会话并
+    // 回调 Failed；其余失败原样上抛，由 Channel 弃用本代连接、退避重连后再试。
     private async Task RejoinAsync()
     {
         try
         {
             await JoinBattleAsync().ConfigureAwait(false);
             await SyncFramesAsync(LastSeenFrame).ConfigureAwait(false);
+        }
+        catch (BusinessException exception) when (exception.Reason == DirectErrors.BattleEndedReason)
+        {
+            // 对局正常结束不是失败：不报 Failed（否则上层会被误导去重新匹配），只做终态收口。
+            EnterEnded(DirectErrors.BattleEndedReason);
+            await CloseChannelAsync().ConfigureAwait(false);
+        }
+        catch (BattleEndedException)
+        {
+            // 终态在钩子执行期间到达（结束信号与重连并发）：不再重新入局（发帧一律拒发），
+            // 立即停重连——否则钩子会在终态里空转重试，直到收尾窗口关连接才退出。
+            await CloseChannelAsync().ConfigureAwait(false);
         }
         catch (BusinessException exception) when (IsTerminalRejoinFailure(exception))
         {
@@ -139,8 +167,14 @@ public sealed partial class BattleSession
     }
 
     // OnReconnectAborted 重连被接入层拒绝（不可重试）时通知上层：会话已终止，需重新匹配。
+    // 终态（对局已结束）触发的拨号拒绝不算失败——那是收尾窗口里的既定收口（不再重连），
+    // 上报 Failed 会让上层误以为需要重新匹配。
     private void OnReconnectAborted(Exception exception)
     {
+        if (HasEnded)
+        {
+            return;
+        }
         RaiseFailed(exception);
     }
 

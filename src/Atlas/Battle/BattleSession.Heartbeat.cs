@@ -2,6 +2,7 @@ using System;
 using System.Threading;
 using System.Threading.Tasks;
 using Atlas.Client;
+using Atlas.Errors;
 
 namespace Atlas.Battle;
 
@@ -84,11 +85,16 @@ public sealed partial class BattleSession
     }
 
     // HeartbeatLoopAsync 是保活周期循环：等待一拍 → 发探针 → 记失败 → 再等。
-    // 退出条件只有「令牌取消」（关闭/终止）；探针失败绝不终止循环。
+    // 退出条件：令牌取消（关闭）、终态（对局已结束——探针不再有意义）。
+    // 探针失败绝不终止循环，**除非**服务端以 BATTLE_ENDED 拒绝（该局已结束，停发是正解）。
     private async Task HeartbeatLoopAsync(CancellationToken token)
     {
         while (await HeartbeatDelayAsync(token).ConfigureAwait(false))
         {
+            if (HasEnded)
+            {
+                return; // 终态：停表退出（不再探活）。
+            }
             try
             {
                 await SendPingAsync(token).ConfigureAwait(false);
@@ -97,6 +103,16 @@ public sealed partial class BattleSession
             catch (OperationCanceledException)
             {
                 return; // 关闭/终止取消：心跳随会话退出，不计失败。
+            }
+            catch (BattleEndedException)
+            {
+                return; // 本拍起表前已进入终态：静默退出（拒发不是链路失败）。
+            }
+            catch (BusinessException exception) when (exception.Reason == DirectErrors.BattleEndedReason)
+            {
+                // 服务端判该局已结束：进入终态并停表（终态不是链路失败，不上报 HeartbeatFailed）。
+                EnterEnded(DirectErrors.BattleEndedReason);
+                return;
             }
             catch (Exception exception)
             {
@@ -123,11 +139,12 @@ public sealed partial class BattleSession
         return !token.IsCancellationRequested;
     }
 
-    // SendPingAsync 发一拍探针：未连接（重连窗口内）跳过；直通路径不排队
+    // SendPingAsync 发一拍探针：终态（对局已结束）拒发；未连接（重连窗口内）跳过；直通路径不排队
     //（死链/重连期间排队无意义，探针不是业务请求），与正常发帧共用通道写锁、互不干扰。
     private Task<byte[]> SendPingAsync(CancellationToken token)
     {
         ThrowIfClosed();
+        ThrowIfEnded();
         var channel = Volatile.Read(ref _channel);
         if (channel == null || channel.State != ClientState.Connected)
         {

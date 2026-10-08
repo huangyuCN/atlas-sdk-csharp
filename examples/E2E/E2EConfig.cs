@@ -15,7 +15,7 @@ internal sealed class E2EConfig
     public const int EdgeUdpPort = 7102;
 
     private E2EConfig(string server, EdgeTransport[] faces, int quietMs, TimeSpan heartbeat,
-        bool closure, bool keepalive, bool control, bool debug, int probeMs)
+        bool closure, bool keepalive, bool control, bool debug, int probeMs, bool end)
     {
         Debug = debug;
         ProbeMs = probeMs;
@@ -26,6 +26,7 @@ internal sealed class E2EConfig
         RunClosure = closure;
         RunKeepalive = keepalive;
         RunControl = control;
+        RunEnd = end;
     }
 
     // Server 是目标服务器主机（成局通知里的接入层地址由服务端下发，本项只用于网关地址）。
@@ -52,6 +53,9 @@ internal sealed class E2EConfig
     // RunControl 为真时跑「心跳关」的同参数对照。
     public bool RunControl { get; }
 
+    // RunEnd 为真时跑对局结束语义验收（跑到自然结算，断言终态停发与事件幂等）。
+    public bool RunEnd { get; }
+
     // ProbeMs 是静默窗口中途的探针点（到点补发一帧 + 补帧，验证仍被受理）。
     public int ProbeMs { get; }
 
@@ -70,6 +74,7 @@ internal sealed class E2EConfig
         var keepalive = true;
         var control = true;
         var debug = false;
+        var end = true;
 
         for (var i = 0; i < args.Length; i++)
         {
@@ -80,9 +85,11 @@ internal sealed class E2EConfig
                 case "-quiet-ms" when i + 1 < args.Length: quietMs = int.Parse(args[++i]); break;
                 case "-heartbeat-ms" when i + 1 < args.Length: heartbeatMs = int.Parse(args[++i]); break;
                 case "-probe-ms" when i + 1 < args.Length: probeMs = int.Parse(args[++i]); break;
-                case "-closure-only": keepalive = false; control = false; break;
-                case "-keepalive-only": closure = false; control = false; break;
+                case "-closure-only": keepalive = false; control = false; end = false; break;
+                case "-keepalive-only": closure = false; control = false; end = false; break;
+                case "-end-only": closure = false; keepalive = false; control = false; break;
                 case "-skip-control": control = false; break;
+                case "-skip-end": end = false; break;
                 case "-debug": debug = true; break;
                 case "-h" or "--help": return null;
             }
@@ -92,7 +99,7 @@ internal sealed class E2EConfig
             return null;
         }
         return new E2EConfig(server!.Trim(), faces.ToArray(), quietMs,
-            TimeSpan.FromMilliseconds(heartbeatMs), closure, keepalive, control, debug, probeMs);
+            TimeSpan.FromMilliseconds(heartbeatMs), closure, keepalive, control, debug, probeMs, end);
     }
 
     // ParseFaces 解析面清单（kcp,udp,ws 短名；未知面即报错，不静默跳过）。
