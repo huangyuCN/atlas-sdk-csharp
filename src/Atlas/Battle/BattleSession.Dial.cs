@@ -64,10 +64,13 @@ public sealed partial class BattleSession
             // 拨号期被接入层拒绝（票无效/过期）→ 终止重连：同一张废票重试必然再被拒。
             DialFailureAbortsReconnect = exception => exception is ProtocolException,
             OnReconnectAborted = OnReconnectAborted,
+            // 终态双检：写锁内复核终态（组帧与写线之间）——终态置位后不再有新字节上线。
+            WriteGuard = ThrowIfTerminal,
+            HookMaxAttempts = _options.HookMaxAttempts,
         };
         var channel = new Channel(ChannelKind.Battle, DialAsync, options);
-        channel.On(BattleOps.FrameBroadcast, OnFrameBroadcast);
-        channel.On(BattleOps.BattleEndNotify, OnBattleEnd);
+        // 推送统一入口：通配订阅（含未来新增 op），归口分发见 BattleSession.Push.cs。
+        channel.OnAny(OnChannelPush);
         channel.OnRelogin = RejoinAsync;
         return channel;
     }
@@ -77,15 +80,36 @@ public sealed partial class BattleSession
     internal Func<CancellationToken, Task<ITransport>>? DialOverride { get; set; }
 
     // DialAsync 按选定面直连接入层（每次重连都重新 hello；票仍来自成局通知）。
-    // 终态（对局已结束）拒绝拨号：重连循环据此终止（ProtocolException 走 DialFailureAbortsReconnect），
-    // 于是收尾窗口内既不会重拨、也不会有任何线写入（终态不再 hello/入局/补帧）。
-    private Task<ITransport> DialAsync(CancellationToken cancellationToken)
+    // 终态（对局已结束 / 终态失败）拒绝拨号：重连循环据此终止（ProtocolException 走
+    // DialFailureAbortsReconnect），于是收尾窗口内既不会重拨、也不会有任何线写入。
+    // 每次尝试都计数（Stats.ConnectAttempts / ConnectFailures / HandshakeFailures）。
+    private async Task<ITransport> DialAsync(CancellationToken cancellationToken)
     {
         if (HasEnded)
         {
             throw new ProtocolException(
                 $"{DirectErrors.SessionEnded}（{EndedReason ?? ""}）：不再重连");
         }
+        if (HasFailed)
+        {
+            throw new ProtocolException(
+                $"{DirectErrors.SessionEnded}（{FailureCause?.Message ?? ""}）：会话已终止，不再重连");
+        }
+        CountDialAttempt();
+        try
+        {
+            return await DialFaceAsync(cancellationToken).ConfigureAwait(false);
+        }
+        catch (Exception exception)
+        {
+            CountDialFailure(exception);
+            throw;
+        }
+    }
+
+    // DialFaceAsync 按选定面真正拨号（测试经 DialOverride 注入假传输，不改变生产路径）。
+    private Task<ITransport> DialFaceAsync(CancellationToken cancellationToken)
+    {
         if (DialOverride != null)
         {
             return DialOverride(cancellationToken);
@@ -131,17 +155,21 @@ public sealed partial class BattleSession
     }
 
     // RejoinAsync 是重连钩子：新一代连接就绪后重新入局 + 以 LastSeenFrame 补帧。
-    // 对局已结束（BATTLE_ENDED：服务端在懒激活前先补投留档结果再拒绝）→ 终态收口并立即
-    // 停重连（终态不再 hello/入局/补帧）；票过期/无效（不可重试的业务拒绝）→ 终止会话并
-    // 回调 Failed；其余失败原样上抛，由 Channel 弃用本代连接、退避重连后再试。
+    // 业务拒绝一律**不可重试**（同一张票/同一请求重发只会拿到同一拒绝），故：
+    //   - BATTLE_ENDED（服务端在懒激活前先补投留档结果再拒绝）→ 终态收口（不上报 Failed）；
+    //   - 票类（过期/无效）：会话已废，上层需重新取票 → 终态失败并上报 Failed；
+    //   - 终态类（BATTLE_NOT_FOUND/BATTLE_FULL/FRAME_TARGET_MISMATCH）与其余业务拒绝
+    //     （含 INVALID_PARAMS）→ 终态失败并上报 Failed——重试风暴与无限重连的根因就在这里。
+    // 非业务失败（网络/超时）原样上抛，由 Channel 弃用本代连接、退避后重试（重试有界）。
     private async Task RejoinAsync()
     {
         try
         {
             await JoinBattleAsync().ConfigureAwait(false);
             await SyncFramesAsync(LastSeenFrame).ConfigureAwait(false);
+            CountReconnect(); // 自动重连一轮成功（重新入局 + 补帧完成）。
         }
-        catch (BusinessException exception) when (exception.Reason == DirectErrors.BattleEndedReason)
+        catch (BusinessException exception) when (DirectErrors.IsBattleEnded(exception))
         {
             // 对局正常结束不是失败：不报 Failed（否则上层会被误导去重新匹配），只做终态收口。
             EnterEnded(DirectErrors.BattleEndedReason);
@@ -153,36 +181,41 @@ public sealed partial class BattleSession
             // 立即停重连——否则钩子会在终态里空转重试，直到收尾窗口关连接才退出。
             await CloseChannelAsync().ConfigureAwait(false);
         }
-        catch (BusinessException exception) when (IsTerminalRejoinFailure(exception))
+        catch (BusinessException exception)
         {
-            await FailSessionAsync(exception).ConfigureAwait(false);
+            CountRejoinFailure();
+            await FailTerminalAsync(exception, exception.Code, exception.Reason).ConfigureAwait(false);
+        }
+        catch (Exception)
+        {
+            CountRejoinFailure();
+            throw; // 网络/超时类：交给 Channel 弃用本代连接、退避后重试（重试次数有界）。
         }
     }
 
-    // IsTerminalRejoinFailure 判定「票已废」类业务拒绝（重取票之前不可重试）。
-    private static bool IsTerminalRejoinFailure(BusinessException exception)
-    {
-        return exception.Reason == DirectErrors.TicketExpiredReason
-            || exception.Reason == DirectErrors.TicketInvalidReason;
-    }
-
-    // OnReconnectAborted 重连被接入层拒绝（不可重试）时通知上层：会话已终止，需重新匹配。
-    // 终态（对局已结束）触发的拨号拒绝不算失败——那是收尾窗口里的既定收口（不再重连），
-    // 上报 Failed 会让上层误以为需要重新匹配。
+    // OnReconnectAborted 重连被接入层拒绝（不可重试）或重试超限而终止时通知上层：
+    // 会话已终止，需重新匹配。终态（对局已结束/终态失败）触发的拨号拒绝不算新失败
+    //——那是既定收口（不再重连），重复上报会让上层误以为需要重新匹配。
     private void OnReconnectAborted(Exception exception)
     {
-        if (HasEnded)
+        if (HasEnded || HasFailed)
         {
             return;
         }
         RaiseFailed(exception);
     }
 
-    // FailSessionAsync 终止会话：停保活心跳（会话已废，探针不再有意义）、关闭通道
-    //（打断重连循环、结算排队请求）并回调 Failed。
+    // FailSessionAsync 终止会话：停保活心跳（会话已废，探针不再有意义）→ 关通道并上报。
     private async Task FailSessionAsync(Exception exception)
     {
         await StopHeartbeatAsync().ConfigureAwait(false);
+        await CloseAndReportAsync(exception).ConfigureAwait(false);
+    }
+
+    // CloseAndReportAsync 关闭通道（打断重连循环、结算剩余请求）并回调 Failed
+    //（心跳循环内的终态收口走这里：不停表——循环随即返回即停表，避免自等待死锁）。
+    private async Task CloseAndReportAsync(Exception exception)
+    {
         await CloseChannelAsync().ConfigureAwait(false);
         RaiseFailed(exception);
     }

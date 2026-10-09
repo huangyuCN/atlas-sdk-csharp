@@ -72,6 +72,14 @@ public sealed class BattleSessionOptions
     // HookTimeoutMs 是重连钩子（重新入局 + 补帧）的单次执行上限。
     public int HookTimeoutMs { get; set; } = 10_000;
 
+    // HookMaxAttempts 是重连钩子（重新入局 + 补帧）的最大尝试次数（缺省 10，必须 > 0）：
+    // 超过即终止本次重连并上报 Failed——重试必须有界，否则服务端持续拒绝/链路长期不可用时
+    // 会无限退避重拨（会话既不恢复也不报错）。
+    // 该选项为通道级、业务通道同样生效（落到 ChannelOptions.HookMaxAttempts）；
+    // 本层取更严口径：≤0 在装配期即报错（不留「配了却不生效」的窗口；通道层直接构造时
+    // 对 ≤0 按 1 处理，即至少执行一次钩子）。
+    public int HookMaxAttempts { get; set; } = 10;
+
     // Serializer 是载荷编码插槽（缺省 protojson）。
     public ISerializer Serializer { get; set; } = new JsonSerializer();
 
@@ -108,6 +116,10 @@ public sealed class BattleSessionOptions
         if (QueueSize <= 0)
         {
             throw new ArgumentException("QueueSize 必须大于 0", nameof(QueueSize));
+        }
+        if (HookMaxAttempts <= 0)
+        {
+            throw new ArgumentException("HookMaxAttempts 必须大于 0（重连钩子重试必须有界）", nameof(HookMaxAttempts));
         }
         if (TransportPriority == null || TransportPriority.Length == 0)
         {

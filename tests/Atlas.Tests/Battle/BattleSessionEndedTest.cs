@@ -103,6 +103,7 @@ public sealed class BattleSessionEndedTest
         Assert.Equal(DirectErrors.BattleEndedReason, exception.Reason);
         Assert.True(session.HasEnded);
         Assert.Equal(DirectErrors.BattleEndedReason, session.EndedReason);
+        Assert.False(session.HasFailed); // 正常结束（有结算）不是终态失败。
 
         // 停表：等 ≥ 2 个心跳周期，写线计数不再增长（终态后零写入的线级证据）。
         await Task.Delay(120); // 排空结束瞬间在途的一拍。

@@ -52,6 +52,16 @@ public sealed partial class Channel
         }
     }
 
+    // SettlePending 立即以给定错误结算本代全部在途与排队请求（不关连接、不改通道状态）：
+    // 战斗会话进入终态（对局已结束/入局被拒等）时调用——收尾窗口内连接仍要可读
+    //（继续收尾随推送与补投的结算通知），但已发出的请求不会再有结果，
+    // 让调用方等回执/等到超时都没有意义（对齐 TS 的 failPending(terminalStatus)）。
+    internal void SettlePending(Exception cause)
+    {
+        FailAllInflight(cause);
+        FailAllQueued(cause);
+    }
+
     // RemoveInflight 按 (key, 实例) 摘除在途项：仅当表内仍是同一实例时摘除（返回 true），
     // 否则返回 false（已被响应或断连认领）——超时路径据此判定结算权。
     private bool RemoveInflight(InflightKey key, Inflight inflight)

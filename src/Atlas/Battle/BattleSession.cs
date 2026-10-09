@@ -35,6 +35,14 @@ public sealed partial class BattleSession : IAsyncDisposable
     private Channel? _channel;
     private int _closed;
 
+    // _connectGate 串行化首连与显式重连（单飞）：并发 Connect/Reconnect 不得各拨一代——
+    // 否则后到者会摘掉/关掉先到者刚装的通道，两代都不完整（会话不可用）。
+    private readonly SemaphoreSlim _connectGate = new(1, 1);
+
+    // _reconnectRound 是「已完成的重连轮次」计数（单调递增，仅成功轮次 +1）：
+    // 并发 ReconnectAsync 据它识别「本轮已由先到者完成」并直接复用（不重复拨号/入局）。
+    private long _reconnectRound;
+
     private BattleSession(DirectPlan plan, BattleSessionOptions options, EdgeTransport face, string address)
     {
         _plan = plan;
@@ -77,63 +85,10 @@ public sealed partial class BattleSession : IAsyncDisposable
     // State 是底层通道状态（未连接/连接中/已连接/重连中/已断开）。
     public ClientState State => Volatile.Read(ref _channel)?.State ?? ClientState.Disconnected;
 
-    // FrameBroadcast 是帧广播推送回调（原始载荷 + 帧头载荷编码版本，SDK 不解码 DTO）。
-    public event Action<BattlePush>? FrameBroadcast;
-
-    // BattleEnd 是战斗结束推送回调（原始载荷 + 版本）。
-    public event Action<BattlePush>? BattleEnd;
-
-    // Failed 是会话终止回调：接入层拒绝（ProtocolException）或票过期/无效（BusinessException）
-    // 等**不可重试**失败——上层据此重新匹配或提示下线。
+    // Failed 是会话终止回调：接入层拒绝（ProtocolException）、票过期/无效、入局被拒
+    //（BATTLE_NOT_FOUND/BATTLE_FULL 等不可重试业务拒绝）等**不可重试**失败——
+    // 上层据此重新匹配或提示下线。
     public event Action<Exception>? Failed;
-
-    // ConnectAsync 建立直连（hello 握手 + 接入层验票 + 转发到 battle 帧面）并订阅推送。
-    // 可选地随后自行调用 JoinBattleAsync / SyncFramesAsync 入局。
-    public async Task ConnectAsync(CancellationToken cancellationToken = default)
-    {
-        ThrowIfClosed();
-        ThrowIfEnded();
-        if (Volatile.Read(ref _channel) != null)
-        {
-            throw new NetworkException(DirectErrors.SessionAlreadyConnected);
-        }
-        var channel = NewChannel();
-        // 先登记再拨号：拨号失败/立刻断线时，重连钩子（重新入局）也能找到本代通道。
-        _channel = channel;
-        try
-        {
-            await channel.ConnectAsync(cancellationToken).ConfigureAwait(false);
-            StartHeartbeat(); // 连接就绪才起表：周期到点即发保活探针（未连接不探测）。
-        }
-        catch
-        {
-            await CloseChannelAsync().ConfigureAwait(false);
-            throw;
-        }
-    }
-
-    // ReconnectAsync 显式重连：关闭旧通道 → 重新 hello（同一张票）→ JoinBattle →
-    // SyncFrames(LastSeenFrame) 补帧。任一环节失败都不留半开会话（关闭后抛出原异常）。
-    public async Task ReconnectAsync(CancellationToken cancellationToken = default)
-    {
-        ThrowIfClosed();
-        ThrowIfEnded();
-        await CloseChannelAsync().ConfigureAwait(false);
-        var channel = NewChannel();
-        _channel = channel;
-        try
-        {
-            await channel.ConnectAsync(cancellationToken).ConfigureAwait(false);
-            await JoinBattleAsync(cancellationToken).ConfigureAwait(false);
-            await SyncFramesAsync(LastSeenFrame, cancellationToken).ConfigureAwait(false);
-            StartHeartbeat(); // 幂等：显式重连后同样要保活（首次 Connect 已起表则原样复用）。
-        }
-        catch
-        {
-            await CloseChannelAsync().ConfigureAwait(false);
-            throw;
-        }
-    }
 
     // JoinBattleAsync 入局：用计划里的 battle_id 自动组装 protojson 请求。
     public Task<byte[]> JoinBattleAsync(CancellationToken cancellationToken = default)
@@ -207,33 +162,19 @@ public sealed partial class BattleSession : IAsyncDisposable
         await CloseAsync().ConfigureAwait(false);
     }
 
-    // InvokeAsync 发一次帧请求（已关闭/已结束/未连接即失败，不静默丢弃、不写线）。
+    // InvokeAsync 发一次帧请求（已关闭/已终态/未连接即失败，不静默丢弃、不写线）。
     private Task<byte[]> InvokeAsync(string operation, byte[]? payload, CancellationToken cancellationToken)
     {
         ThrowIfClosed();
-        ThrowIfEnded();
+        ThrowIfTerminal();
         var channel = Volatile.Read(ref _channel)
             ?? throw new NetworkException($"{DirectErrors.SessionClosed}: 尚未连接（先 ConnectAsync）");
-        return GuardEndedAsync(channel.InvokeRawAsync(operation, payload, cancellationToken));
+        return GuardRejectionAsync(channel.InvokeRawAsync(operation, payload, cancellationToken));
     }
 
-    // GuardEndedAsync 观察一次帧调用的结果：服务端以 BATTLE_ENDED 拒绝（该局已结束）即进入
-    // 终态（停心跳、停发、收尾窗口），并把拒绝原样上抛——调用方看到的是可判定的业务拒绝，
-    // 而不是「重试到超时」。首个结束信号生效，重复拒绝幂等。
-    private async Task<byte[]> GuardEndedAsync(Task<byte[]> call)
-    {
-        try
-        {
-            return await call.ConfigureAwait(false);
-        }
-        catch (BusinessException exception) when (exception.Reason == DirectErrors.BattleEndedReason)
-        {
-            EnterEnded(DirectErrors.BattleEndedReason);
-            throw;
-        }
-    }
-
-    // CloseChannelAsync 关闭并摘下当前通道（幂等：无通道时直接返回）。
+    // CloseChannelAsync 关闭并摘下**当前**通道（幂等：无通道时直接返回）。
+    // CloseAsync / 终态收口 / 票废终止等「会话级关闭」用它；重连路径必须用
+    // DetachChannel + 只关自己持有的那一代（不得误关并发路径新装的通道）。
     private async Task CloseChannelAsync()
     {
         var channel = Interlocked.Exchange(ref _channel, null);
@@ -243,53 +184,26 @@ public sealed partial class BattleSession : IAsyncDisposable
         }
     }
 
+    // DetachChannel 只在「当前通道就是本次持有的那一代」时摘下（CAS）：返回 true = 本代
+    // 已摘除（调用方随后自行关闭它）；false = 当前通道是别人装的，不得触碰。
+    private bool DetachChannel(Channel channel)
+    {
+        return ReferenceEquals(Interlocked.CompareExchange(ref _channel, null, channel), channel);
+    }
+
+    // DetachAndCloseAsync 关闭本次调用持有的通道：只在自己仍持有它时摘下再关，
+    // 并发重连交错时不会误关别人新装的通道（P0-6a 的根因修复点）。
+    private async Task DetachAndCloseAsync(Channel channel)
+    {
+        DetachChannel(channel);
+        await channel.CloseAsync().ConfigureAwait(false);
+    }
+
     private void ThrowIfClosed()
     {
         if (Volatile.Read(ref _closed) != 0)
         {
             throw new NetworkException(DirectErrors.SessionClosed);
-        }
-    }
-
-    // OnFrameBroadcast 分发帧广播：推进 LastSeenFrame 后交给回调（SDK 不解码 DTO）。
-    private void OnFrameBroadcast(string op, byte[] payload, byte version)
-    {
-        TrackLastSeenFrame(payload, version);
-        FrameBroadcast?.Invoke(new BattlePush(op, payload, version));
-    }
-
-    // TrackLastSeenFrame 从帧广播载荷尽力取帧号（ver=1 protojson：{"frame":{"frameId":"9"}}）
-    // 用于断线补帧；取不到（ver=2/字段缺失/非 JSON）就保持原值——不猜、不抛错。
-    private void TrackLastSeenFrame(byte[] payload, byte version)
-    {
-        if (version != FrameGen.Version)
-        {
-            return;
-        }
-        try
-        {
-            using var document = JsonDocument.Parse(payload);
-            if (!document.RootElement.TryGetProperty("frame", out var frame)
-                || frame.ValueKind != JsonValueKind.Object)
-            {
-                return;
-            }
-            if (!frame.TryGetProperty("frameId", out var id) && !frame.TryGetProperty("frame_id", out id))
-            {
-                return;
-            }
-            if (id.ValueKind == JsonValueKind.String && ulong.TryParse(id.GetString(), out var fromText))
-            {
-                LastSeenFrame = fromText;
-            }
-            else if (id.ValueKind == JsonValueKind.Number && id.TryGetUInt64(out var fromNumber))
-            {
-                LastSeenFrame = fromNumber;
-            }
-        }
-        catch (JsonException)
-        {
-            // 推送载荷不是 protojson：保持原值（LastSeenFrame 由调用方维护）。
         }
     }
 

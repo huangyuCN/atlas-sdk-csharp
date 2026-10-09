@@ -105,4 +105,19 @@ public sealed class ChannelOptions
     //（重连编排同步执行、hookBypass 直通窗口）。AtlasClient 装配层同时配置
     // ChannelConfig.ReconnectHook 时以 ReconnectHook 为准（通道级覆盖）。
     public Func<Task>? OnReconnected { get; set; }
+
+    // WriteGuard 是写线前的复核钩子（在**写锁内**、真正写帧之前调用；null = 不复核）：
+    // 战斗会话据此在「组帧与写线之间」复核终态，保证终态置位后零写线
+    //（已在写锁内的那一笔不回滚——对齐 Go writeRequest 的终态双检）。
+    // 钩子抛出的异常原样上抛（不包装成网络错误）：终态拒绝必须是可判定的业务/终态异常。
+    public Action? WriteGuard { get; set; }
+
+    // HookMaxAttempts 是重连钩子（会话重登/重新入局）的最大尝试次数（>0；缺省 10）：
+    // 超过即终止本次重连并通知 OnReconnectAborted——重试必须有界，否则钩子持续失败时
+    // 会无限退避重拨（服务端持续拒绝/链路长期不可用等场景永不退出）。单次尝试仍受
+    // HookTimeoutMs 约束。
+    // 业务通道与战斗通道同样生效（本选项属通道级）；≤0 按 1 处理（至少执行一次钩子，
+    // 仍不会无界重试）——战斗会话装配层 BattleSessionOptions 对同项取更严格口径：
+    // ≤0 在装配期直接报错（不留「配了却不生效」的窗口）。
+    public int HookMaxAttempts { get; set; } = 10;
 }

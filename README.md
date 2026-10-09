@@ -7,13 +7,15 @@
 
 Atlas 帧协议的 C# 客户端 SDK（**Unity 优先**）。用于游戏客户端、机器人、压测脚本连接
 [Atlas](https://github.com/huangyuCN/atlas) 游戏服务端，提供开箱即用的长连接能力：
-**请求-响应匹配、服务端推送订阅、双层心跳、断线自动重连、dual 双通道编排**。
+**请求-响应匹配、服务端推送订阅、双层心跳、断线自动重连、dual 双通道编排**，
+以及**战斗直连会话**（凭成局票据直连接入层，不经网关，见「战斗直连」一节）。
 
 核心库为纯托管 .NET Standard 2.1（零 UnityEngine 依赖），可被 Unity
 （Mono/IL2CPP）引用，也可被 .NET 服务器工具与压测脚本复用。
 
 > **当前状态**：协议层、运行时内核（请求匹配、推送订阅、双层心跳、断线重连、
-> dual 双通道编排）与四通道传输全部可用；真机四通道 × 三编码冒烟通过（详见
+> dual 双通道编排）、四通道传输与**战斗直连会话**（阶段 3：直连接入层 + 统一推送
+> 出口 + 终态语义 + 只读观测）全部可用；真机四通道 × 三编码冒烟通过（详见
 > [docs/unity-verify.md](docs/unity-verify.md)）。Unity 编辑器真机挂载验证待验
 > （本机 Unity 许可证失效，见 [docs/unity-verify.md](docs/unity-verify.md) §4）。
 
@@ -25,7 +27,8 @@ Atlas 帧协议的 C# 客户端 SDK（**Unity 优先**）。用于游戏客户�
 | WebSocket | 浏览器形态的单通道业务+战斗 | `WsTransport.ConnectAsync` |
 | KCP | 战斗通道（可靠 UDP，低延迟） | `KcpTransport.ConnectAsync` |
 | UDP | 战斗通道（低延迟，尽力而为） | `UdpTransport.ConnectAsync` |
-| TCP/WS + KCP/UDP 组合 | dual 形态：业务 + 战斗双通道 | `AtlasClient` + 双 `ChannelConfig` |
+| TCP/WS + KCP/UDP 组合 | dual 形态：业务 + 战斗双通道（自管） | `AtlasClient` + 双 `ChannelConfig` |
+| WS / KCP / UDP（直连接入层） | 战斗直连（阶段 3 标准形态：凭票逐帧带票，不经网关） | `BattleSession.Create` + `DirectPlan.FromNotify` |
 
 ## 特性
 
@@ -37,6 +40,10 @@ Atlas 帧协议的 C# 客户端 SDK（**Unity 优先**）。用于游戏客户�
 - **dual 双通道编排**：业务 + 战斗通道各自独立连接、心跳、重连与请求排队；
   业务重登成功后 SDK 自动链式触发战斗通道重新绑定（Join 语义）；任一通道拨号
   失败整体回滚。
+- **战斗直连（阶段 3 标准形态）**：`BattleSession` 凭成局推送的「接入层地址 + 战斗
+  票据」直连接入层（WS/KCP/UDP 三面，逐帧带票），战斗帧**不经网关**；统一推送出口
+  （`Push` 事件 + `OnPush` 订阅 + `FrameBroadcast`/`BattleEnd`/`PlayerOut` 专用事件）、
+  终态语义（对局结束 / 不可重试失败）与只读观测（`Stats`）齐备——见「战斗直连」一节。
 - **请求-响应匹配**：`seq` 单调递增 + 按连接代次（epoch）隔离匹配；超时、迟到
   响应静默丢弃、断连统一失败——全部路径恰好一次投递（含排队看护、drain 重发
   的 CAS 认领互斥）。
@@ -106,6 +113,7 @@ ATLAS_LAYOUT_DIR=../atlas-game-layout ATLAS_DIR=../atlas bash scripts/gen-dto.sh
 | `src/Atlas/Frame/Gen/FrameGen.cs` | 复制框架 `transport/frame/gen/csharp/FrameGen.cs` | 帧协议常量（单一来源） |
 | `examples/Smoke/Proto/gen/imessage/*.cs` | `--csharp_out`（`IMessage`） | ver=2 protobuf 二进制路径 |
 | `examples/Smoke/Proto/gen/api/**/opclient/*.client.g.cs` | `--atlas-client_out`（POCO + 强类型 stub + 协议描述符） | ver=1 protojson 路径、会话 op 与提取器 |
+| `src/Atlas/Battle/Gen/*.g.cs` | 从 `--atlas-client_out` 产物抽取 `ProtocolOps`/`PushOps` 常量类 | 战斗域请求 op 与推送 op 常量（SDK 侧零手写 op 字面量） |
 
 > **序列化经插槽注入**：生成的 stub 构造为 `(IAtlasInvoker inv, ISerializer ser)`，
 > DTO ↔ payload 一律走 `ISerializer.Serialize(object)` / `Deserialize(byte[], Type)`，
@@ -181,9 +189,16 @@ await channel.CloseAsync();
 
 错误处理：`InvokeRawAsync` 抛四类异常——`BusinessException`（业务拒绝，按
 `Reason` 分支，用 `IsBusinessError(ex, "REASON")` 判定）/ `NetworkException` /
-`TimeoutException` / `ProtocolException`。
+`TimeoutException` / `ProtocolException`。战斗直连会话另有 `BattleEndedException`
+（对局已结束后的发帧/补帧/入局/重连一律明确拒发、不写线）与判定函数族
+`DirectErrors.IsBattleEnded/IsBattleNotFound/IsBattleFull/IsFrameTargetMismatch/IsTicketRejected`
+（`isBattleEnded` 同族，供上层按 reason 分支）。
 
 ### dual 双通道（业务 TCP + 战斗 KCP）
+
+> **口径更新（阶段 3）**：战斗帧的标准形态是**直连接入层**（见下一节
+> 「战斗直连」）——客户端凭成局票据直连战斗帧面，**网关只剩单一业务通道**。
+> 本节的 dual 编排保留给「自管双通道」的旧形态（如自建战斗通道、压测脚本）。
 
 业务通道承载登录/会话，战斗通道承载高频帧输入，两通道独立心跳与重连。
 `AtlasClient` 自动链式编排：**业务重登成功后自动触发战斗重绑**；战斗通道自身
@@ -210,6 +225,66 @@ var battle = client.Channel(ChannelKind.Battle);     // 战斗通道视图
 // 业务/战斗独立请求与订阅；State 聚合向下降级（任一通道非 Connected 即降级）。
 ```
 
+### 战斗直连（BattleSession，阶段 3 标准形态）
+
+阶段 3 起**战斗帧不经网关**：客户端从成局推送（`/game.v1.MatchStartedNotify`）拿到
+「接入层地址 + 战斗票据」，凭票直连接入层（L4 转发到 battle 帧面，**不解析帧正文**）；
+网关只剩单一业务通道（登录/会话/匹配）。`BattleSession` 封装这条链路：
+
+```csharp
+using System;
+using Atlas.Battle;
+
+// 1) 成局通知 → 直连计划（票据 + 各面地址；缺票/缺面/面名未知即明确报错）。
+var plan = DirectPlan.FromNotify(pushPayload);   // 帧 Notify 的 protojson 载荷
+// 2) 装配会话：按 endpoints 选面（优先面必须已下发，否则报错——不猜端口、不静默换面）。
+var session = BattleSession.Create(plan, new BattleSessionOptions
+{
+    PreferredTransport = EdgeTransport.Ws,   // 缺省优先级 ws → kcp → udp
+});
+// 3) 直连（hello 换票）→ 入局 → 补帧。
+await session.ConnectAsync(ct);
+await session.JoinBattleAsync();
+await session.SyncFramesAsync(session.LastSeenFrame);
+
+// 4) 统一推送出口：Push 事件（含未预设 op）+ OnPush 按 op 订阅 + 专用事件。
+session.Push += push => CountPush(push.Op, push.Version);              // 全部推送
+session.FrameBroadcast += push => TrackFrame(push.Payload, push.Version); // 帧广播（自动推进 LastSeenFrame）
+session.BattleEnd += push => ShowResult(push.Payload);                 // 结算（同一局只触发一次）
+session.PlayerOut += push => ShowPlayerOut(push.Payload);              // 玩家出局
+using var off = session.OnPush(BattleOps.PlayerOutNotify, push => Log(push.Payload));
+
+// 5) 收尾（幂等）：停探针、取消收尾窗口、结算在途请求、关连接。
+await session.CloseAsync();
+```
+
+直连口径要点（与 Go/TS 三 SDK 一致）：
+
+| 主题 | 口径 |
+|------|------|
+| 面选择 | 只用成局通知下发的面与地址；优先面缺失或与支持集无交集 → `ProtocolException`（不猜端口、不静默换面） |
+| 逐帧带票 | 三面统一在帧会话槽携带 base64url 票（`ForceFrameSessionSlot`）：WS 长连接也逐帧带票（接入层透传后帧面按帧槽验票） |
+| 保活 | 无输入期间按 `HeartbeatInterval`（缺省 2s）发 `battle.v1.BattleService/Ping`（Tell），维持帧面活跃 |
+| 断线恢复 | 自动重连（退避）或显式 `ReconnectAsync`；重连后重新 `JoinBattle` + `SyncFrames(LastSeenFrame)` 补帧；并发 `ReconnectAsync` 单飞（只重连一轮） |
+| 重试有界 | 重连钩子连续失败到 `HookMaxAttempts`（缺省 10）即终止重连并上报 `Failed`（不无限退避重拨） |
+| 终态·对局结束 | `BATTLE_ENDED`（409）拒绝或结算结束通知 → `HasEnded`：停发一切上发（含探针），收尾窗口内继续收尾随推送 |
+| 终态·不可重试失败 | `BATTLE_NOT_FOUND`(404)、`BATTLE_FULL`(409)、`FRAME_TARGET_MISMATCH`(403)、`INVALID_PARAMS`、票类拒绝 → `HasFailed`：`Failed` 上报一次、不再重连、后续调用本地拒绝 |
+| 终态零写线 | 终态检查在任何组帧之前，并在**写锁内**复核（`ChannelOptions.WriteGuard`）：终态置位后不再有新字节上线 |
+| 在途结算 | 终态时在途/排队请求立即以终态 `BusinessException` 结算（reason/code 与触发拒绝同形、class=business、metadata 键 `x-atlas-sdk-local-settled` 标本地结算——三 SDK 统一键名），不等回执超时、不报成网络错误 |
+| 心跳被拒 | 终态类（`BATTLE_ENDED`/`BATTLE_NOT_FOUND`/`BATTLE_FULL`/`FRAME_TARGET_MISMATCH`）→ 入终态停探针；票类 → `TicketRejected` 信号（**不终态**：等上层重新取票，此期间每拍被拒只计数、首见一条）；其余 → 计数 + `HeartbeatFailed`，继续探测（日志/事件只在状态首次变化时一条） |
+| 可观测 | `session.Stats`：拨号尝试/失败、握手失败、重连轮次、钩子失败、心跳送达/失败/被拒/票类被拒（只读快照，零依赖） |
+
+终态语义分工（三 SDK 一致）：`HasEnded`（`BATTLE_ENDED` 拒绝或结算推送）表示**对局正常
+结束、有结算可展示**（读 `BattleEnd` 事件/推送载荷）；`HasFailed`（`BATTLE_NOT_FOUND`/
+`BATTLE_FULL`/`FRAME_TARGET_MISMATCH`/`INVALID_PARAMS`/票类）表示**无结算可展示的终态拒绝**
+（读 `Failed` 事件/`FailureCause`）——两者**互不置位**：入局被拒不是「结束」，上层不该去取
+不存在的结算。
+
+op 常量全部取自生成物（`src/Atlas/Battle/Gen/*.g.cs`，由 `scripts/gen-dto.sh` 从
+插件产物抽取）：`BattleOps.JoinBattle/SendFrameInput/SyncFrames/Ping`、
+`BattleOps.FrameBroadcast/BattleEndNotify/PlayerOutNotify/MatchStartedNotify`——
+SDK 侧不手写 op 字面量。
+
 ## 编码语义（json = protojson）
 
 C# SDK 覆盖两条编码路径，同一份 IDL 生成两套类型：
@@ -234,6 +309,8 @@ C# SDK 覆盖两条编码路径，同一份 IDL 生成两套类型：
 | `BackoffBaseMs`/`BackoffMaxMs` | 500/30_000 | 重连退避参数（×2 封顶 + 抖动） |
 | `QueueSize` | 64 | 重连期间请求排队上限（满后立即失败） |
 | `HookTimeoutMs` | 10_000 | 重连钩子（重登/重绑）窗口上限 |
+| `HookMaxAttempts` | 10 | 重连钩子最大尝试次数（超限即终止重连并回调 `OnReconnectAborted`）；**业务通道同样生效**；通道层 `≤0` 按 1 处理（至少跑一次），战斗会话装配层 `≤0` 直接报错 |
+| `WriteGuard` | null | 写线前复核钩子（**写锁内**调用；战斗会话据此保证终态零写线） |
 | `HeartbeatFailures` | 3 | 心跳死链判定阈值 |
 
 `ChannelConfig`：`Kind`（`Business`/`Battle`）、`Dial`（拨号工厂）、`Options`

@@ -19,6 +19,15 @@ public sealed partial class Channel
 
         FailGeneration(epoch, cause);
 
+        // 陈旧代（已换代/已弃用）不驱动重连：本代的连接是被重连编排（钩子失败弃用、
+        // 重试超限终止）关掉的，重连另有人在——若让它的读循环退出再起一轮，会让
+        // 「重试有界」失效（每轮终止后又被旧连接凭空拉起一轮重连）。
+        if (!IsCurrentGeneration(epoch))
+        {
+            await CloseTransportAsync(transport);
+            return;
+        }
+
         // M4：网络错误退出（非协议致命、非主动关闭）驱动自动重连。
         // 协议级致命错误（ProtocolException：版本不匹配/帧非法）直接终止、不重连
         //（对标 Go：不可重试、连接已断；ChannelTest.ResponseVersionMismatch 依赖此语义）。
@@ -86,6 +95,16 @@ public sealed partial class Channel
                 SetState(ClientState.Reconnecting);
             }
             return shouldReconnect;
+        }
+    }
+
+    // IsCurrentGeneration 返回该代是否仍是当前代（已关闭恒为 false）：陈旧代的读循环退出
+    // 不得驱动重连（重连编排属于新代，或已按重试上限终止）。
+    private bool IsCurrentGeneration(uint epoch)
+    {
+        lock (_gate)
+        {
+            return !_isClosed && _epoch == epoch;
         }
     }
 

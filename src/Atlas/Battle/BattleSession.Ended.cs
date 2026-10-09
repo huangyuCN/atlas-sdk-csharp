@@ -36,6 +36,9 @@ public sealed partial class BattleSession
 
     // HasEnded 是对局是否已结束（终态判定）：服务端以 BATTLE_ENDED 拒绝任一帧调用，
     // 或收到结算结束通知，即置位；终态下 SDK 不再写线（发帧/补帧/心跳/重连一律拒发）。
+    // 语义分工：本标记表示**对局正常结束、有结算可展示**；无结算可展示的终态拒绝
+    //（BATTLE_NOT_FOUND/BATTLE_FULL/FRAME_TARGET_MISMATCH/票类）走 HasFailed，**不置本标记**
+    //——否则上层会去取不存在的结算。
     public bool HasEnded => Volatile.Read(ref _ended) != 0;
 
     // EndedReason 是触发终态的结束信号来源（未结束为 null）：
@@ -43,7 +46,8 @@ public sealed partial class BattleSession
     public string? EndedReason => Volatile.Read(ref _endedReason);
 
     // EnterEnded 进入终态（幂等：首个结束信号生效，重复信号不改写来源、不重启窗口）：
-    // 置位 → 启动收尾窗口（停心跳 → 等窗口 → 关连接）。返回 true = 本次是首个结束信号。
+    // 置位 → 在途/排队请求立即以终态 Status 结算（不等回执/超时）→ 启动收尾窗口
+    //（停心跳 → 等窗口 → 关连接）。返回 true = 本次是首个结束信号。
     private bool EnterEnded(string reason)
     {
         if (Interlocked.CompareExchange(ref _ended, 1, 0) != 0)
@@ -51,6 +55,7 @@ public sealed partial class BattleSession
             return false;
         }
         Volatile.Write(ref _endedReason, reason);
+        SettleInflightTerminal(DirectErrors.BattleEndedCode, DirectErrors.BattleEndedReason);
         StartEndDrain();
         return true;
     }
@@ -69,18 +74,27 @@ public sealed partial class BattleSession
     }
 
     // OnBattleEnd 分发战斗结束推送（幂等）：首个结束通知进入终态并触发一次 BattleEnd 事件；
-    // 重复投递（服务端关闭前重投 + 重连补投）只比对载荷——不一致记 Warn，事件不重发、
-    // 首个载荷不被改写（同一局只有一个结算结果，重复投递不得让上层看到两份）。
+    // 重复投递（服务端关闭前重投 + 重连补投）只比对载荷——不一致记 Warn，专用事件不重发、
+    // 首个载荷不被改写（同一局只有一个结算结果，重复投递不得让上层看到两份）；
+    // 统一出口（Push 事件 + OnPush 订阅）对每次投递都可见——观测面不该被幂等去重掉。
     private void OnBattleEnd(string op, byte[] payload, byte version)
     {
         EnterEnded(DirectErrors.BattleEndNotifyReason);
-        if (Interlocked.CompareExchange(ref _endNotified, 1, 0) != 0)
+        var first = Interlocked.CompareExchange(ref _endNotified, 1, 0) == 0;
+        if (first)
+        {
+            Volatile.Write(ref _endPayload, payload);
+        }
+        else
         {
             NoteEndReplay(payload);
-            return;
         }
-        Volatile.Write(ref _endPayload, payload);
-        BattleEnd?.Invoke(new BattlePush(op, payload, version));
+        var push = new BattlePush(op, payload, version);
+        DispatchPush(push);
+        if (first)
+        {
+            InvokePushHandler(BattleEnd, push);
+        }
     }
 
     // NoteEndReplay 记一次重复结束通知：载荷逐字一致（服务端口径）即静默忽略；不一致记 Warn

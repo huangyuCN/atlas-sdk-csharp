@@ -227,8 +227,9 @@ public sealed partial class Channel : IAsyncDisposable
         CancelGeneration(); // 停当前代心跳。
         ClearSubscriptions(); // 订阅随通道生命周期结束：关闭后不再分发任何推送。
 
-        FailAllInflight(new NetworkException("通道已关闭"));
-        FailAllQueued();
+        var closedCause = new NetworkException("通道已关闭");
+        FailAllInflight(closedCause);
+        FailAllQueued(closedCause);
         if (closing.Transport != null)
         {
             await CloseTransportAsync(closing.Transport);

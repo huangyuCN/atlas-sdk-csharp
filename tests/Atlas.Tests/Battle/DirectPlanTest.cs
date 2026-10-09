@@ -65,10 +65,11 @@ public sealed class DirectPlanTest
     public void PushOps_AreMessageFullNames()
     {
         // 推送 op 是**消息完整名**（atlas.route.v1.push 声明在消息上），不是服务/方法名：
-        // 与 Go 生成物 api/game/v1/opclient.PlayerServicePushOps 同值。
+        // 与生成物（src/Atlas/Battle/Gen/*.g.cs）逐字一致（SDK 侧不手写 op 字面量）。
         Assert.Equal("/game.v1.MatchStartedNotify", BattleOps.MatchStartedNotify);
         Assert.Equal("/battle.v1.FrameBroadcast", BattleOps.FrameBroadcast);
         Assert.Equal("/battle.v1.BattleEndNotify", BattleOps.BattleEndNotify);
+        Assert.Equal("/battle.v1.PlayerOutNotify", BattleOps.PlayerOutNotify);
         // rpc op 才是服务/方法全名（客户端 op 寻址）。
         Assert.Equal("/battle.v1.BattleService/JoinBattle", BattleOps.JoinBattle);
     }

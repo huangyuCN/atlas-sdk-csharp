@@ -90,7 +90,10 @@ public sealed partial class Channel
         }
     }
 
-    // WriteRequestAsync 在写锁内补齐帧头 seq 并写帧（写失败按网络错误包装，协议错误原样上抛）。
+    // WriteRequestAsync 在写锁内复核写线资格、补齐帧头 seq 并写帧：
+    //   - WriteGuard（战斗会话的终态双检）在**写锁内、真正写帧之前**调用——终态置位后
+    //     不会再有任何新字节上线（已在写锁内的那一笔不回滚，对齐 Go writeRequest 双检）；
+    //   - Atlas 异常（协议错误/终态拒绝）原样上抛，其余写失败按网络错误包装。
     private async Task WriteRequestAsync(
         (InflightKey Key, Inflight Inflight, ITransport Transport) request,
         Header header,
@@ -102,6 +105,7 @@ public sealed partial class Channel
         {
             await _writeLock.WaitAsync(cancellationToken);
             acquired = true;
+            _options.WriteGuard?.Invoke();
             header.Seq = request.Key.Sequence;
             await request.Transport.WriteFrameAsync(
                 header,
@@ -109,9 +113,9 @@ public sealed partial class Channel
                 _options.MaxBodySize,
                 cancellationToken);
         }
-        catch (ProtocolException)
+        catch (AtlasException)
         {
-            throw;
+            throw; // 已分类的异常（协议/终态/网络）原样上抛，不二次包装。
         }
         catch (Exception exception)
         {

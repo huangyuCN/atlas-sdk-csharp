@@ -97,8 +97,8 @@ public sealed partial class Channel
         }
     }
 
-    // FailAllQueued 关闭时取消全部排队请求（对齐 Go failAllQueued）。
-    private void FailAllQueued()
+    // FailAllQueued 以给定错误结算全部排队请求（关闭 = 通道已关闭；终态 = 终态 Status）。
+    private void FailAllQueued(Exception cause)
     {
         List<QueuedInvoke> all;
         lock (_gate)
@@ -111,7 +111,7 @@ public sealed partial class Channel
             // 认领后结算：与看护（排队超时）互斥，恰好一次。
             if (queued.TryClaim())
             {
-                queued.Completion.TrySetException(new NetworkException("通道已关闭"));
+                queued.Completion.TrySetException(cause);
             }
         }
     }

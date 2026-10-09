@@ -43,6 +43,10 @@ internal sealed class BattleFakeTransport : ITransport
         }
     }
 
+    // BeforeWrite 是写帧前的测试钩子（默认 null）：挂起即把「本次写已进写锁、尚未上线」
+    // 的窗口固定住，供「组帧与写线之间置终态」的竞态用例使用。
+    internal Func<Task>? BeforeWrite { get; set; }
+
     // WaitForWritesAsync 等到写入数达到 count（超时即失败，不接受固定 sleep 赌时序）。
     public async Task WaitForWritesAsync(int count)
     {
@@ -90,15 +94,18 @@ internal sealed class BattleFakeTransport : ITransport
         return _incoming.Reader.ReadAsync(cancellationToken);
     }
 
-    public Task WriteFrameAsync(Header header, byte[] body, int maxBodySize, CancellationToken cancellationToken)
+    public async Task WriteFrameAsync(Header header, byte[] body, int maxBodySize, CancellationToken cancellationToken)
     {
+        if (BeforeWrite != null)
+        {
+            await BeforeWrite().ConfigureAwait(false);
+        }
         lock (_gate)
         {
             _written.Add(header);
             _writeSignal.TrySetResult(true);
             _writeSignal = NewSignal();
         }
-        return Task.CompletedTask;
     }
 
     public Task CloseAsync()
