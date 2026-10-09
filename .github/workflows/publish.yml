@@ -1,0 +1,88 @@
+# NuGet 发布工作流（发布就绪形态）：push tag v* 或手动触发。
+#
+# 采用 nuget.org **Trusted Publishing**（OIDC 受信发布）：不需要长期 API key——
+# 工作流用 GitHub OIDC 短时令牌向 nuget.org 换取**1 小时有效**的临时 key。
+# （nuget.org 自 2026-08 起把 API key 最长期限压到 30 天，故走免密钥这条路。）
+#
+# 前置配置（两步，缺任一步发布步会明确失败并打印指引）：
+#   1) nuget.org → 右上角用户名 → **Trusted Publishing** → Add a new policy：
+#        Repository Owner = huangyuCN
+#        Repository       = atlas-sdk-csharp
+#        Workflow File    = publish.yml        （只填文件名，不带 .github/workflows/ 路径）
+#        Environment      = 留空                （本工作流不使用 GitHub environment）
+#        Scopes           = 勾 "Push new packages and package versions"
+#        Glob pattern     = HuangyuCN.Atlas.Sdk（不填或不覆盖该包名会 403）
+#   2) 本仓 Settings → Secrets and variables → Actions 添加
+#        NUGET_USER = 你的 nuget.org **用户名**（profile name，不是邮箱）
+name: Publish
+
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: '仅验证构建与 pack，不发布'
+        type: boolean
+        default: true
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write # OIDC：向 nuget.org 换取临时 API key 必需
+    steps:
+      - uses: actions/checkout@v4
+      # golden 向量源仓 = atlas 主仓（与 ci.yml 同款检出）：golden 对齐测试经
+      # ATLAS_GOLDEN_DIR 读该检出。atlas 为私有仓，检出用只读 PAT（fine-grained，
+      # 仅授 atlas 仓 Contents:Read），经 secrets.ATLAS_CI_TOKEN 注入。
+      - name: 校验向量源仓访问凭证
+        env:
+          TOKEN_SET: ${{ secrets.ATLAS_CI_TOKEN != '' }}
+        run: |
+          if [ "$TOKEN_SET" != "true" ]; then
+            echo "::error::缺少 secrets.ATLAS_CI_TOKEN（只读 PAT，授 atlas 仓 Contents:Read）。"
+            echo "::error::GitHub → Settings → Developer settings → Fine-grained tokens 新建（仅 atlas 仓，Contents: Read）"
+            echo "::error::再到本仓 Settings → Secrets and variables → Actions 添加 ATLAS_CI_TOKEN，然后重跑本工作流。"
+            exit 1
+          fi
+      - uses: actions/checkout@v4
+        with:
+          repository: huangyuCN/atlas
+          ref: feat/actor
+          path: atlas
+          token: ${{ secrets.ATLAS_CI_TOKEN }}
+      - uses: actions/checkout@v4
+        with:
+          repository: huangyuCN/atlas-game-layout
+          ref: main
+          path: atlas-game-layout
+          token: ${{ secrets.ATLAS_CI_TOKEN }}
+      - uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: '8.0.x'
+      - name: 构建
+        run: dotnet build Atlas.sln -c Release
+      - name: 测试（含 golden 对齐）
+        env:
+          ATLAS_GOLDEN_DIR: ${{ github.workspace }}/atlas/testdata/golden
+        run: dotnet test Atlas.sln --no-build -c Release --nologo
+      - name: 格式门禁
+        run: dotnet format Atlas.sln --verify-no-changes --no-restore
+      - name: 打包
+        run: dotnet pack src/Atlas/Atlas.csproj -c Release -o artifacts
+      - name: pack 预检（包内清单）
+        run: ls -l artifacts && unzip -l artifacts/*.nupkg | tail -12
+      - name: NuGet 登录（OIDC → 临时 API key）
+        if: ${{ startsWith(github.ref, 'refs/tags/v') || (inputs.dry_run == false) }}
+        uses: NuGet/login@v1
+        id: login
+        with:
+          user: ${{ secrets.NUGET_USER }}
+      - name: 发布到 nuget.org
+        if: ${{ startsWith(github.ref, 'refs/tags/v') || (inputs.dry_run == false) }}
+        run: dotnet nuget push artifacts/*.nupkg --api-key ${{ steps.login.outputs.NUGET_API_KEY }} --source https://api.nuget.org/v3/index.json
+      - name: dry-run 说明（发布就绪校验完成，未发布）
+        if: ${{ !startsWith(github.ref, 'refs/tags/v') && (inputs.dry_run != false) }}
+        run: echo '发布就绪校验通过；实际发布请 push v* tag 或以 dry_run=false 手动触发'
