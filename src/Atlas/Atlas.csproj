@@ -3,15 +3,25 @@
     <TargetFramework>netstandard2.1</TargetFramework>
     <RootNamespace>Atlas</RootNamespace>
     <AssemblyName>Atlas</AssemblyName>
-    <!-- NuGet 发布元数据：Atlas.Sdk 包（Unity 优先的帧协议客户端）。 -->
-    <PackageId>Atlas.Sdk</PackageId>
-    <Version>0.1.0</Version>
+    <!-- NuGet 发布元数据：HuangyuCN.Atlas.Sdk 包（Unity 优先的帧协议客户端）。
+         包名带 HuangyuCN 品牌域，与另两条 SDK 线（TS @huangyucn/atlas-sdk-ts、
+         Go github.com/huangyuCN/atlas-sdk-go）及 UPM com.huangyucn.atlas 一致；
+         不带前缀的 Atlas.Sdk 已被第三方占用（nuget.org 作者 Atlas，push 必 403）。 -->
+    <PackageId>HuangyuCN.Atlas.Sdk</PackageId>
+    <Version>0.7.0</Version>
     <Description>Atlas 帧协议 C# 客户端 SDK（Unity 优先）：四通道 + dual + 双层心跳 + 重连 + 三编码</Description>
+    <!-- 发布说明与 CHANGELOG.md 的 0.7.0 条目同源（NuGet 包页展示）。 -->
+    <PackageReleaseNotes>0.7.0 破坏性变更：对局结束语义收口——终态下 JoinBattle/SendFrameInput/SyncFrames/Connect/Reconnect 抛专用 BattleEndedException（不再抛 InvalidOperationException），终态停心跳且拒绝拨号；BattleSessionOptions 新增 HeartbeatInterval（缺省 2s）与 EndDrainWindow（缺省 2s）；推送出口统一为 OnAny/OnPush/PlayerOut，op 常量全部改引生成物。其余：直连保活心跳（与传输心跳 HeartbeatIntervalMs 明确区分）、并发 ReconnectAsync 单飞与有界重试（HookMaxAttempts 缺省 10）、终态零写线（WriteGuard 写锁内复核）、Stats 改只读快照、DTO/stub 跟随模板 proto 重新生成。详见 CHANGELOG.md。</PackageReleaseNotes>
     <Authors>huangyuCN</Authors>
     <PackageLicenseExpression>Apache-2.0</PackageLicenseExpression>
     <PackageTags>atlas;frame;game;unity;client;realtime</PackageTags>
     <RepositoryUrl>https://github.com/huangyuCN/atlas-sdk-csharp</RepositoryUrl>
+    <!-- 仓根 README 打进包，NuGet 包页展示安装说明（消除 pack「缺少自述文件」警告）。 -->
+    <PackageReadmeFile>README.md</PackageReadmeFile>
   </PropertyGroup>
+  <ItemGroup>
+    <None Include="../../README.md" Pack="true" PackagePath="/" />
+  </ItemGroup>
   <ItemGroup>
     <PackageReference Include="Google.Protobuf" Version="3.27.1" />
     <PackageReference Include="KcpSharp" Version="0.8.8" />

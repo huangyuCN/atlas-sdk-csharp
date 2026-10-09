@@ -1,6 +1,6 @@
 {
   "name": "com.huangyucn.atlas",
-  "version": "0.1.0",
+  "version": "0.7.0",
   "displayName": "Atlas SDK",
   "description": "Atlas 帧协议 C# 客户端 SDK（Unity 优先）：四通道 + dual + 双层心跳 + 重连 + protojson/protobuf",
   "unity": "6000.0",

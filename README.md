@@ -73,7 +73,7 @@ Atlas 帧协议的 C# 客户端 SDK（**Unity 优先**）。用于游戏客户�
 ### NuGet（.NET 项目 / 压测 / 服务器工具）
 
 ```bash
-dotnet add package Atlas.Sdk
+dotnet add package HuangyuCN.Atlas.Sdk
 ```
 
 要求 .NET Standard 2.1 兼容宿主（.NET 6+ / Unity 6000.0+）。包携带
