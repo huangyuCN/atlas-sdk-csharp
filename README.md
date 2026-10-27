@@ -249,7 +249,7 @@ await session.SyncFramesAsync(session.LastSeenFrame);
 
 // 4) 统一推送出口：Push 事件（含未预设 op）+ OnPush 按 op 订阅 + 专用事件。
 session.Push += push => CountPush(push.Op, push.Version);              // 全部推送
-session.FrameBroadcast += push => TrackFrame(push.Payload, push.Version); // 帧广播（自动推进 LastSeenFrame）
+session.FrameBroadcast += push => TrackFrame(push.Payload, push.Version); // 帧广播（ver=1 自动推进 LastSeenFrame）
 session.BattleEnd += push => ShowResult(push.Payload);                 // 结算（同一局只触发一次）
 session.PlayerOut += push => ShowPlayerOut(push.Payload);              // 玩家出局
 using var off = session.OnPush(BattleOps.PlayerOutNotify, push => Log(push.Payload));
@@ -266,6 +266,7 @@ await session.CloseAsync();
 | 逐帧带票 | 三面统一在帧会话槽携带 base64url 票（`ForceFrameSessionSlot`）：WS 长连接也逐帧带票（接入层透传后帧面按帧槽验票） |
 | 保活 | 无输入期间按 `HeartbeatInterval`（缺省 2s）发 `battle.v1.BattleService/Ping`（Tell），维持帧面活跃 |
 | 断线恢复 | 自动重连（退避）或显式 `ReconnectAsync`；重连后重新 `JoinBattle` + `SyncFrames(LastSeenFrame)` 补帧；并发 `ReconnectAsync` 单飞（只重连一轮） |
+| 载荷编码版本 | 推送把 `(payload, version)` 原样交给调用方：ver=1 为 protojson、ver=2 为 protobuf **二进制**（SDK 不预解游戏消息，由游戏侧生成包按版本解码）。补帧基准：ver=1 恒用内建解析；ver≠1 须注入 `BattleSessionOptions.FrameNumberOf`，未注入即**不推进、也不报错**。请求/响应版本白名单 `{1,2}` 且须与会话载荷编码一致（`Serializer`，缺省 ver=1），未知版本/失配一律明确抛 `ProtocolException`。边界：内置便捷载荷与保活探针仍按 protojson 组装，ver=2 目前只有 raw 载荷重载能带二进制（补帧/探针待契约 DTO 生成后整体切换） |
 | 重试有界 | 重连钩子连续失败到 `HookMaxAttempts`（缺省 10）即终止重连并上报 `Failed`（不无限退避重拨） |
 | 终态·对局结束 | `BATTLE_ENDED`（409）拒绝或结算结束通知 → `HasEnded`：停发一切上发（含探针），收尾窗口内继续收尾随推送 |
 | 终态·不可重试失败 | `BATTLE_NOT_FOUND`(404)、`BATTLE_FULL`(409)、`FRAME_TARGET_MISMATCH`(403)、`INVALID_PARAMS`、票类拒绝 → `HasFailed`：`Failed` 上报一次、不再重连、后续调用本地拒绝 |

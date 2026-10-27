@@ -21,7 +21,9 @@ public sealed partial class BattleSession
     private readonly object _pushGate = new();
     private readonly Dictionary<string, List<Action<BattlePush>>> _pushSubscriptions = new();
 
-    // FrameBroadcast 是帧广播推送回调（原始载荷 + 帧头载荷编码版本，SDK 不解码 DTO）。
+    // FrameBroadcast 是帧广播推送回调（原始载荷 + 帧头载荷编码版本，SDK 不解码 DTO）：
+    // ver=1 为 protojson、ver=2 为 protobuf 二进制——**ver=2 须由游戏侧生成包自行解码**
+    //（SDK 只交字节与版本，不带也不预解游戏逻辑消息）。
     public event Action<BattlePush>? FrameBroadcast;
 
     // BattleEnd 是战斗结束推送回调（原始载荷 + 版本；同一局只触发一次，重复投递不重放）。
@@ -36,6 +38,8 @@ public sealed partial class BattleSession
 
     // OnPush 按 op 订阅推送（与 Push 事件同源、同一分发顺序），返回退订句柄；
     // 同一 (op, handler) 重复注册只保留一份，重复退订安全。
+    // 回调拿到 (op, 原始载荷, 帧头版本)：ver=2 二进制载荷须由调用方按 version 选自己的
+    // 生成包解码（SDK 不预解游戏消息）。
     public IDisposable OnPush(string op, Action<BattlePush> handler)
     {
         if (handler == null)
@@ -157,14 +161,22 @@ public sealed partial class BattleSession
         }
     }
 
-    // TrackLastSeenFrame 从帧广播载荷尽力取帧号（ver=1 protojson：{"frame":{"frameId":"9"}}）
-    // 用于断线补帧；取不到（ver=2/字段缺失/非 JSON）就保持原值——不猜、不抛错。
+    // TrackLastSeenFrame 推进补帧基准：ver=1 恒走内建 protojson 解析（注入钩子也不接管）；
+    // 其余版本（ver=2 protobuf 二进制等）交调用方注入的帧号钩子——SDK 不猜二进制编码。
     private void TrackLastSeenFrame(byte[] payload, byte version)
     {
         if (version != FrameGen.Version)
         {
+            TrackLastSeenFrameByHook(payload);
             return;
         }
+        TrackLastSeenFrameJson(payload);
+    }
+
+    // TrackLastSeenFrameJson 从 ver=1 帧广播载荷尽力取帧号（{"frame":{"frameId":"9"}}）
+    // 用于断线补帧；取不到（字段缺失/非 JSON）就保持原值——不猜、不抛错。
+    private void TrackLastSeenFrameJson(byte[] payload)
+    {
         try
         {
             using var document = JsonDocument.Parse(payload);
@@ -189,6 +201,30 @@ public sealed partial class BattleSession
         catch (JsonException)
         {
             // 推送载荷不是 protojson：保持原值（LastSeenFrame 由调用方维护）。
+        }
+    }
+
+    // TrackLastSeenFrameByHook 用调用方注入的帧号钩子推进补帧基准（ver≠1）：未注入 ⇒ **不推进、
+    // 也不报错**（二进制载荷非自描述，猜编码会静默错帧）；钩子返回 null 或抛错同样不推进。
+    private void TrackLastSeenFrameByHook(byte[] payload)
+    {
+        var hook = _options.FrameNumberOf;
+        if (hook == null)
+        {
+            return;
+        }
+        ulong? frameId;
+        try
+        {
+            frameId = hook(new ReadOnlyMemory<byte>(payload));
+        }
+        catch (Exception)
+        {
+            return; // 上层解码异常不得中断推送分发（与推送回调的异常隔离同一口径）。
+        }
+        if (frameId.HasValue)
+        {
+            LastSeenFrame = frameId.Value;
         }
     }
 }

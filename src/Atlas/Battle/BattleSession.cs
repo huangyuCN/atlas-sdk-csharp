@@ -79,7 +79,8 @@ public sealed partial class BattleSession : IAsyncDisposable
     public string Address { get; }
 
     // LastSeenFrame 是本地已见的最大帧号：重连补帧（SyncFrames）以此为起点。
-    // 帧广播推送（ver=1 protojson）会自动推进该值；调用方也可显式赋值（自定义解码时）。
+    // ver=1 帧广播由 SDK 内建 protojson 解析自动推进；ver≠1（如 ver=2 二进制）须注入
+    // BattleSessionOptions.FrameNumberOf 才会推进（未注入即不推进、不报错）；调用方也可显式赋值。
     public ulong LastSeenFrame { get; set; }
 
     // State 是底层通道状态（未连接/连接中/已连接/重连中/已断开）。

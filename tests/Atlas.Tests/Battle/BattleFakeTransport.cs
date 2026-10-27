@@ -68,7 +68,13 @@ internal sealed class BattleFakeTransport : ITransport
     // QueueSuccess 注入一条成功回执（envelope 口径与 EdgeReply.Success 一致）。
     public void QueueSuccess(uint sequence, byte[] payload)
     {
-        QueueReply(sequence, FrameGen.Version, EdgeReply.Success(payload));
+        QueueSuccessVersion(sequence, payload, FrameGen.Version);
+    }
+
+    // QueueSuccessVersion 注入一条**指定帧头版本**的成功回执（ver=2 会话与版本白名单用例）。
+    public void QueueSuccessVersion(uint sequence, byte[] payload, byte version)
+    {
+        QueueReply(sequence, version, EdgeReply.Success(payload));
     }
 
     // QueueBusinessError 注入一条业务拒绝回执（BATTLE_ENDED 等稳定 reason）。

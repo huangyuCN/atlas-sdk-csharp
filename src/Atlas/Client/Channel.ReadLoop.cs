@@ -145,6 +145,13 @@ public sealed partial class Channel
         {
             throw new ProtocolException($"客户端收到非法帧类型 {(byte)header.Type}");
         }
+        // 载荷编码协商（规范 §3.1）：响应版本先过白名单 {1,2}，再与**本会话**的载荷编码比对。
+        // 未知版本（如 3）是明确的协议缺陷、失配同样不可重试——两者都 fail fast，不猜编码重解。
+        if (!PayloadVersion.IsSupported(header.Version))
+        {
+            throw new ProtocolException(
+                $"响应帧版本 {header.Version} 不在载荷编码白名单 {PayloadVersion.SupportedList}");
+        }
         if (header.Version != _options.Serializer.Version)
         {
             throw new ProtocolException($"响应帧 version {header.Version} 与载荷编码 {_options.Serializer.Version} 不一致");

@@ -359,9 +359,10 @@ public sealed partial class Channel : IAsyncDisposable
         {
             throw new ArgumentException("Serializer 不能为空", nameof(options));
         }
-        if (options.Serializer.Version != FrameGen.Version && options.Serializer.Version != FrameGen.Version2)
+        if (!PayloadVersion.IsSupported(options.Serializer.Version))
         {
-            throw new ArgumentException("Serializer Version 必须是 1 或 2", nameof(options));
+            throw new ArgumentException(
+                $"Serializer Version 必须在载荷编码白名单 {PayloadVersion.SupportedList}", nameof(options));
         }
         if (options.InvokeTimeoutMs <= 0)
         {

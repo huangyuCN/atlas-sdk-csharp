@@ -1,5 +1,6 @@
 using System;
 using Atlas.Client;
+using Atlas.Frame;
 using Atlas.Serialization;
 
 namespace Atlas.Battle;
@@ -80,8 +81,22 @@ public sealed class BattleSessionOptions
     // 对 ≤0 按 1 处理，即至少执行一次钩子）。
     public int HookMaxAttempts { get; set; } = 10;
 
-    // Serializer 是载荷编码插槽（缺省 protojson）。
+    // Serializer 是载荷编码插槽（缺省 protojson = ver=1）：它的 Version 决定**出站**帧头版本，
+    // 回执必须带同一版本；ver=2 用 ProtobufSerializer（protobuf 二进制）。版本不在白名单
+    // {1,2} 时装配期（Create）即拒绝，不拨号、不猜编码。
+    // 边界：SDK 内置载荷（入局 / 补帧 / 帧输入 / 保活探针，含自动重连的重登与补帧）恒按
+    // protojson 组装——ver=2 会话目前只有 raw 载荷重载（JoinBattleAsync(byte[]) /
+    // SendFrameInputAsync(byte[])）能带二进制；补帧与探针要切 ver=2 需契约消息的生成 DTO
+    //（后续步骤，本轮只透传）。
     public ISerializer Serializer { get; set; } = new JsonSerializer();
+
+    // FrameNumberOf 是帧号提取钩子：从一帧 FrameBroadcast 的**非 ver=1** 载荷里取帧号
+    //（重连补帧的 LastSeenFrame 基准）。ver=1（protojson）恒走 SDK 内建解析，注入后也不接管；
+    // ver≠1 才交本钩子——未注入时补帧基准**不推进、也不报错**：二进制载荷非自描述，猜编码会
+    // 静默错帧，宁可让上层显式注入，也不能因此断链。
+    // 返回 null = 本帧取不到帧号（不推进）；钩子抛错同样按「取不到」处理（推送分发不因上层
+    // 解码异常中断）。IL2CPP/AOT 友好：只用到委托与 ReadOnlyMemory，无反射、无动态代码。
+    public Func<ReadOnlyMemory<byte>, ulong?>? FrameNumberOf { get; set; }
 
     // Logger 是调试日志实现（null + LogSilence=false = 默认 Error 级 Console.Error）。
     public SDKLogger? Logger { get; set; }
@@ -128,6 +143,14 @@ public sealed class BattleSessionOptions
         if (Serializer == null)
         {
             throw new ArgumentException("Serializer 不能为空", nameof(Serializer));
+        }
+        if (!PayloadVersion.IsSupported(Serializer.Version))
+        {
+            // 拨号前把关：不把一个服务端只认 {1,2} 的版本发上线（与通道层同一白名单口径）。
+            throw new ArgumentException(
+                $"Serializer.Version 必须在载荷编码白名单 {PayloadVersion.SupportedList}"
+                + $"（1 = protojson / 2 = protobuf 二进制），当前 {Serializer.Version}",
+                nameof(Serializer));
         }
     }
 }
