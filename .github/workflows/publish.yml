@@ -50,13 +50,16 @@ jobs:
       - uses: actions/checkout@v4
         with:
           repository: huangyuCN/atlas
-          ref: feat/actor
+          # pin 固定 sha：上游移动分支会让「重生成无 diff」门禁红绿不定，无法区分
+          # 「我们忘了重生成」与「上游动了」。bump 时改这里（三仓同步）。
+          ref: 08933f9ae854f66e196c38d2dead789511153e89
           path: atlas
           token: ${{ secrets.ATLAS_CI_TOKEN }}
       - uses: actions/checkout@v4
         with:
           repository: huangyuCN/atlas-game-layout
-          ref: main
+          # pin 固定 sha（同 atlas）：bump 时与 atlas 的 ref 一起改。
+          ref: d0b0451a782428f4ae77b8bc3a16629b9b8269a8
           path: atlas-game-layout
           token: ${{ secrets.ATLAS_CI_TOKEN }}
       - uses: actions/setup-dotnet@v4
