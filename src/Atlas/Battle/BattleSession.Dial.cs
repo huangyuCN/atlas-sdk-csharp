@@ -8,7 +8,7 @@ using Atlas.Transport;
 namespace Atlas.Battle;
 
 // BattleSession 的装配与拨号面：面选择、按面直连接入层（WS query / KCP 先 hello 再会话 /
-// UDP 首包 hello 换 flow-id）、通道装配（强制帧槽、失败分类、重连钩子）与重连后的重新入局。
+// UDP 首包 hello 换 flow-id）、通道装配（强制帧槽、失败分类、重连钩子）与重连后的重放步骤。
 public sealed partial class BattleSession
 {
     // SelectFace 选面：优先面（配置）必须已下发；否则按 TransportPriority 取第一个已下发面；
@@ -35,7 +35,7 @@ public sealed partial class BattleSession
         throw new ProtocolException($"{DirectErrors.TransportNotFound}: 计划内的面都不在支持列表");
     }
 
-    // NewChannel 装配一代直连通道：强制帧会话槽（逐帧带票）、重连钩子（重新入局 + 补帧）、
+    // NewChannel 装配一代直连通道：强制帧会话槽（逐帧带票）、重连钩子（按 Replay 重放）、
     // 拨号失败分类（接入层拒绝终止重连）与推送订阅（订阅挂在通道上，跨代际保留）。
     private Channel NewChannel()
     {
@@ -154,7 +154,19 @@ public sealed partial class BattleSession
         return (host, port);
     }
 
-    // RejoinAsync 是重连钩子：新一代连接就绪后重新入局 + 以 LastSeenFrame 补帧。
+    // ReplayStepsAsync 按 `Replay` 配置在新一代连接上按顺序重放（通常是入局 + 按
+    // LastSeenFrame 补帧）：op 与载荷由调用方给出（游戏域消息已迁出 SDK），载荷用当前补帧
+    // 基准生成，故重放总是从断点续上。未配置则一个字节都不重放。
+    private async Task ReplayStepsAsync(CancellationToken cancellationToken)
+    {
+        foreach (var step in _options.Replay)
+        {
+            var payload = step.Payload?.Invoke(LastSeenFrame);
+            await InvokeAsync(step.Op, payload, cancellationToken).ConfigureAwait(false);
+        }
+    }
+
+    // RejoinAsync 是重连钩子：新一代连接就绪后按 `Replay` 重放（入局 + 补帧等）。
     // 业务拒绝一律**不可重试**（同一张票/同一请求重发只会拿到同一拒绝），故：
     //   - BATTLE_ENDED（服务端在懒激活前先补投留档结果再拒绝）→ 终态收口（不上报 Failed）；
     //   - 票类（过期/无效）：会话已废，上层需重新取票 → 终态失败并上报 Failed；
@@ -165,9 +177,8 @@ public sealed partial class BattleSession
     {
         try
         {
-            await JoinBattleAsync().ConfigureAwait(false);
-            await SyncFramesAsync(LastSeenFrame).ConfigureAwait(false);
-            CountReconnect(); // 自动重连一轮成功（重新入局 + 补帧完成）。
+            await ReplayStepsAsync(CancellationToken.None).ConfigureAwait(false);
+            CountReconnect(); // 自动重连一轮成功（重放步骤完成）。
         }
         catch (BusinessException exception) when (DirectErrors.IsBattleEnded(exception))
         {
@@ -177,7 +188,7 @@ public sealed partial class BattleSession
         }
         catch (BattleEndedException)
         {
-            // 终态在钩子执行期间到达（结束信号与重连并发）：不再重新入局（发帧一律拒发），
+            // 终态在钩子执行期间到达（结束信号与重连并发）：不再重放（发帧一律拒发），
             // 立即停重连——否则钩子会在终态里空转重试，直到收尾窗口关连接才退出。
             await CloseChannelAsync().ConfigureAwait(false);
         }

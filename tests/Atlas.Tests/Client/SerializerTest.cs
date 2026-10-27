@@ -2,7 +2,7 @@ using System;
 using Atlas.Serialization;
 using Gateway.V1;
 using PocoHeartbeatReply = Atlas.Gateway.V1.HeartbeatReply;
-using ProtoJoinBattleReq = global::Battle.V1.JoinBattleReq;
+using ProtoLockstepInput = Atlas.Game.Lockstep.LockstepInput;
 using PocoLoginReply = Atlas.Gateway.V1.LoginReply;
 using Xunit;
 
@@ -126,8 +126,8 @@ public sealed class SerializerTest
     }
 
     // Protobuf_SmokeRequestDtos_Roundtrip 验证冒烟 ver=2 路径的请求 DTO（生成物
-    // IMessage 族）经 ProtobufSerializer 往返：登录（含 client_version 上报）与
-    // 战斗域 JoinBattle（权威 proto：battle_id 客体寻址，消息体零身份字段）。
+    // IMessage 族）经 ProtobufSerializer 往返：登录（含 client_version 上报）与契约消息
+    // lockstep.LockstepInput（游戏域消息已迁出 SDK，SDK 侧只保留契约域生成物）。
     [Fact]
     public void Protobuf_SmokeRequestDtos_Roundtrip()
     {
@@ -144,10 +144,11 @@ public sealed class SerializerTest
         Assert.Equal("p1", parsedLogin.PlayerId);
         Assert.Equal(AtlasVersion.Value, parsedLogin.ClientVersion);
 
-        var join = new ProtoJoinBattleReq { BattleId = "b1" };
-        var parsedJoin = (ProtoJoinBattleReq)serializer.Deserialize(
-            serializer.Serialize(join), typeof(ProtoJoinBattleReq));
-        Assert.Equal("b1", parsedJoin.BattleId);
+        var input = new ProtoLockstepInput { FrameId = 7, PlayerId = "p1" };
+        var parsedInput = (ProtoLockstepInput)serializer.Deserialize(
+            serializer.Serialize(input), typeof(ProtoLockstepInput));
+        Assert.Equal(7UL, parsedInput.FrameId);
+        Assert.Equal("p1", parsedInput.PlayerId);
     }
 
     // Json_Poco_OmitsUnsetFields 验证 POCO 分支的零值省略语义（对齐 protojson 默认

@@ -39,6 +39,12 @@ public sealed class BattleSessionReconnectTest
             BackoffBaseMs = 30,
             BackoffMaxMs = 100,
             HeartbeatInterval = TimeSpan.Zero,
+            // 重连重放显式配置（SDK 不再内建 JoinBattle + SyncFrames 重放）：入局 + 按基准补帧。
+            Replay = new[]
+            {
+                new ReplayStep(TestOps.JoinBattle, _ => TestWire.Join("b-1")),
+                new ReplayStep(TestOps.SyncFrames, lastSeen => TestWire.Sync("b-1", lastSeen)),
+            },
         };
     }
 
@@ -64,7 +70,7 @@ public sealed class BattleSessionReconnectTest
         await using var server = new BattleEdgeUdpServer();
         await using var session = BattleSession.Create(Plan(server.Port), Options());
         await session.ConnectAsync();
-        await session.JoinBattleAsync();
+        await session.InvokeAsync(TestOps.JoinBattle, TestWire.Join("b-1"));
         Assert.Equal(1, server.HelloCount);
 
         session.LastSeenFrame = 5;
@@ -74,14 +80,14 @@ public sealed class BattleSessionReconnectTest
 
         // 单飞：只重连一轮（两次调用共享同一轮），不是各拨一代。
         Assert.Equal(2, server.HelloCount);
-        Assert.Equal(2, server.RequestsOf(BattleOps.JoinBattle).Length);
-        Assert.Single(server.RequestsOf(BattleOps.SyncFrames));
+        Assert.Equal(2, server.RequestsOf(TestOps.JoinBattle).Length);
+        Assert.Single(server.RequestsOf(TestOps.SyncFrames));
         Assert.Equal(ClientState.Connected, session.State);
 
         // 会话仍可用：重连后的发帧走新一轮的连接（不是被并发调用关掉的旧代）。
-        var reply = await session.SendFrameInputAsync(1, new byte[] { 0x01 });
-        Assert.Equal(BattleEdgeDefaults.ReplyJson(BattleOps.SendFrameInput), Encoding.UTF8.GetString(reply));
-        Assert.Single(server.RequestsOf(BattleOps.SendFrameInput));
+        var reply = await session.InvokeAsync(TestOps.SendFrameInput, TestWire.Input("b-1", 1, new byte[] { 0x01 }));
+        Assert.Equal(BattleEdgeDefaults.ReplyJson(TestOps.SendFrameInput), Encoding.UTF8.GetString(reply));
+        Assert.Single(server.RequestsOf(TestOps.SendFrameInput));
     }
 
     // ② 重连钩子连续失败（新一代入局无回执，超时）→ 到 HookMaxAttempts 即终止并上报 Failed。

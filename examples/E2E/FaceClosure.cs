@@ -1,7 +1,6 @@
 using System;
 using System.Collections.Generic;
 using System.Text;
-using System.Text.Json;
 using System.Threading;
 using System.Threading.Tasks;
 using Atlas.Battle;
@@ -30,35 +29,45 @@ internal sealed class FaceClosure
         Console.WriteLine($"[闭环] 面={name} 下发地址={address}（期望端口 {expected} → "
             + (portMatched ? "一致" : "不一致（以服务端下发为准）") + "）");
 
-        await using var session = BattleSession.Create(plan, Options(face));
+        await using var session = BattleSession.Create(plan, Options(face, plan));
         Console.WriteLine($"[闭环] {name} 会话装配完成：battle_id={plan.BattleId} 票长={plan.Ticket.Length}B "
             + $"握手={Handshake(face)}");
         await session.ConnectAsync(ct).ConfigureAwait(false);
         Console.WriteLine($"[闭环] {name} 经接入层直连就绪（{address} → battle 帧面）");
 
-        var join = await session.JoinBattleAsync(ct).ConfigureAwait(false);
+        // 业务 op 与载荷由示例本地给出（真实项目取游戏协议包的 op 常量与 DTO）：
+        // SDK 只负责发出、匹配回执与错误归一。
+        var join = await session.InvokeAsync(
+            GameOps.JoinBattle, GameWire.Join(plan.BattleId), ct).ConfigureAwait(false);
         Console.WriteLine($"[闭环] {name} JoinBattle 回执 {Snippet(join)}");
 
         // 输入载荷取 0：示例竞速模拟器按 payload[0] 步进，非 0 会推到终点提前结算。
-        var input = await session.SendFrameInputAsync(1, new byte[] { 0x00 }, ct).ConfigureAwait(false);
+        var input = await session.InvokeAsync(
+            GameOps.SendFrameInput, GameWire.Input(plan.BattleId, 1, new byte[] { 0x00 }), ct).ConfigureAwait(false);
         Console.WriteLine($"[闭环] {name} SendFrameInput(frame=1) 回执 {Snippet(input)}（Tell：服务端不回业务体）");
 
-        var sync = await session.SyncFramesAsync(0, ct).ConfigureAwait(false);
+        var sync = await session.InvokeAsync(
+            GameOps.SyncFrames, GameWire.Sync(plan.BattleId, 0), ct).ConfigureAwait(false);
         Console.WriteLine($"[闭环] {name} SyncFrames(last_seen=0) 回执 {Snippet(sync)}");
 
         var frameId = await WaitBroadcastAsync(session, TimeSpan.FromSeconds(3), ct).ConfigureAwait(false);
-        Console.WriteLine($"[闭环] {name} 收到帧广播 op={BattleOps.FrameBroadcast} frameId={frameId} "
+        Console.WriteLine($"[闭环] {name} 收到帧广播 op={GameOps.FrameBroadcast} frameId={frameId} "
             + $"（LastSeenFrame={session.LastSeenFrame}）");
         Console.WriteLine($"闭环通过（C#/{name} 经接入层）");
     }
 
     // Options 组装本次会话选项：优先面锁定本面（缺面即报错，不静默换面）。
-    private BattleSessionOptions Options(EdgeTransport face)
+    private BattleSessionOptions Options(EdgeTransport face, DirectPlan plan)
     {
         return new BattleSessionOptions
         {
             PreferredTransport = face,
             HeartbeatInterval = _config.HeartbeatInterval,
+            // 保活探针与重连重放都显式配置（SDK 不持游戏域消息，不再内建 Ping/Join+Sync）。
+            ProbeOp = GameOps.Ping,
+            ProbePayload = GameWire.Probe(plan.BattleId),
+            Replay = GameWire.Replay(plan.BattleId),
+            FrameNumberOf = GameWire.FrameNumberOf,
             HelloTimeoutMs = 5000,
             InvokeTimeoutMs = 5000,
             BackoffBaseMs = 200,
@@ -76,49 +85,18 @@ internal sealed class FaceClosure
     }
 
     // WaitBroadcastAsync 等一帧帧广播推送（帧引擎直发；超时即失败）。
+    // 按 op 订阅（游戏协议包的推送 op 常量；示例用本地字面量）：载荷由 GameWire 解码取帧号。
     private static async Task<ulong> WaitBroadcastAsync(BattleSession session, TimeSpan timeout, CancellationToken ct)
     {
         var signal = new TaskCompletionSource<ulong>(TaskCreationOptions.RunContinuationsAsynchronously);
-        void Handler(BattlePush push)
+        using var subscription = session.OnPush(GameOps.FrameBroadcast, push =>
         {
-            if (TryReadFrameId(push.Payload, out var frameId))
+            if (GameWire.FrameNumberOf(push.Payload) is { } frameId)
             {
                 signal.TrySetResult(frameId);
             }
-        }
-
-        session.FrameBroadcast += Handler;
-        try
-        {
-            var wait = signal.Task.WaitAsync(timeout, ct);
-            return await wait.ConfigureAwait(false);
-        }
-        finally
-        {
-            session.FrameBroadcast -= Handler;
-        }
-    }
-
-    // TryReadFrameId 从帧广播载荷尽力取帧号（ver=1 protojson：{"frame":{"frameId":"9"}}）。
-    internal static bool TryReadFrameId(byte[] payload, out ulong frameId)
-    {
-        frameId = 0;
-        try
-        {
-            using var document = JsonDocument.Parse(payload);
-            if (!document.RootElement.TryGetProperty("frame", out var frame)
-                || frame.ValueKind != JsonValueKind.Object
-                || !frame.TryGetProperty("frameId", out var id)
-                || id.ValueKind != JsonValueKind.String)
-            {
-                return false;
-            }
-            return ulong.TryParse(id.GetString(), out frameId);
-        }
-        catch (JsonException)
-        {
-            return false;
-        }
+        });
+        return await signal.Task.WaitAsync(timeout, ct).ConfigureAwait(false);
     }
 
     private static string Snippet(byte[] payload)

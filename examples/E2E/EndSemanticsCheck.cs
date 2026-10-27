@@ -39,11 +39,13 @@ internal sealed class EndSemanticsCheck
         Console.WriteLine($"[结束] 面={name} 地址={plan.Endpoint(face)} "
             + $"心跳={_config.HeartbeatInterval.TotalMilliseconds:F0}ms/拍 收尾窗口={DrainMs}ms");
         var recorder = new EndRecorder();
-        await using var session = BattleSession.Create(plan, Options(face, recorder));
+        await using var session = BattleSession.Create(plan, Options(face, recorder, plan));
         recorder.Attach(session); // 订阅先于连接：不漏首条推送。
         await session.ConnectAsync(ct).ConfigureAwait(false);
-        await session.JoinBattleAsync(ct).ConfigureAwait(false);
-        await session.SendFrameInputAsync(1, new byte[] { 0x00 }, ct).ConfigureAwait(false);
+        await session.InvokeAsync(GameOps.JoinBattle, GameWire.Join(plan.BattleId), ct).ConfigureAwait(false);
+        await session.InvokeAsync(
+            GameOps.SendFrameInput, GameWire.Input(plan.BattleId, 1, new byte[] { 0x00 }), ct)
+            .ConfigureAwait(false);
         Console.WriteLine("[结束] 已入局并发首帧输入（payload=0 不推进）：等对局自然结算"
             + $"（帧数上限 max_frames=60 × tick 100ms ≈ 6s，上限 {SettleTimeout.TotalSeconds:F0}s）");
 
@@ -52,18 +54,20 @@ internal sealed class EndSemanticsCheck
             Console.WriteLine("[结束] 未在时限内收到结算结束通知：本项未通过");
             return false;
         }
-        return await VerifyAsync(session, recorder, name, ct).ConfigureAwait(false);
+        return await VerifyAsync(session, recorder, name, plan.BattleId, ct).ConfigureAwait(false);
     }
 
     // VerifyAsync 在结束信号到达后逐条验收：终态拒发 → 停发 → 幂等 → 收尾窗口 → 关闭。
     private async Task<bool> VerifyAsync(
-        BattleSession session, EndRecorder recorder, string face, CancellationToken ct)
+        BattleSession session, EndRecorder recorder, string face, string battleId, CancellationToken ct)
     {
         Console.WriteLine($"[结束] 收到结算结束通知：HasEnded={session.HasEnded} 来源={session.EndedReason} "
             + $"载荷={Snippet(recorder.Payload)} 结束前发送打点={recorder.SendsBeforeEnd} 条");
-        var input = await ProbeAsync(() => session.SendFrameInputAsync(2, new byte[] { 0x00 }, ct))
+        var input = await ProbeAsync(() => session.InvokeAsync(
+            GameOps.SendFrameInput, GameWire.Input(battleId, 2, new byte[] { 0x00 }), ct))
             .ConfigureAwait(false);
-        var sync = await ProbeAsync(() => session.SyncFramesAsync(ct)).ConfigureAwait(false);
+        var sync = await ProbeAsync(() => session.InvokeAsync(
+            GameOps.SyncFrames, GameWire.Sync(battleId, session.LastSeenFrame), ct)).ConfigureAwait(false);
         Console.WriteLine($"[结束] 终态拒发：SendFrameInput={input} SyncFrames={sync}");
 
         await Task.Delay(300, ct).ConfigureAwait(false); // 让结束瞬间在途的一拍落地，再取证据基线。
@@ -85,12 +89,17 @@ internal sealed class EndSemanticsCheck
     }
 
     // Options 组装本次会话选项：Debug 打点进 recorder（「结束后零发送」的证据来源）。
-    private BattleSessionOptions Options(EdgeTransport face, EndRecorder recorder)
+    // 探针、重放与帧号钩子都显式配置（SDK 不持游戏域消息，不再内建 Ping/Join+Sync/帧号解析）。
+    private BattleSessionOptions Options(EdgeTransport face, EndRecorder recorder, DirectPlan plan)
     {
         return new BattleSessionOptions
         {
             PreferredTransport = face,
             HeartbeatInterval = _config.HeartbeatInterval,
+            ProbeOp = GameOps.Ping,
+            ProbePayload = GameWire.Probe(plan.BattleId),
+            Replay = GameWire.Replay(plan.BattleId),
+            FrameNumberOf = GameWire.FrameNumberOf,
             EndDrainWindow = TimeSpan.FromMilliseconds(DrainMs),
             HelloTimeoutMs = 5000,
             InvokeTimeoutMs = 3000,
@@ -200,7 +209,8 @@ internal sealed class EndRecorder
     // Attach 订阅会话事件（在 ConnectAsync 之前调用，避免漏掉首条推送）。
     public void Attach(BattleSession session)
     {
-        session.BattleEnd += push =>
+        // 统一出口按 op 订阅（游戏协议包的推送 op；示例用本地字面量）：SDK 不再有游戏消息专用事件。
+        session.OnPush(GameOps.BattleEndNotify, push =>
         {
             lock (_gate)
             {
@@ -209,8 +219,8 @@ internal sealed class EndRecorder
                 Payload = push.Payload;
             }
             _endSignal.TrySetResult(true);
-        };
-        session.FrameBroadcast += _ => Broadcasts++;
+        });
+        session.OnPush(GameOps.FrameBroadcast, _ => Broadcasts++);
         session.Failed += _ => Failed = true;
         session.HeartbeatFailed += _ => HeartbeatFailures++;
     }

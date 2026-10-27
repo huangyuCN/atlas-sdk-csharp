@@ -40,13 +40,28 @@ public sealed class BattleSessionOptions
     public int HeartbeatIntervalMs { get; set; }
 
     // HeartbeatInterval 是**直连保活心跳**周期（缺省 2s；TimeSpan.Zero = 关闭）：
-    // 无输入期间周期发送 battle 域探针（battle.v1.BattleService/Ping，Tell 无回执），
-    // 让帧面保持活跃。服务端掉线窗口 offline_timeout 缺省 15s，数据报面（UDP/KCP）
-    // 的空闲读超时取其 1/3（缺省 5s）——**周期必须严格小于该值**，否则两拍之间
-    // 就会被判掉线，且 NAT 映射失效后下行帧收不到（表现为「连接还在但没数据」）。
+    // 无输入期间周期发送 `ProbeOp/ProbePayload` 配置的探针，让帧面保持活跃。服务端掉线窗口
+    // offline_timeout 缺省 15s，数据报面（UDP/KCP）的空闲读超时取其 1/3（缺省 5s）——
+    // **周期必须严格小于该值**，否则两拍之间就会被判掉线，且 NAT 映射失效后下行帧收不到
+    //（表现为「连接还在但没数据」）。
     // 与 HeartbeatIntervalMs 的分工：后者证明本代链路存活（失败即重连），
     // 本项维持服务端帧面活跃（失败只记账，不终止会话）。
+    // **未配置 ProbeOp 时本项不产生任何写出**（SDK 不持游戏域消息，不会裸发现空载荷探针）。
     public TimeSpan HeartbeatInterval { get; set; } = TimeSpan.FromSeconds(2);
+
+    // ProbeOp 是保活探针的 op（缺省空 = 不发探针）：取值来自游戏协议包的探针 op 常量。
+    // SDK 只按周期把它与 ProbePayload 发出去，
+    // 并等帧引擎必回的空回执以捞出可判定失败——不含任何游戏域语义。
+    public string ProbeOp { get; set; } = "";
+
+    // ProbePayload 是保活探针的请求载荷（由游戏侧用协议包构造，原样发送；null = 空载荷）。
+    // 探针语义是「我还在」：只带客体寻址字段，不承载对局参数（加参数即越界）。
+    public byte[]? ProbePayload { get; set; }
+
+    // Replay 是重连后的重放步骤（缺省空 = 只重新 hello，不重放任何业务 op）：
+    // 拨号成功即按顺序重放，载荷用当前 LastSeenFrame 生成。是否「已入局」由调用方是否配置
+    // 重放来表达——类型化入局方法已随游戏域消息迁出 SDK。
+    public ReplayStep[] Replay { get; set; } = Array.Empty<ReplayStep>();
 
     // EndDrainWindow 是对局结束后的**收尾窗口**（缺省 2s；TimeSpan.Zero = 立即关连接）：
     // 收到结束信号（业务拒绝 BATTLE_ENDED 或结算结束通知）后 SDK 立即停心跳与业务发帧，
@@ -70,10 +85,10 @@ public sealed class BattleSessionOptions
     // QueueSize 是重连期间的请求排队上限（帧输入在重连窗口内不丢）。
     public int QueueSize { get; set; } = 64;
 
-    // HookTimeoutMs 是重连钩子（重新入局 + 补帧）的单次执行上限。
+    // HookTimeoutMs 是重连钩子（按 Replay 重放）的单次执行上限。
     public int HookTimeoutMs { get; set; } = 10_000;
 
-    // HookMaxAttempts 是重连钩子（重新入局 + 补帧）的最大尝试次数（缺省 10，必须 > 0）：
+    // HookMaxAttempts 是重连钩子（按 Replay 重放）的最大尝试次数（缺省 10，必须 > 0）：
     // 超过即终止本次重连并上报 Failed——重试必须有界，否则服务端持续拒绝/链路长期不可用时
     // 会无限退避重拨（会话既不恢复也不报错）。
     // 该选项为通道级、业务通道同样生效（落到 ChannelOptions.HookMaxAttempts）；
@@ -84,16 +99,15 @@ public sealed class BattleSessionOptions
     // Serializer 是载荷编码插槽（缺省 protojson = ver=1）：它的 Version 决定**出站**帧头版本，
     // 回执必须带同一版本；ver=2 用 ProtobufSerializer（protobuf 二进制）。版本不在白名单
     // {1,2} 时装配期（Create）即拒绝，不拨号、不猜编码。
-    // 边界：SDK 内置载荷（入局 / 补帧 / 帧输入 / 保活探针，含自动重连的重登与补帧）恒按
-    // protojson 组装——ver=2 会话目前只有 raw 载荷重载（JoinBattleAsync(byte[]) /
-    // SendFrameInputAsync(byte[])）能带二进制；补帧与探针要切 ver=2 需契约消息的生成 DTO
-    //（后续步骤，本轮只透传）。
+    // 边界：SDK 不再组装任何游戏域载荷——业务 op 的载荷由调用方给出（InvokeAsync 的裸字节，
+    // 或 Replay/Probe 里预编码的字节），故 ver=2 会话的入局/补帧/探针同样可带二进制。
+    // 本插槽只决定帧头版本与控制版本协商，不参与业务体编解码。
     public ISerializer Serializer { get; set; } = new JsonSerializer();
 
-    // FrameNumberOf 是帧号提取钩子：从一帧 FrameBroadcast 的**非 ver=1** 载荷里取帧号
-    //（重连补帧的 LastSeenFrame 基准）。ver=1（protojson）恒走 SDK 内建解析，注入后也不接管；
-    // ver≠1 才交本钩子——未注入时补帧基准**不推进、也不报错**：二进制载荷非自描述，猜编码会
-    // 静默错帧，宁可让上层显式注入，也不能因此断链。
+    // FrameNumberOf 是帧号提取钩子：从一帧帧广播的载荷里取帧号（重连补帧的 LastSeenFrame
+    // 基准）。SDK 不持游戏域消息、也不猜载荷编码，故 ver=1（protojson）与 ver=2（protobuf
+    // 二进制）**都**由调用方用游戏协议包解码后经本钩子给出——未注入时补帧基准**不推进、
+    // 也不报错**（宁可让上层显式注入，也不能因猜编码静默错帧）。
     // 返回 null = 本帧取不到帧号（不推进）；钩子抛错同样按「取不到」处理（推送分发不因上层
     // 解码异常中断）。IL2CPP/AOT 友好：只用到委托与 ReadOnlyMemory，无反射、无动态代码。
     public Func<ReadOnlyMemory<byte>, ulong?>? FrameNumberOf { get; set; }
@@ -143,6 +157,11 @@ public sealed class BattleSessionOptions
         if (Serializer == null)
         {
             throw new ArgumentException("Serializer 不能为空", nameof(Serializer));
+        }
+        if (Replay == null || Array.Exists(Replay, step => step == null))
+        {
+            // 重放表定了重连行为：null 项会让「拨号成功后重放」变成空指针，装配期即拒绝。
+            throw new ArgumentException("Replay 不能为 null，也不能含 null 步骤", nameof(Replay));
         }
         if (!PayloadVersion.IsSupported(Serializer.Version))
         {

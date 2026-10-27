@@ -13,7 +13,7 @@ namespace Atlas.Battle;
 //
 // 载荷口径（规范形态唯一）：
 //   - 客户端收到的是帧 Notify：operation = 推送 op（消息完整名 /game.v1.MatchStartedNotify），
-//     payload = **protojson 通知本体**——帧 operation 由调用方按 BattleOps.MatchStartedNotify
+//     payload = **protojson 通知本体**——帧 operation 由调用方按协议包里的成局推送 op
 //     订阅时已剥离，本入口拿到的就是本体字节；
 //   - {type, payload} 信封只存在于 NATS 事件总线侧（网关自己解包后转发），SDK 侧看不到；
 //     本入口仍**防御性**兼容该形态（探测到 payload 是对象即先解包），但不作为规范形态。
@@ -33,7 +33,7 @@ public sealed class DirectPlan
     // MatchId 是对局 ID（protojson 字符串字段，缺省空串）。
     public string MatchId { get; }
 
-    // BattleId 是战斗实例 ID（JoinBattle/SyncFrames 的客体外键）。
+    // BattleId 是战斗实例 ID（游戏侧入局/补帧请求的客体外键）。
     public string BattleId { get; }
 
     // Ticket 是本人入场票据密文（接入层 hello 与帧会话槽都用它）。

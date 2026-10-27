@@ -10,8 +10,8 @@ using Xunit;
 
 namespace Atlas.Tests.Battle;
 
-// BattleSessionTest 覆盖直连战斗会话的行为口径：面选择、入局/输入/补帧、
-// 推送回调、重连重新 hello + 补帧、票过期的可判定异常、接入层拒绝不重试。
+// BattleSessionTest 覆盖直连战斗会话的行为口径：面选择、裸 op 收发、推送出口、
+// 重连重新 hello + 按 Replay 重放、票过期的可判定异常、接入层拒绝不重试。
 public sealed class BattleSessionTest
 {
     // Ticket 是测试票据密文（非真实 AEAD 票：接入层/帧面只按字节透传与编码）。
@@ -104,18 +104,18 @@ public sealed class BattleSessionTest
     }
 
     [Fact]
-    public async Task Connect_SendsHello_ThenJoinBattleWithTicketSlot()
+    public async Task Connect_SendsHello_ThenInvokeCarriesTicketSlot()
     {
         await using var server = new BattleEdgeUdpServer();
         await using var session = BattleSession.Create(
             Plan(server.Port, EdgeTransports.WireName(EdgeTransport.Udp)), Options());
 
         await session.ConnectAsync();
-        var reply = await session.JoinBattleAsync();
+        var reply = await session.InvokeAsync(TestOps.JoinBattle, TestWire.Join("b-1"));
 
         // hello 段逐字节：magic(4)="ATLH" || version(1)=1 || 票长(2,大端) || 票密文。
         Assert.Equal(EdgeWire.EncodeHello(Ticket), server.HelloDatagram);
-        var requests = server.RequestsOf(BattleOps.JoinBattle);
+        var requests = server.RequestsOf(TestOps.JoinBattle);
         Assert.Single(requests);
         Assert.Equal(Slot, requests[0].Slot);
         Assert.Equal("b-1", Parse(requests[0].Payload).GetProperty("battleId").GetString());
@@ -130,9 +130,9 @@ public sealed class BattleSessionTest
             Plan(server.Port, EdgeTransports.WireName(EdgeTransport.Udp)), Options());
 
         await session.ConnectAsync();
-        await session.JoinBattleAsync();
-        await session.SendFrameInputAsync(new byte[] { 0x01 });
-        await session.SyncFramesAsync(0);
+        await session.InvokeAsync(TestOps.JoinBattle, TestWire.Join("b-1"));
+        await session.InvokeAsync(TestOps.SendFrameInput, TestWire.Input("b-1", 1, new byte[] { 0x01 }));
+        await session.InvokeAsync(TestOps.SyncFrames, TestWire.Sync("b-1", 0));
 
         var requests = server.Requests;
         Assert.Equal(3, requests.Length);
@@ -145,26 +145,7 @@ public sealed class BattleSessionTest
     }
 
     [Fact]
-    public async Task SendFrameInput_ConvenienceOverload_BuildsProtojsonPayload()
-    {
-        await using var server = new BattleEdgeUdpServer();
-        await using var session = BattleSession.Create(
-            Plan(server.Port, EdgeTransports.WireName(EdgeTransport.Udp)), Options());
-
-        await session.ConnectAsync();
-        await session.SendFrameInputAsync(3, new byte[] { 0xaa, 0xbb });
-
-        var request = server.RequestsOf(BattleOps.SendFrameInput)[0];
-        var payload = Parse(request.Payload);
-        Assert.Equal("b-1", payload.GetProperty("battleId").GetString());
-        // protojson 的 64 位整数为字符串形态，bytes 为标准 base64。
-        Assert.Equal("3", payload.GetProperty("input").GetProperty("frameId").GetString());
-        Assert.Equal(Convert.ToBase64String(new byte[] { 0xaa, 0xbb }),
-            payload.GetProperty("input").GetProperty("payload").GetString());
-    }
-
-    [Fact]
-    public async Task SendFrameInput_RawPayload_ForwardedVerbatim()
+    public async Task InvokeAsync_RawPayload_ForwardedVerbatim()
     {
         await using var server = new BattleEdgeUdpServer();
         await using var session = BattleSession.Create(
@@ -172,75 +153,78 @@ public sealed class BattleSessionTest
         var raw = Encoding.UTF8.GetBytes("{\"battleId\":\"b-1\",\"input\":{\"frameId\":\"9\"}}");
 
         await session.ConnectAsync();
-        await session.SendFrameInputAsync(raw);
+        await session.InvokeAsync(TestOps.SendFrameInput, raw);
 
-        Assert.Equal(raw, server.RequestsOf(BattleOps.SendFrameInput)[0].Payload);
+        Assert.Equal(raw, server.RequestsOf(TestOps.SendFrameInput)[0].Payload);
     }
 
     [Fact]
-    public async Task SyncFrames_SendsLastSeenFrame()
+    public async Task InvokeAsync_CarriesLastSeenFrameInPayload()
     {
         await using var server = new BattleEdgeUdpServer();
         await using var session = BattleSession.Create(
             Plan(server.Port, EdgeTransports.WireName(EdgeTransport.Udp)), Options());
 
         await session.ConnectAsync();
-        var reply = await session.SyncFramesAsync(11);
+        var reply = await session.InvokeAsync(TestOps.SyncFrames, TestWire.Sync("b-1", 11));
 
-        var request = server.RequestsOf(BattleOps.SyncFrames)[0];
+        var request = server.RequestsOf(TestOps.SyncFrames)[0];
         var payload = Parse(request.Payload);
         Assert.Equal("11", payload.GetProperty("lastSeenFrame").GetString());
         Assert.Equal(BattleEdgeDefaults.SyncFramesReply, Encoding.UTF8.GetString(reply));
     }
 
     [Fact]
-    public async Task FrameBroadcast_Push_InvokesCallback_AndTracksLastSeenFrame()
+    public async Task FrameBroadcast_Push_ReachesSubscription_AndTracksLastSeenFrameByHook()
     {
         await using var server = new BattleEdgeUdpServer();
+        var options = Options();
+        options.FrameNumberOf = TestWire.FrameNumberOf; // 帧号提取由调用方注入（SDK 不内建解析）。
         await using var session = BattleSession.Create(
-            Plan(server.Port, EdgeTransports.WireName(EdgeTransport.Udp)), Options());
+            Plan(server.Port, EdgeTransports.WireName(EdgeTransport.Udp)), options);
         BattlePush? received = null;
         var signal = new TaskCompletionSource<bool>(TaskCreationOptions.RunContinuationsAsynchronously);
-        session.FrameBroadcast += push =>
+        using var subscription = session.OnPush(TestOps.FrameBroadcast, push =>
         {
-            received = push;
+            Volatile.Write(ref received, push);
             signal.TrySetResult(true);
-        };
+        });
 
         await session.ConnectAsync();
-        await session.JoinBattleAsync();
-        var body = Encoding.UTF8.GetBytes("{\"battleId\":\"b-1\",\"frame\":{\"frameId\":\"9\",\"inputs\":[]}}");
-        await server.PushNotifyAsync(BattleOps.FrameBroadcast, body);
+        await session.InvokeAsync(TestOps.JoinBattle, TestWire.Join("b-1"));
+        var body = TestWire.FrameBroadcast(9);
+        await server.PushNotifyAsync(TestOps.FrameBroadcast, body);
 
         await signal.Task.WaitAsync(TimeSpan.FromSeconds(3));
         Assert.NotNull(received);
-        Assert.Equal(BattleOps.FrameBroadcast, received!.Op);
+        Assert.Equal(TestOps.FrameBroadcast, received!.Op);
         Assert.Equal(body, received.Payload);
         Assert.Equal(Atlas.Frame.FrameGen.Version, received.Version);
         Assert.Equal(9UL, session.LastSeenFrame);
     }
 
     [Fact]
-    public async Task BattleEnd_Push_InvokesCallback()
+    public async Task BattleEnd_Push_ReachesSubscription_AndKeepsPayload()
     {
         await using var server = new BattleEdgeUdpServer();
         await using var session = BattleSession.Create(
             Plan(server.Port, EdgeTransports.WireName(EdgeTransport.Udp)), Options());
         BattlePush? ended = null;
         var signal = new TaskCompletionSource<bool>(TaskCreationOptions.RunContinuationsAsynchronously);
-        session.BattleEnd += push =>
+        using var subscription = session.OnPush(TestOps.BattleEndNotify, push =>
         {
-            ended = push;
+            Volatile.Write(ref ended, push);
             signal.TrySetResult(true);
-        };
+        });
 
         await session.ConnectAsync();
-        await server.PushNotifyAsync(BattleOps.BattleEndNotify,
-            Encoding.UTF8.GetBytes("{\"battleId\":\"b-1\",\"winnerPlayerId\":\"p-1\"}"));
+        var payload = TestWire.EndPayload("p-1");
+        await server.PushNotifyAsync(TestOps.BattleEndNotify, payload);
 
         await signal.Task.WaitAsync(TimeSpan.FromSeconds(3));
         Assert.NotNull(ended);
-        Assert.Equal(BattleOps.BattleEndNotify, ended!.Op);
+        Assert.Equal(TestOps.BattleEndNotify, ended!.Op);
+        Assert.Equal(payload, session.EndNotifyPayload); // 首投载荷留档（迟到订阅者可直接取）。
         Assert.Contains("p-1", Encoding.UTF8.GetString(ended.Payload), StringComparison.Ordinal);
     }
 
@@ -248,12 +232,13 @@ public sealed class BattleSessionTest
     public async Task JoinBattle_TicketExpired_SurfacesBusinessReason()
     {
         await using var server = new BattleEdgeUdpServer();
-        server.FailWith(BattleOps.JoinBattle, 401, DirectErrors.TicketExpiredReason, "票据已过期");
+        server.FailWith(TestOps.JoinBattle, 401, DirectErrors.TicketExpiredReason, "票据已过期");
         await using var session = BattleSession.Create(
             Plan(server.Port, EdgeTransports.WireName(EdgeTransport.Udp)), Options());
 
         await session.ConnectAsync();
-        var exception = await Assert.ThrowsAsync<BusinessException>(() => session.JoinBattleAsync());
+        var exception = await Assert.ThrowsAsync<BusinessException>(
+            () => session.InvokeAsync(TestOps.JoinBattle, TestWire.Join("b-1")));
 
         // 可判定异常：上层据此重新匹配（对齐 Go errors.Is(err, ErrTicketExpired) 口径）。
         Assert.True(AtlasException.IsBusinessError(exception, DirectErrors.TicketExpiredReason));
@@ -278,28 +263,34 @@ public sealed class BattleSessionTest
     }
 
     [Fact]
-    public async Task ReconnectAsync_ReHellosAndResyncsFromLastSeenFrame()
+    public async Task ReconnectAsync_ReHellosAndReplaysFromLastSeenFrame()
     {
         await using var server = new BattleEdgeUdpServer();
+        var options = Options();
+        options.Replay = new[]
+        {
+            new ReplayStep(TestOps.JoinBattle, _ => TestWire.Join("b-1")),
+            new ReplayStep(TestOps.SyncFrames, lastSeen => TestWire.Sync("b-1", lastSeen)),
+        };
         await using var session = BattleSession.Create(
-            Plan(server.Port, EdgeTransports.WireName(EdgeTransport.Udp)), Options());
+            Plan(server.Port, EdgeTransports.WireName(EdgeTransport.Udp)), options);
 
         await session.ConnectAsync();
-        await session.JoinBattleAsync();
+        await session.InvokeAsync(TestOps.JoinBattle, TestWire.Join("b-1"));
         session.LastSeenFrame = 7;
 
         await session.ReconnectAsync();
 
-        // 重新 hello（同一张票）+ JoinBattle + SyncFrames(last_seen_frame) 补帧。
+        // 重新 hello（同一张票）+ 按 Replay 重放入局与补帧（补帧基准 = 已见帧号）。
         Assert.Equal(2, server.HelloCount);
-        Assert.Equal(2, server.RequestsOf(BattleOps.JoinBattle).Length);
-        var syncs = server.RequestsOf(BattleOps.SyncFrames);
+        Assert.Equal(2, server.RequestsOf(TestOps.JoinBattle).Length);
+        var syncs = server.RequestsOf(TestOps.SyncFrames);
         Assert.Single(syncs);
         Assert.Equal("7", Parse(syncs[0].Payload).GetProperty("lastSeenFrame").GetString());
     }
 
     [Fact]
-    public async Task CloseAsync_ThenJoin_ThrowsNetworkException()
+    public async Task CloseAsync_ThenInvoke_ThrowsNetworkException()
     {
         await using var server = new BattleEdgeUdpServer();
         var session = BattleSession.Create(
@@ -309,7 +300,8 @@ public sealed class BattleSessionTest
         await session.CloseAsync();
         await session.CloseAsync(); // 幂等。
 
-        await Assert.ThrowsAsync<NetworkException>(() => session.JoinBattleAsync());
+        await Assert.ThrowsAsync<NetworkException>(
+            () => session.InvokeAsync(TestOps.JoinBattle, TestWire.Join("b-1")));
         await session.DisposeAsync();
     }
 

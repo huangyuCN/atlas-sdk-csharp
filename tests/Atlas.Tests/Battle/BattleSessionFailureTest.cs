@@ -39,6 +39,12 @@ public sealed class BattleSessionFailureTest
             BackoffBaseMs = 30,
             BackoffMaxMs = 100,
             HeartbeatInterval = TimeSpan.Zero,
+            // 重连重放显式配置（SDK 不再内建 JoinBattle + SyncFrames 重放）：入局 + 按基准补帧。
+            Replay = new[]
+            {
+                new ReplayStep(TestOps.JoinBattle, _ => TestWire.Join("b-1")),
+                new ReplayStep(TestOps.SyncFrames, lastSeen => TestWire.Sync("b-1", lastSeen)),
+            },
         };
     }
 
@@ -108,7 +114,7 @@ public sealed class BattleSessionFailureTest
         await Task.Delay(150);
         Assert.Equal(writes, second.WrittenCount);
         var rejected = await Assert.ThrowsAsync<BusinessException>(
-            () => session.SendFrameInputAsync(1, new byte[] { 0x01 }));
+            () => session.InvokeAsync(TestOps.SendFrameInput, TestWire.Input("b-1", 1, new byte[] { 0x01 })));
         Assert.Equal(reason, rejected.Reason);
         Assert.Equal(writes, second.WrittenCount);
         await session.CloseAsync();
@@ -124,7 +130,7 @@ public sealed class BattleSessionFailureTest
         session.Failed += _ => Interlocked.Increment(ref failures);
         await session.ConnectAsync();
 
-        var call = session.JoinBattleAsync();
+        var call = session.InvokeAsync(TestOps.JoinBattle, TestWire.Join("b-1"));
         await transport.WaitForWritesAsync(1);
         transport.QueueBusinessError(
             transport.WrittenHeaders[0].Seq, DirectErrors.BattleNotFoundCode,
@@ -136,7 +142,7 @@ public sealed class BattleSessionFailureTest
         Assert.Equal(1, Volatile.Read(ref failures));
 
         var writes = transport.WrittenCount;
-        await Assert.ThrowsAsync<BusinessException>(() => session.JoinBattleAsync());
+        await Assert.ThrowsAsync<BusinessException>(() => session.InvokeAsync(TestOps.JoinBattle, TestWire.Join("b-1")));
         Assert.Equal(writes, transport.WrittenCount);
         await session.CloseAsync();
     }
@@ -149,9 +155,9 @@ public sealed class BattleSessionFailureTest
         var session = FakeSession(transport, Options());
         await session.ConnectAsync();
 
-        var rejected = session.JoinBattleAsync();
+        var rejected = session.InvokeAsync(TestOps.JoinBattle, TestWire.Join("b-1"));
         await transport.WaitForWritesAsync(1);
-        var inflight = session.SendFrameInputAsync(1, new byte[] { 0x01 });
+        var inflight = session.InvokeAsync(TestOps.SendFrameInput, TestWire.Input("b-1", 1, new byte[] { 0x01 }));
         await transport.WaitForWritesAsync(2);
 
         transport.QueueBusinessError(

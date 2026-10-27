@@ -34,6 +34,12 @@ public sealed class BattleWireConsistencyTest
             InvokeTimeoutMs = 3000,
             BackoffBaseMs = 50,
             BackoffMaxMs = 200,
+            // 重连重放显式配置（SDK 不再内建 JoinBattle + SyncFrames 重放）：入局 + 按基准补帧。
+            Replay = new[]
+            {
+                new ReplayStep(TestOps.JoinBattle, _ => TestWire.Join("b-1")),
+                new ReplayStep(TestOps.SyncFrames, lastSeen => TestWire.Sync("b-1", lastSeen)),
+            },
         };
     }
 
@@ -58,11 +64,11 @@ public sealed class BattleWireConsistencyTest
         await using var session = BattleSession.Create(Plan(server.Port, "EDGE_TRANSPORT_WS"), Options());
 
         await session.ConnectAsync();
-        await session.JoinBattleAsync();
+        await session.InvokeAsync(TestOps.JoinBattle, TestWire.Join("b-1"));
 
         // 升级请求行：路径 "/" + query `ticket=<base64url(票密文，无填充)>`。
         Assert.Equal("/?ticket=" + Slot, server.Targets[0]);
-        var request = server.RequestsOf(BattleOps.JoinBattle)[0];
+        var request = server.RequestsOf(TestOps.JoinBattle)[0];
         Assert.Equal((byte)(FrameGen.FlagSession | FrameGen.FlagRequestID),
             (byte)(request.Flags & (FrameGen.FlagSession | FrameGen.FlagRequestID)));
         Assert.Equal(Slot, request.Slot);
@@ -79,7 +85,7 @@ public sealed class BattleWireConsistencyTest
         await using var session = BattleSession.Create(Plan(server.Port, "EDGE_TRANSPORT_WS"), options);
 
         await session.ConnectAsync();
-        await session.JoinBattleAsync();
+        await session.InvokeAsync(TestOps.JoinBattle, TestWire.Join("b-1"));
 
         // 头形态：query 不带票，票在 X-Atlas-Ticket（接入层两种都接受）。
         Assert.Equal("/", server.Targets[0]);
@@ -93,7 +99,7 @@ public sealed class BattleWireConsistencyTest
         await using var session = BattleSession.Create(Plan(server.Port, "EDGE_TRANSPORT_UDP"), Options());
 
         await session.ConnectAsync();
-        await session.JoinBattleAsync();
+        await session.InvokeAsync(TestOps.JoinBattle, TestWire.Join("b-1"));
 
         // 首包 = hello 段：magic(4)="ATLH" || version(1)=1 || 票长(2,大端) || 票密文。
         var want = new byte[] { (byte)'A', (byte)'T', (byte)'L', (byte)'H', 0x01, 0x00, 0x07 };
@@ -111,7 +117,7 @@ public sealed class BattleWireConsistencyTest
         Assert.Equal(FrameGen.Magic, header.Magic);
         Assert.Equal(MsgType.Request, header.Type);
         var (op, slot, _, _) = Body.ParseRequestBodyFull(body, header.Flags);
-        Assert.Equal(BattleOps.JoinBattle, op);
+        Assert.Equal(TestOps.JoinBattle, op);
         Assert.Equal(Slot, slot);
     }
 
@@ -122,9 +128,9 @@ public sealed class BattleWireConsistencyTest
         await using var session = BattleSession.Create(Plan(server.Port, "EDGE_TRANSPORT_KCP"), Options());
 
         await session.ConnectAsync();
-        await session.JoinBattleAsync();
-        await session.SendFrameInputAsync(new byte[] { 0x01 });
-        await session.SyncFramesAsync(0);
+        await session.InvokeAsync(TestOps.JoinBattle, TestWire.Join("b-1"));
+        await session.InvokeAsync(TestOps.SendFrameInput, new byte[] { 0x01 });
+        await session.InvokeAsync(TestOps.SyncFrames, TestWire.Sync("b-1", 0));
 
         // 顺序断言：服务端收到的**第一个数据报**就是 hello 段（先 hello，再起 KCP 会话）。
         Assert.Equal(EdgeWire.EncodeHello(Ticket), server.FirstDatagram);
@@ -134,10 +140,10 @@ public sealed class BattleWireConsistencyTest
         // KCP 会话报文带 flow-id 前缀（服务端前缀失配即丢弃：能收到帧即证明前缀正确）。
         var requests = server.Requests;
         Assert.Equal(3, requests.Length);
-        Assert.Equal(BattleOps.JoinBattle, requests[0].Op);
+        Assert.Equal(TestOps.JoinBattle, requests[0].Op);
         Assert.Equal(Slot, requests[0].Slot);
-        Assert.Equal(BattleOps.SendFrameInput, requests[1].Op);
-        Assert.Equal(BattleOps.SyncFrames, requests[2].Op);
+        Assert.Equal(TestOps.SendFrameInput, requests[1].Op);
+        Assert.Equal(TestOps.SyncFrames, requests[2].Op);
     }
 
     [Fact]
@@ -162,10 +168,10 @@ public sealed class BattleWireConsistencyTest
         await using var session = BattleSession.Create(Plan(server.Port, "EDGE_TRANSPORT_WS"), Options());
 
         await session.ConnectAsync();
-        await session.JoinBattleAsync();
+        await session.InvokeAsync(TestOps.JoinBattle, TestWire.Join("b-1"));
 
         await WaitUntilAsync(
-            () => server.AcceptedCount >= 2 && server.RequestsOf(BattleOps.JoinBattle).Length >= 2,
+            () => server.AcceptedCount >= 2 && server.RequestsOf(TestOps.JoinBattle).Length >= 2,
             TimeSpan.FromSeconds(5));
         Assert.Equal("/?ticket=" + Slot, server.Targets[1]);
     }
@@ -176,7 +182,7 @@ public sealed class BattleWireConsistencyTest
         // 票过期可回退：断线重连后的重新入局被帧面拒（BATTLE_TICKET_EXPIRED）→ 终止会话并
         // 以可判定异常通知上层（重新匹配取新票），不再拿废票重试。
         await using var server = new BattleEdgeWsServer { CloseAfterRequests = 1 };
-        server.FailAfter(BattleOps.JoinBattle, 1, 401, DirectErrors.TicketExpiredReason, "票据已过期");
+        server.FailAfter(TestOps.JoinBattle, 1, 401, DirectErrors.TicketExpiredReason, "票据已过期");
         await using var session = BattleSession.Create(Plan(server.Port, "EDGE_TRANSPORT_WS"), Options());
         Exception? failure = null;
         var signal = new TaskCompletionSource<bool>(TaskCreationOptions.RunContinuationsAsynchronously);
@@ -187,7 +193,7 @@ public sealed class BattleWireConsistencyTest
         };
 
         await session.ConnectAsync();
-        await session.JoinBattleAsync(); // 第 1 次入局：成功
+        await session.InvokeAsync(TestOps.JoinBattle, TestWire.Join("b-1")); // 第 1 次入局：成功
 
         await signal.Task.WaitAsync(TimeSpan.FromSeconds(5));
         Assert.NotNull(failure);
@@ -213,7 +219,7 @@ public sealed class BattleWireConsistencyTest
         };
 
         await session.ConnectAsync();
-        await session.JoinBattleAsync();
+        await session.InvokeAsync(TestOps.JoinBattle, TestWire.Join("b-1"));
 
         await signal.Task.WaitAsync(TimeSpan.FromSeconds(5));
         Assert.IsType<ProtocolException>(failure);

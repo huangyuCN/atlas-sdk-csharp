@@ -1,26 +1,26 @@
 using System;
-using System.Text;
-using System.Text.Json;
 using System.Threading;
 using System.Threading.Tasks;
 using Atlas.Client;
 using Atlas.Errors;
-using Atlas.Frame;
 
 namespace Atlas.Battle;
 
 // BattleSession 是一次直连战斗会话：从成局通知取票据与接入层地址 → 直连接入层（hello 换票）
-// → 跑战斗帧（JoinBattle / SendFrameInput / SyncFrames）→ 收帧广播与战斗结束推送。
+// → 收发业务 op（op 与载荷由调用方给出）→ 收帧广播与战斗结束推送（原始字节 + 帧头版本）。
 //
-// 复用业务通道的请求-响应匹配、推送分发、重连排队与退避（Channel），只额外做三件事：
+// 游戏域消息（battle / game / matcher 的 DTO 与 op 表）**不在本 SDK**：由游戏协议包
+//（NuGet HuangyuCN.AtlasGame.Protocol，源自模板仓 protocol/）生成；本会话只做传输/会话四件事：
 //   1. 逐帧携带帧会话槽（ForceFrameSessionSlot + base64url 票）：经接入层透传后 battle 帧面
 //      仍按帧槽验票，WS 长连接也不例外；
-//   2. 重连钩子 = 重新入局 + 按 LastSeenFrame 补帧（SyncFrames(last_seen_frame)）；
-//   3. 失败分类：接入层拒绝（ProtocolException）终止重连；票过期/无效（BusinessException
+//   2. 重连钩子 = 重新 hello 后按 `BattleSessionOptions.Replay` 的步骤重放（入局 + 按
+//      LastSeenFrame 补帧等，载荷由调用方用协议包构造）；
+//   3. 保活探针按 `BattleSessionOptions.ProbeOp/ProbePayload` 发送（不配置就不发）；
+//   4. 失败分类：接入层拒绝（ProtocolException）终止重连；票过期/无效（BusinessException
 //      的 BATTLE_TICKET_EXPIRED / BATTLE_TICKET_INVALID）终止会话并回调 Failed，供上层重新匹配。
 //
-// 生命周期：Create（装配期选面，缺面即报错）→ ConnectAsync（hello）→ JoinBattleAsync →
-// SyncFramesAsync → SendFrameInputAsync；断线自动重连（AutoReconnect）或显式 ReconnectAsync；
+// 生命周期：Create（装配期选面，缺面即报错）→ ConnectAsync（hello）→ InvokeAsync（业务 op，
+// 通常由游戏协议包的 op 常量与 DTO 编码）；断线自动重连（AutoReconnect）或显式 ReconnectAsync；
 // 关闭后（CloseAsync/DisposeAsync）不可再连接。
 public sealed partial class BattleSession : IAsyncDisposable
 {
@@ -78,9 +78,9 @@ public sealed partial class BattleSession : IAsyncDisposable
     // Address 是选定面的接入层地址（host:port）。
     public string Address { get; }
 
-    // LastSeenFrame 是本地已见的最大帧号：重连补帧（SyncFrames）以此为起点。
-    // ver=1 帧广播由 SDK 内建 protojson 解析自动推进；ver≠1（如 ver=2 二进制）须注入
-    // BattleSessionOptions.FrameNumberOf 才会推进（未注入即不推进、不报错）；调用方也可显式赋值。
+    // LastSeenFrame 是本地已见的最大帧号：重连补帧（游戏侧 Replay 里的补帧步骤）以此为起点。
+    // 只由调用方注入的 BattleSessionOptions.FrameNumberOf 钩子推进（SDK 不解载荷、不猜编码；
+    // 未注入即不推进、不报错），调用方也可显式赋值。
     public ulong LastSeenFrame { get; set; }
 
     // State 是底层通道状态（未连接/连接中/已连接/重连中/已断开）。
@@ -90,62 +90,6 @@ public sealed partial class BattleSession : IAsyncDisposable
     //（BATTLE_NOT_FOUND/BATTLE_FULL 等不可重试业务拒绝）等**不可重试**失败——
     // 上层据此重新匹配或提示下线。
     public event Action<Exception>? Failed;
-
-    // JoinBattleAsync 入局：用计划里的 battle_id 自动组装 protojson 请求。
-    public Task<byte[]> JoinBattleAsync(CancellationToken cancellationToken = default)
-    {
-        return InvokeAsync(BattleOps.JoinBattle, JoinBattlePayload(), cancellationToken);
-    }
-
-    // JoinBattleAsync 入局（原始载荷重载：调用方自备 DTO 编码）。
-    public Task<byte[]> JoinBattleAsync(byte[] payload, CancellationToken cancellationToken = default)
-    {
-        return InvokeAsync(BattleOps.JoinBattle, payload, cancellationToken);
-    }
-
-    // SendFrameInputAsync 发送帧输入（原始载荷重载：调用方自备 LockstepInput 编码）。
-    public Task<byte[]> SendFrameInputAsync(byte[] payload, CancellationToken cancellationToken = default)
-    {
-        return InvokeAsync(BattleOps.SendFrameInput, payload, cancellationToken);
-    }
-
-    // SendFrameInputAsync 发送帧输入（便捷重载：按 protojson 组装 FrameInputReq）。
-    public Task<byte[]> SendFrameInputAsync(ulong frameId, byte[] input, CancellationToken cancellationToken = default)
-    {
-        return SendFrameInputAsync(FrameInputPayload(frameId, input), cancellationToken);
-    }
-
-    // SyncFramesAsync 补帧：以 LastSeenFrame 为起点。
-    public Task<byte[]> SyncFramesAsync(CancellationToken cancellationToken = default)
-    {
-        return SyncFramesAsync(LastSeenFrame, cancellationToken);
-    }
-
-    // SyncFramesAsync 补帧：以显式 last_seen_frame 为起点（服务端回缺失帧区间）。
-    public Task<byte[]> SyncFramesAsync(ulong lastSeenFrame, CancellationToken cancellationToken = default)
-    {
-        return InvokeAsync(BattleOps.SyncFrames, SyncFramesPayload(lastSeenFrame), cancellationToken);
-    }
-
-    // JoinBattlePayload 组装 JoinBattle 请求载荷（protojson：{"battleId":"..."}）。
-    public byte[] JoinBattlePayload()
-    {
-        return Utf8("{\"battleId\":" + Quote(_plan.BattleId) + "}");
-    }
-
-    // SyncFramesPayload 组装补帧请求载荷（64 位整数按 protojson 字符串形态）。
-    public byte[] SyncFramesPayload(ulong lastSeenFrame)
-    {
-        return Utf8("{\"battleId\":" + Quote(_plan.BattleId)
-            + ",\"lastSeenFrame\":\"" + lastSeenFrame + "\"}");
-    }
-
-    // FrameInputPayload 组装帧输入请求载荷（bytes 按 protojson 的 base64 形态）。
-    public byte[] FrameInputPayload(ulong frameId, byte[]? input)
-    {
-        return Utf8("{\"battleId\":" + Quote(_plan.BattleId) + ",\"input\":{\"frameId\":\"" + frameId
-            + "\",\"payload\":\"" + Convert.ToBase64String(input ?? Array.Empty<byte>()) + "\"}}");
-    }
 
     // CloseAsync 关闭会话（幂等）：停保活心跳、停收尾窗口、停止重连、结算在途请求、关闭连接。
     // 关闭后不再发任何帧（含探针），也不可再连接。
@@ -163,8 +107,10 @@ public sealed partial class BattleSession : IAsyncDisposable
         await CloseAsync().ConfigureAwait(false);
     }
 
-    // InvokeAsync 发一次帧请求（已关闭/已终态/未连接即失败，不静默丢弃、不写线）。
-    private Task<byte[]> InvokeAsync(string operation, byte[]? payload, CancellationToken cancellationToken)
+    // InvokeAsync 发一条业务 op 并等回执：op 与载荷由调用方给出（通常来自游戏协议包的 op 常量
+    // 与生成 DTO），SDK 只负责组帧、写线、匹配回执与错误归一——**不持有任何游戏域消息类型**。
+    // 已关闭/已终态/未连接即失败，不静默丢弃、不写线；业务拒绝原样上抛（可判定）。
+    public Task<byte[]> InvokeAsync(string operation, byte[]? payload, CancellationToken cancellationToken = default)
     {
         ThrowIfClosed();
         ThrowIfTerminal();
@@ -206,16 +152,5 @@ public sealed partial class BattleSession : IAsyncDisposable
         {
             throw new NetworkException(DirectErrors.SessionClosed);
         }
-    }
-
-    // Quote 把字符串编码为 JSON 字面量（battle_id 可能含引号等字符）。
-    private static string Quote(string value)
-    {
-        return JsonSerializer.Serialize(value);
-    }
-
-    private static byte[] Utf8(string json)
-    {
-        return Encoding.UTF8.GetBytes(json);
     }
 }

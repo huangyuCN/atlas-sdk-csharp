@@ -4,16 +4,13 @@ using System.Threading.Tasks;
 using Atlas.Client;
 using Atlas.Errors;
 using Atlas.Serialization;
-using Battle.V1;
 using Gateway.V1;
 
 namespace Atlas.Smoke;
 
 // 协议常量：会话 op 名取自生成物（Atlas.Gateway.V1.SessionProtocolOps），本类只保留
-// 生成物覆盖不到的传输面 op。
-// 战斗域 op 为 examples 局部常量：战斗 POCO 生成物（Atlas.Battle.V1）会与其 IMessage
-// 族的 lockstep 命名空间（protoc 生成的 Atlas.Game.Lockstep）同名冲突，故本仓不生成
-// 战斗 POCO（冒烟走 IMessage 路径，见 scripts/gen-dto.sh）。
+// 生成物覆盖不到的传输面 op 与**游戏域 op 的示例局部字面量**（战斗域消息已迁出 SDK，
+// 真实项目取游戏协议包的常量与 DTO；冒烟保持零游戏依赖，见 BattleWire.cs）。
 public static class Ops
 {
     // Ping 是服务端内置传输心跳 op（无 payload 往返）。
@@ -32,17 +29,17 @@ public enum SmokeMode
     Protobuf,   // ProtobufSerializer（ver=2 二进制）
 }
 
-// SmokeOps 封装冒烟业务操作的 DTO 构造与解析（三编码经同一 ISerializer 分派；
-// op 名取自生成物 Atlas.Gateway.V1.SessionProtocolOps / Atlas.Battle.V1.BattleService）。
+// SmokeOps 封装冒烟业务操作的载荷构造与解析（三编码经同一 ISerializer 分派；
+// op 名取自生成物 Atlas.Gateway.V1.SessionProtocolOps 与示例局部字面量 Ops.JoinBattle）。
 public sealed class SmokeOps
 {
     private readonly ISerializer _serializer;
+    private readonly bool _protobuf;
 
     public SmokeOps(SmokeMode mode)
     {
-        _serializer = mode == SmokeMode.Protobuf
-            ? new ProtobufSerializer()
-            : new JsonSerializer();
+        _protobuf = mode == SmokeMode.Protobuf;
+        _serializer = _protobuf ? new ProtobufSerializer() : new JsonSerializer();
     }
 
     public string ModeName(SmokeMode mode)
@@ -131,10 +128,11 @@ public sealed class SmokeOps
     // 消息体零身份字段）验证战斗通道 payload 编解码——服务端回业务拒绝
     //（BusinessException）即证明解码成功（协议错误/解码失败才说明编解码问题，
     // 对标 Go runBattleChannelSmoke）。
+    // 载荷用示例局部字节（BattleWire），不经 SDK 的任何游戏域类型：真实项目用协议包的 DTO
+    // 按所选编码序列化后同样走 client.InvokeRawAsync。
     public async Task<bool> TryJoinBattleAsync(AtlasClient client, CancellationToken ct)
     {
-        var request = new JoinBattleReq { BattleId = "b1" };
-        var payload = _serializer.Serialize(request);
+        var payload = _protobuf ? BattleWire.JoinProtobuf("b1") : BattleWire.JoinJson("b1");
         try
         {
             await client.InvokeRawAsync(Ops.JoinBattle, payload, ct);

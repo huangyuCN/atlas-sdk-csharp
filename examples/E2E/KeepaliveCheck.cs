@@ -43,21 +43,24 @@ internal sealed class KeepaliveCheck
             + $"心跳={(heartbeatEnabled ? $"{interval.TotalMilliseconds:F0}ms/拍" : "关闭")} "
             + $"静默目标={_config.QuietMs}ms 中途探针={_config.ProbeMs}ms");
 
-        await using var session = BattleSession.Create(plan, Options(face, interval));
+        await using var session = BattleSession.Create(plan, Options(face, interval, plan));
         var recorder = new BroadcastRecorder(session, heartbeatEnabled);
         var failed = false;
         session.Failed += _ => failed = true;
 
         await session.ConnectAsync(ct).ConfigureAwait(false);
-        var join = await session.JoinBattleAsync(ct).ConfigureAwait(false);
+        var join = await session.InvokeAsync(
+            GameOps.JoinBattle, GameWire.Join(plan.BattleId), ct).ConfigureAwait(false);
         Console.WriteLine($"[{tag}] 入局完成：JoinBattle 回执 {Snippet(join)}");
         // 输入载荷取 0：示例竞速模拟器按 payload[0] 步进，非 0 会把玩家推到终点提前结算，
         // 掩盖后续保活证据（结算不是掉线，但会把观测窗口截断）。
-        await session.SendFrameInputAsync(1, new byte[] { 0x00 }, ct).ConfigureAwait(false);
+        await session.InvokeAsync(
+            GameOps.SendFrameInput, GameWire.Input(plan.BattleId, 1, new byte[] { 0x00 }), ct)
+            .ConfigureAwait(false);
         Console.WriteLine($"[{tag}] 已发输入 frame=1（payload=0，不推进）；开始静默（只发心跳、不发输入）");
 
         var silence = await recorder.WaitSilenceAsync(_config.ProbeMs, _config.QuietMs, ct).ConfigureAwait(false);
-        var probe = await ProbeAsync(session, ct).ConfigureAwait(false);
+        var probe = await ProbeAsync(session, plan.BattleId, ct).ConfigureAwait(false);
         Console.WriteLine($"[{tag}] 静默窗口实测 {silence.ElapsedMs}ms（目标 {_config.QuietMs}ms；"
             + (silence.TruncatedBySettle
                 ? "局已自然结算，窗口止于结算"
@@ -71,12 +74,17 @@ internal sealed class KeepaliveCheck
     }
 
     // Options 组装会话选项：探针失败要快点暴露，故调用超时取 2.5s（缺省 10s 会拖过对局）。
-    private static BattleSessionOptions Options(EdgeTransport face, TimeSpan interval)
+    // 探针、重放与帧号钩子都显式配置（SDK 不持游戏域消息，不再内建 Ping/Join+Sync/帧号解析）。
+    private static BattleSessionOptions Options(EdgeTransport face, TimeSpan interval, DirectPlan plan)
     {
         return new BattleSessionOptions
         {
             PreferredTransport = face,
             HeartbeatInterval = interval,
+            ProbeOp = GameOps.Ping,
+            ProbePayload = GameWire.Probe(plan.BattleId),
+            Replay = GameWire.Replay(plan.BattleId),
+            FrameNumberOf = GameWire.FrameNumberOf,
             HelloTimeoutMs = 5000,
             InvokeTimeoutMs = 2500,
             BackoffBaseMs = 200,
@@ -85,12 +93,14 @@ internal sealed class KeepaliveCheck
     }
 
     // ProbeAsync 中途探针：静默窗口跑到探针点后「还能不能发帧/补帧」。
-    private static async Task<ProbeResult> ProbeAsync(BattleSession session, CancellationToken ct)
+    private static async Task<ProbeResult> ProbeAsync(BattleSession session, string battleId, CancellationToken ct)
     {
         var result = new ProbeResult { State = session.State, LastSeenFrame = session.LastSeenFrame };
         try
         {
-            await session.SendFrameInputAsync(2, new byte[] { 0x00 }, ct).ConfigureAwait(false);
+            await session.InvokeAsync(
+                GameOps.SendFrameInput, GameWire.Input(battleId, 2, new byte[] { 0x00 }), ct)
+                .ConfigureAwait(false);
             result.InputOk = true;
         }
         catch (Exception exception)
@@ -99,7 +109,8 @@ internal sealed class KeepaliveCheck
         }
         try
         {
-            var sync = await session.SyncFramesAsync(ct).ConfigureAwait(false);
+            var sync = await session.InvokeAsync(
+                GameOps.SyncFrames, GameWire.Sync(battleId, session.LastSeenFrame), ct).ConfigureAwait(false);
             result.SyncOk = true;
             result.SyncReply = Snippet(sync);
         }
@@ -178,8 +189,9 @@ internal sealed class BroadcastRecorder
 
     public BroadcastRecorder(BattleSession session, bool heartbeatEnabled)
     {
-        session.FrameBroadcast += _ => Track(_watch.ElapsedMilliseconds);
-        session.BattleEnd += _ => BattleEndedAt = _watch.ElapsedMilliseconds;
+        // 统一出口按 op 订阅（游戏协议包的推送 op；示例用本地字面量）：SDK 不再有游戏消息专用事件。
+        session.OnPush(GameOps.FrameBroadcast, _ => Track(_watch.ElapsedMilliseconds));
+        session.OnPush(GameOps.BattleEndNotify, _ => BattleEndedAt = _watch.ElapsedMilliseconds);
         if (heartbeatEnabled)
         {
             session.HeartbeatFailed += _ => HeartbeatFailures++;

@@ -44,6 +44,9 @@ jobs:
 
       # 会话协议唯一来源是模板仓（R13）：descriptor set 从模板导出，帧常量与生成器
       # 取自框架仓——「重生成无 diff」门禁需要三个检出（同一只读 PAT）。
+      # 游戏域消息（battle/game/matcher 的 DTO 与 op 表）**不在这里生成**：它们由该仓
+      # protocol/ 包独立发布（NuGet HuangyuCN.AtlasGame.Protocol），本仓不依赖它——
+      # 见 tests/Atlas.Tests/Battle/BattleGameDomainBoundaryTest.cs 的边界守卫。
       - name: Checkout atlas-game-layout (会话协议来源)
         uses: actions/checkout@v5
         with:
@@ -64,9 +67,10 @@ jobs:
         with:
           dotnet-version: '8.0.x'
 
-      # 生成物（帧常量快照 + 会话 DTO/stub，含 src/Atlas/Frame/Gen/FrameGen.cs 与
-      # examples/Smoke/Proto/gen/**）全部已提交入库；重生成验证——产物与上游不一致
-      # 即 CI 失败（防手改产物或上游漂移）。
+      # 生成物（帧常量快照 + **契约消息** DTO/stub：会话 / common / lockstep / route，含
+      # src/Atlas/Frame/Gen/FrameGen.cs 与 examples/Smoke/Proto/gen/**）全部已提交入库；
+      # 重生成验证——产物与上游不一致即 CI 失败（防手改产物或上游漂移）。游戏域消息不在
+      # 产出清单里（迁出到游戏协议包），边界守卫用例会在有人加回生成项时先红。
       - name: Install protoc
         run: |
           PROTOC_VERSION=26.1
@@ -76,7 +80,7 @@ jobs:
           sudo chmod +x /usr/local/bin/protoc
           protoc --version
 
-      - name: Verify DTO regenerated
+      - name: Verify DTO regenerated（帧常量 + 契约消息 DTO/stub）
         env:
           ATLAS_DIR: ${{ github.workspace }}/atlas
           ATLAS_LAYOUT_DIR: ${{ github.workspace }}/atlas-game-layout

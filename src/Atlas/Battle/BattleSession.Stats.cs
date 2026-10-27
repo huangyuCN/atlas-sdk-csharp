@@ -37,7 +37,7 @@ public readonly struct HeartbeatStats
 //   - ConnectFailures：拨号失败数；
 //   - HandshakeFailures：其中握手类失败数（hello/WS 升级被接入层拒绝：ProtocolException）；
 //   - Reconnects：成功完成的重连轮次数（自动重连成功 + 显式 ReconnectAsync）；
-//   - RejoinFailures：重连钩子（重新入局 + 补帧）失败次数（业务拒绝与网络失败都计）；
+//   - RejoinFailures：重连钩子（按 Replay 重放）失败次数（业务拒绝与网络失败都计）；
 //   - Heartbeat：保活探针统计（见 HeartbeatStats）。
 public readonly struct BattleSessionStats
 {
@@ -121,7 +121,7 @@ public sealed partial class BattleSession
         Interlocked.Increment(ref _reconnects);
     }
 
-    // CountRejoinFailure 记一次重连钩子（重新入局 + 补帧）失败。
+    // CountRejoinFailure 记一次重连钩子（按 Replay 重放）失败。
     private void CountRejoinFailure()
     {
         Interlocked.Increment(ref _rejoinFailures);

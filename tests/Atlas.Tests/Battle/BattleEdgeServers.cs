@@ -360,9 +360,9 @@ internal static class BattleEdgeDefaults
     {
         switch (op)
         {
-            case BattleOps.JoinBattle:
+            case TestOps.JoinBattle:
                 return JoinBattleReply;
-            case BattleOps.SyncFrames:
+            case TestOps.SyncFrames:
                 return SyncFramesReply;
             default:
                 return "{}";

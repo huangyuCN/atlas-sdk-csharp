@@ -41,6 +41,15 @@ public sealed class BattleSessionEndedTest
             InvokeTimeoutMs = 3000,
             BackoffBaseMs = 50,
             BackoffMaxMs = 200,
+            // 保活探针显式配置（SDK 不再内建 PingReq 探针）：本文件的「停表」断言才有意义。
+            ProbeOp = TestOps.Ping,
+            ProbePayload = TestWire.Probe("b-1"),
+            // 重连重放显式配置（SDK 不再内建 JoinBattle + SyncFrames 重放）：入局 + 按基准补帧。
+            Replay = new[]
+            {
+                new ReplayStep(TestOps.JoinBattle, _ => TestWire.Join("b-1")),
+                new ReplayStep(TestOps.SyncFrames, lastSeen => TestWire.Sync("b-1", lastSeen)),
+            },
         };
     }
 
@@ -92,7 +101,7 @@ public sealed class BattleSessionEndedTest
         var session = FakeSession(transport, options);
         await session.ConnectAsync();
 
-        var call = session.SendFrameInputAsync(1, new byte[] { 0x01 });
+        var call = session.InvokeAsync(TestOps.SendFrameInput, TestWire.Input("b-1", 1, new byte[] { 0x01 }));
         await transport.WaitForWritesAsync(1);
         transport.QueueBusinessError(
             transport.WrittenHeaders[0].Seq, 409, DirectErrors.BattleEndedReason, "对局已结束");
@@ -121,7 +130,7 @@ public sealed class BattleSessionEndedTest
         var transport = new BattleFakeTransport();
         var session = FakeSession(transport, Options());
         await session.ConnectAsync();
-        var call = session.JoinBattleAsync();
+        var call = session.InvokeAsync(TestOps.JoinBattle, TestWire.Join("b-1"));
         await transport.WaitForWritesAsync(1);
         transport.QueueBusinessError(
             transport.WrittenHeaders[0].Seq, 409, DirectErrors.BattleEndedReason, "对局已结束");
@@ -129,16 +138,16 @@ public sealed class BattleSessionEndedTest
         var writes = transport.WrittenCount;
 
         await Assert.ThrowsAsync<BattleEndedException>(
-            () => session.SendFrameInputAsync(2, new byte[] { 0x02 }));
-        await Assert.ThrowsAsync<BattleEndedException>(() => session.SyncFramesAsync(1));
-        await Assert.ThrowsAsync<BattleEndedException>(() => session.JoinBattleAsync());
+            () => session.InvokeAsync(TestOps.SendFrameInput, TestWire.Input("b-1", 2, new byte[] { 0x02 })));
+        await Assert.ThrowsAsync<BattleEndedException>(() => session.InvokeAsync(TestOps.SyncFrames, TestWire.Sync("b-1", 1)));
+        await Assert.ThrowsAsync<BattleEndedException>(() => session.InvokeAsync(TestOps.JoinBattle, TestWire.Join("b-1")));
         await Assert.ThrowsAsync<BattleEndedException>(() => session.ReconnectAsync());
         await Assert.ThrowsAsync<BattleEndedException>(() => session.ConnectAsync());
 
         // 明确异常（不是静默丢弃、不是空等超时），且一条都没写到线上。
         Assert.Equal(writes, transport.WrittenCount);
         var thrown = await Assert.ThrowsAsync<BattleEndedException>(
-            () => session.SendFrameInputAsync(3, new byte[] { 0x03 }));
+            () => session.InvokeAsync(TestOps.SendFrameInput, TestWire.Input("b-1", 3, new byte[] { 0x03 })));
         Assert.Equal(DirectErrors.BattleEndedReason, thrown.Reason);
         Assert.Contains(DirectErrors.SessionEnded, thrown.Message, StringComparison.Ordinal);
         await session.CloseAsync();
@@ -161,27 +170,27 @@ public sealed class BattleSessionEndedTest
         });
         var session = FakeSession(transport, options);
         var events = new List<BattlePush>();
-        session.BattleEnd += push =>
+        session.OnPush(TestOps.BattleEndNotify, push =>
         {
             lock (events)
             {
                 events.Add(push);
             }
-        };
+        });
         await session.ConnectAsync();
 
         var payload = EndPayload("p-1");
-        transport.QueueNotify(BattleOps.BattleEndNotify, payload);
+        transport.QueueNotify(TestOps.BattleEndNotify, payload);
         Assert.True(await WaitUntilAsync(() => Count(events) == 1), "首个结束通知应触发一次事件");
 
         // 服务端有界补投（关闭前重投 + 重连补投，最多每人 5 次）：重复到达不再触发事件。
-        transport.QueueNotify(BattleOps.BattleEndNotify, payload);
-        transport.QueueNotify(BattleOps.BattleEndNotify, payload);
+        transport.QueueNotify(TestOps.BattleEndNotify, payload);
+        transport.QueueNotify(TestOps.BattleEndNotify, payload);
         await Task.Delay(150);
 
         Assert.Equal(1, Count(events));
         Assert.Equal(payload, events[0].Payload);
-        Assert.Equal(BattleOps.BattleEndNotify, events[0].Op);
+        Assert.Equal(TestOps.BattleEndNotify, events[0].Op);
         Assert.True(session.HasEnded);
         Assert.Equal(DirectErrors.BattleEndNotifyReason, session.EndedReason);
         Assert.DoesNotContain(logs, line => line.Contains("mismatch", StringComparison.Ordinal));
@@ -205,19 +214,19 @@ public sealed class BattleSessionEndedTest
         });
         var session = FakeSession(transport, options);
         var events = new List<BattlePush>();
-        session.BattleEnd += push =>
+        session.OnPush(TestOps.BattleEndNotify, push =>
         {
             lock (events)
             {
                 events.Add(push);
             }
-        };
+        });
         await session.ConnectAsync();
 
         var first = EndPayload("p-1");
-        transport.QueueNotify(BattleOps.BattleEndNotify, first);
+        transport.QueueNotify(TestOps.BattleEndNotify, first);
         Assert.True(await WaitUntilAsync(() => Count(events) == 1), "首个结束通知应触发一次事件");
-        transport.QueueNotify(BattleOps.BattleEndNotify, EndPayload("p-2"));
+        transport.QueueNotify(TestOps.BattleEndNotify, EndPayload("p-2"));
         Assert.True(
             await WaitUntilAsync(() => logs.Any(line => line.Contains("mismatch", StringComparison.Ordinal))),
             "载荷不一致应记 Warn（排障可见）");
@@ -236,16 +245,16 @@ public sealed class BattleSessionEndedTest
         options.EndDrainWindow = TimeSpan.FromMilliseconds(300);
         var session = FakeSession(transport, options);
         var events = new List<BattlePush>();
-        session.BattleEnd += push =>
+        session.OnPush(TestOps.BattleEndNotify, push =>
         {
             lock (events)
             {
                 events.Add(push);
             }
-        };
+        });
         await session.ConnectAsync();
 
-        var call = session.SendFrameInputAsync(1, new byte[] { 0x01 });
+        var call = session.InvokeAsync(TestOps.SendFrameInput, TestWire.Input("b-1", 1, new byte[] { 0x01 }));
         await transport.WaitForWritesAsync(1);
         transport.QueueBusinessError(
             transport.WrittenHeaders[0].Seq, 409, DirectErrors.BattleEndedReason, "对局已结束");
@@ -253,9 +262,9 @@ public sealed class BattleSessionEndedTest
         Assert.Equal(DirectErrors.BattleEndedReason, session.EndedReason); // 首个结束信号为准。
 
         var payload = EndPayload("p-1");
-        transport.QueueNotify(BattleOps.BattleEndNotify, payload);
+        transport.QueueNotify(TestOps.BattleEndNotify, payload);
         Assert.True(await WaitUntilAsync(() => Count(events) == 1), "拒绝先到时也应补触发一次 BattleEnd");
-        transport.QueueNotify(BattleOps.BattleEndNotify, payload);
+        transport.QueueNotify(TestOps.BattleEndNotify, payload);
         await Task.Delay(150);
 
         Assert.Equal(1, Count(events));
@@ -269,7 +278,7 @@ public sealed class BattleSessionEndedTest
     public async Task Heartbeat_BattleEndedRejection_EntersTerminalState_AndStopsProbe()
     {
         await using var server = new BattleEdgeUdpServer();
-        server.FailWith(BattleOps.Ping, 409, DirectErrors.BattleEndedReason, "对局已结束");
+        server.FailWith(TestOps.Ping, 409, DirectErrors.BattleEndedReason, "对局已结束");
         var options = Options();
         options.HeartbeatInterval = TimeSpan.FromMilliseconds(100);
         await using var session = BattleSession.Create(Plan(server.Port), options);
@@ -281,14 +290,14 @@ public sealed class BattleSessionEndedTest
         Assert.Equal(DirectErrors.BattleEndedReason, session.EndedReason);
 
         await Task.Delay(200); // 排空结束瞬间在途的一拍。
-        var pings = server.RequestsOf(BattleOps.Ping).Length;
+        var pings = server.RequestsOf(TestOps.Ping).Length;
         await Task.Delay(400); // ≥ 3 个心跳周期。
-        Assert.Equal(pings, server.RequestsOf(BattleOps.Ping).Length); // 停表：不再发探针。
+        Assert.Equal(pings, server.RequestsOf(TestOps.Ping).Length); // 停表：不再发探针。
         Assert.Equal(0, Volatile.Read(ref failures)); // 终态不是链路失败，不误报保活质量。
 
         await Assert.ThrowsAsync<BattleEndedException>(
-            () => session.SendFrameInputAsync(1, new byte[] { 0x01 }));
-        Assert.Empty(server.RequestsOf(BattleOps.SendFrameInput)); // 零写入（服务端视角）。
+            () => session.InvokeAsync(TestOps.SendFrameInput, TestWire.Input("b-1", 1, new byte[] { 0x01 })));
+        Assert.Empty(server.RequestsOf(TestOps.SendFrameInput)); // 零写入（服务端视角）。
     }
 
     // 重连补投期判定该局已结束（服务端先补投留档结果、再以 BATTLE_ENDED 拒绝重新入局）：
@@ -346,7 +355,7 @@ public sealed class BattleSessionEndedTest
         await session.ConnectAsync();
         Assert.Equal(1, Volatile.Read(ref dials)); // 首连一次。
 
-        transport.QueueNotify(BattleOps.BattleEndNotify, EndPayload("p-1"));
+        transport.QueueNotify(TestOps.BattleEndNotify, EndPayload("p-1"));
         Assert.True(await WaitUntilAsync(() => session.HasEnded), "结束通知应进入终态");
         await transport.CloseAsync(); // 服务端结算后关连接：读循环退出 → 自动重连被终态拒绝。
         await Task.Delay(400); // ≥ 数个退避周期。
@@ -365,15 +374,15 @@ public sealed class BattleSessionEndedTest
         options.EndDrainWindow = TimeSpan.FromMilliseconds(500);
         var session = FakeSession(transport, options);
         var broadcasts = 0;
-        session.FrameBroadcast += _ => Interlocked.Increment(ref broadcasts);
+        session.OnPush(TestOps.FrameBroadcast, _ => Interlocked.Increment(ref broadcasts));
         await session.ConnectAsync();
 
-        transport.QueueNotify(BattleOps.BattleEndNotify, EndPayload("p-1"));
+        transport.QueueNotify(TestOps.BattleEndNotify, EndPayload("p-1"));
         Assert.True(await WaitUntilAsync(() => session.HasEnded), "结束通知应进入终态");
         Assert.Equal(ClientState.Connected, session.State); // 窗口内不立即断：收尾随推送与在途回执。
 
         transport.QueueNotify(
-            BattleOps.FrameBroadcast, Encoding.UTF8.GetBytes("{\"frame\":{\"frameId\":\"9\"}}"));
+            TestOps.FrameBroadcast, Encoding.UTF8.GetBytes("{\"frame\":{\"frameId\":\"9\"}}"));
         Assert.True(await WaitUntilAsync(() => Volatile.Read(ref broadcasts) == 1), "窗口内尾随推送应仍分发");
 
         Assert.True(
@@ -391,7 +400,7 @@ public sealed class BattleSessionEndedTest
         options.EndDrainWindow = TimeSpan.FromSeconds(10); // 远长于断言窗口：CloseAsync 必须主动取消。
         var session = FakeSession(transport, options);
         await session.ConnectAsync();
-        transport.QueueNotify(BattleOps.BattleEndNotify, EndPayload("p-1"));
+        transport.QueueNotify(TestOps.BattleEndNotify, EndPayload("p-1"));
         Assert.True(await WaitUntilAsync(() => session.HasEnded), "结束通知应进入终态");
 
         var watch = Stopwatch.StartNew();

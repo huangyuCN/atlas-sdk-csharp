@@ -86,13 +86,13 @@ public sealed class BattleSessionTerminalTest
         };
         await session.ConnectAsync();
 
-        var first = session.SendFrameInputAsync(1, new byte[] { 0x01 });
+        var first = session.InvokeAsync(TestOps.SendFrameInput, TestWire.Input("b-1", 1, new byte[] { 0x01 }));
         Assert.True(await enteredWrite.Task.WaitAsync(TimeSpan.FromSeconds(3)), "第一笔写应进入写锁");
-        var second = session.SendFrameInputAsync(2, new byte[] { 0x02 });
+        var second = session.InvokeAsync(TestOps.SendFrameInput, TestWire.Input("b-1", 2, new byte[] { 0x02 }));
         await Task.Delay(50); // 第二笔已组帧并排在写锁之外（竞态窗口就位）。
 
         // 终态在「第二笔已组帧、尚未上线」的窗口内到达（结束通知走推送路径）。
-        transport.QueueNotify(BattleOps.BattleEndNotify, EndPayload("p-1"));
+        transport.QueueNotify(TestOps.BattleEndNotify, EndPayload("p-1"));
         Assert.True(await WaitUntilAsync(() => session.HasEnded), "结束通知应进入终态");
 
         releaseWrite.TrySetResult(true);
@@ -117,10 +117,10 @@ public sealed class BattleSessionTerminalTest
         await session.ConnectAsync();
 
         // 入局请求已写出、服务端不回执（在途）。
-        var call = session.JoinBattleAsync();
+        var call = session.InvokeAsync(TestOps.JoinBattle, TestWire.Join("b-1"));
         await transport.WaitForWritesAsync(1);
 
-        transport.QueueNotify(BattleOps.BattleEndNotify, EndPayload("p-1"));
+        transport.QueueNotify(TestOps.BattleEndNotify, EndPayload("p-1"));
         var exception = await Assert.ThrowsAsync<BusinessException>(
             () => call.WaitAsync(TimeSpan.FromSeconds(2)));
 
@@ -141,13 +141,13 @@ public sealed class BattleSessionTerminalTest
         var session = FakeSession(transport, Options());
         await session.ConnectAsync();
 
-        transport.QueueNotify(BattleOps.BattleEndNotify, EndPayload("p-1"));
+        transport.QueueNotify(TestOps.BattleEndNotify, EndPayload("p-1"));
         Assert.True(await WaitUntilAsync(() => session.HasEnded), "结束通知应进入终态");
         var writes = transport.WrittenCount;
 
-        await Assert.ThrowsAsync<BattleEndedException>(() => session.JoinBattleAsync());
+        await Assert.ThrowsAsync<BattleEndedException>(() => session.InvokeAsync(TestOps.JoinBattle, TestWire.Join("b-1")));
         await Assert.ThrowsAsync<BattleEndedException>(
-            () => session.SendFrameInputAsync(1, new byte[] { 0x01 }));
+            () => session.InvokeAsync(TestOps.SendFrameInput, TestWire.Input("b-1", 1, new byte[] { 0x01 })));
         Assert.Equal(writes, transport.WrittenCount);
         await session.CloseAsync();
     }

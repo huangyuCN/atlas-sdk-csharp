@@ -41,6 +41,9 @@ public sealed class BattleSessionHeartbeatRejectTest
             BackoffBaseMs = 30,
             BackoffMaxMs = 100,
             HeartbeatInterval = interval,
+            // 保活探针显式配置（SDK 不再内建 PingReq 探针）。
+            ProbeOp = TestOps.Ping,
+            ProbePayload = TestWire.Probe("b-1"),
         };
     }
 
@@ -60,7 +63,7 @@ public sealed class BattleSessionHeartbeatRejectTest
 
     private static int PingCount(BattleEdgeUdpServer server)
     {
-        return server.RequestsOf(BattleOps.Ping).Length;
+        return server.RequestsOf(TestOps.Ping).Length;
     }
 
     // 终态类拒绝（入局被拒/目标失配）：探针一拍即入终态并上报 Failed 一次，探针停发。
@@ -71,7 +74,7 @@ public sealed class BattleSessionHeartbeatRejectTest
     public async Task Heartbeat_TerminalClassRejection_TerminalizesAndReportsFailedOnce(int code, string reason)
     {
         await using var server = new BattleEdgeUdpServer();
-        server.FailWith(BattleOps.Ping, code, reason, "探针被拒");
+        server.FailWith(TestOps.Ping, code, reason, "探针被拒");
         await using var session = BattleSession.Create(
             Plan(server.Port), Options(TimeSpan.FromMilliseconds(80)));
         var failures = 0;
@@ -95,7 +98,7 @@ public sealed class BattleSessionHeartbeatRejectTest
     public async Task Heartbeat_TicketRejection_NotTerminal_ReportsOnceAndKeepsProbing()
     {
         await using var server = new BattleEdgeUdpServer();
-        server.FailWith(BattleOps.Ping, 401, DirectErrors.TicketExpiredReason, "票据已过期");
+        server.FailWith(TestOps.Ping, 401, DirectErrors.TicketExpiredReason, "票据已过期");
         var options = Options(TimeSpan.FromMilliseconds(80));
         var logs = new List<string>();
         options.Logger = SDKLoggerFactory.Of(LogLevel.Warn, line =>
@@ -134,7 +137,7 @@ public sealed class BattleSessionHeartbeatRejectTest
     public async Task Heartbeat_OtherBusinessRejection_CountsAndContinuesProbing_WithoutLogStorm()
     {
         await using var server = new BattleEdgeUdpServer();
-        server.FailWith(BattleOps.Ping, 500, "INTERNAL", "探针失败");
+        server.FailWith(TestOps.Ping, 500, "INTERNAL", "探针失败");
         var options = Options(TimeSpan.FromMilliseconds(80));
         var logs = new List<string>();
         options.Logger = SDKLoggerFactory.Of(LogLevel.Warn, line =>
@@ -161,8 +164,8 @@ public sealed class BattleSessionHeartbeatRejectTest
         }
 
         // 会话仍可用：探针被拒不等于链路故障（正常发帧不受影响）。
-        var reply = await session.SendFrameInputAsync(1, new byte[] { 0x01 });
-        Assert.Equal(BattleEdgeDefaults.ReplyJson(BattleOps.SendFrameInput), System.Text.Encoding.UTF8.GetString(reply));
+        var reply = await session.InvokeAsync(TestOps.SendFrameInput, TestWire.Input("b-1", 1, new byte[] { 0x01 }));
+        Assert.Equal(BattleEdgeDefaults.ReplyJson(TestOps.SendFrameInput), System.Text.Encoding.UTF8.GetString(reply));
         Assert.Equal(ClientState.Connected, session.State);
         Assert.False(session.HasFailed);
     }

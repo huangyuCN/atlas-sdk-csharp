@@ -10,8 +10,9 @@ namespace Atlas.Battle;
 //   1. 终态：首个结束信号置 HasEnded（可判定），此后发帧/补帧/入局/重连一律
 //      BattleEndedException（明确异常，检查在最前、不写线）；
 //   2. 停表：停直连保活心跳（终态后不再发 Ping——服务端也会以 BATTLE_ENDED 拒绝迟到探针）；
-//   3. 补投幂等：同一局结束通知重复到达（服务端有界补投：每玩家 ≤5 次 + 重连补投）只触发
-//      一次 BattleEnd 事件，首个载荷为准，载荷不一致只记 Warn（不重发事件、不改写已交付结果）；
+//   3. 补投幂等：同一局结束通知重复到达（服务端有界补投：每玩家 ≤5 次 + 重连补投）只**首投**
+//      从统一出口分发一次（补投只比对/计数），首个载荷经 EndNotifyPayload 留档，载荷不一致
+//      只记 Warn（不重放分发、不改写已交付结果）；空载荷不臆造结束语义（不进终态、不分发）；
 //   4. 收尾窗口：结束后保留 EndDrainWindow 收尾随推送与在途回执，到点自动关连接（停重连）；
 //      CloseAsync 取消窗口并 await 收尾任务退出，不留悬挂定时器。
 public sealed partial class BattleSession
@@ -25,7 +26,7 @@ public sealed partial class BattleSession
     // _endedReason 是触发终态的结束信号来源（见 EndedReason）。
     private string? _endedReason;
 
-    // _endNotified 是结束通知事件的一次性闩（0/1）：重复投递不再触发事件。
+    // _endNotified 是结束通知首投的一次性闩（0/1）：重复投递不再从统一出口分发。
     private int _endNotified;
 
     // _endPayload 是首个结束通知载荷（重复投递据此比对，不被改写）。
@@ -73,27 +74,52 @@ public sealed partial class BattleSession
             reason, $"{DirectErrors.SessionEnded}（{reason}）：不再发送帧输入/补帧/心跳");
     }
 
-    // OnBattleEnd 分发战斗结束推送（幂等）：首个结束通知进入终态并触发一次 BattleEnd 事件；
-    // 重复投递（服务端关闭前重投 + 重连补投）只比对载荷——不一致记 Warn，专用事件不重发、
-    // 首个载荷不被改写（同一局只有一个结算结果，重复投递不得让上层看到两份）；
-    // 统一出口（Push 事件 + OnPush 订阅）对每次投递都可见——观测面不该被幂等去重掉。
+    // OnBattleEnd 收口战斗结束推送（幂等）：首投进入终态并从统一出口分发一次；补投（服务端
+    // 关闭前重投 + 重连补投）只比对载荷——不一致记 Warn，不重放分发、首个载荷不被改写
+    //（同一局只有一个结算结果，重复投递不得让上层看到两份）；空载荷不进终态、不分发
+    //（不臆造结束语义，由游戏侧协议包解码时兜底）。
     private void OnBattleEnd(string op, byte[] payload, byte version)
     {
-        EnterEnded(DirectErrors.BattleEndNotifyReason);
-        var first = Interlocked.CompareExchange(ref _endNotified, 1, 0) == 0;
-        if (first)
+        if (!NoteEndNotify(payload))
         {
-            Volatile.Write(ref _endPayload, payload);
+            return;
         }
-        else
+        EnterEnded(DirectErrors.BattleEndNotifyReason);
+        DispatchPush(new BattlePush(op, payload, version));
+    }
+
+    // NoteEndNotify 登记一条结束通知：返回 true = 首投（应进终态并分发）。
+    // 空载荷返回 false（不臆造结束语义）；补投只比对载荷、不覆盖首投。
+    private bool NoteEndNotify(byte[] payload)
+    {
+        if (payload.Length == 0)
+        {
+            return false;
+        }
+        if (Interlocked.CompareExchange(ref _endNotified, 1, 0) != 0)
         {
             NoteEndReplay(payload);
+            return false;
         }
-        var push = new BattlePush(op, payload, version);
-        DispatchPush(push);
-        if (first)
+        Volatile.Write(ref _endPayload, payload);
+        return true;
+    }
+
+    // EndNotifyPayload 返回首条结算结束通知的**原始载荷副本**（未收到通知返回 null）。
+    // 迟到订阅者用它在注册回调之前取结果：分发只随首投触发一次，补投不重放。
+    // 载荷按帧头版本编码（ver=1 protojson / ver=2 protobuf），由游戏侧协议包解码——SDK 不预解。
+    public byte[]? EndNotifyPayload
+    {
+        get
         {
-            InvokePushHandler(BattleEnd, push);
+            var raw = Volatile.Read(ref _endPayload);
+            if (raw == null)
+            {
+                return null;
+            }
+            var copy = new byte[raw.Length];
+            Array.Copy(raw, copy, raw.Length);
+            return copy;
         }
     }
 
@@ -107,7 +133,7 @@ public sealed partial class BattleSession
             return;
         }
         _logger.Warnf("battle end notify payload mismatch op={0} first={1}B replay={2}B",
-            BattleOps.BattleEndNotify, first?.Length ?? 0, payload.Length);
+            WireOps.BattleEndNotify, first?.Length ?? 0, payload.Length);
     }
 
     // StartEndDrain 启动收尾窗口（首个结束信号触发一次，重复信号不延长——否则补投风暴
@@ -116,8 +142,10 @@ public sealed partial class BattleSession
     {
         lock (_drainGate)
         {
-            if (_drainTask != null)
+            if (_drainTask != null || Volatile.Read(ref _closed) != 0)
             {
+                // 已在跑，或 CloseAsync 已抢先把关闭置位（此时起窗口只会白等一整窗：
+                // CancelEndDrain 早于本方法执行过，取消令牌对后来创建的任务无效）。
                 return;
             }
             var cts = new CancellationTokenSource();

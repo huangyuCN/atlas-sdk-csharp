@@ -42,8 +42,10 @@ Atlas 帧协议的 C# 客户端 SDK（**Unity 优先**）。用于游戏客户�
   失败整体回滚。
 - **战斗直连（阶段 3 标准形态）**：`BattleSession` 凭成局推送的「接入层地址 + 战斗
   票据」直连接入层（WS/KCP/UDP 三面，逐帧带票），战斗帧**不经网关**；统一推送出口
-  （`Push` 事件 + `OnPush` 订阅 + `FrameBroadcast`/`BattleEnd`/`PlayerOut` 专用事件）、
-  终态语义（对局结束 / 不可重试失败）与只读观测（`Stats`）齐备——见「战斗直连」一节。
+  （`Push` 事件 + `OnPush` 按 op 订阅，载荷与帧头版本原样透传）、终态语义（对局结束 /
+  不可重试失败）与只读观测（`Stats`）齐备——见「战斗直连」一节。
+  **游戏域消息不在本 SDK**：battle/game/matcher 的 DTO 与 op 表由游戏协议包
+  （NuGet `HuangyuCN.AtlasGame.Protocol`）提供，SDK 只留传输/会话与契约消息。
 - **请求-响应匹配**：`seq` 单调递增 + 按连接代次（epoch）隔离匹配；超时、迟到
   响应静默丢弃、断连统一失败——全部路径恰好一次投递（含排队看护、drain 重发
   的 CAS 认领互斥）。
@@ -99,8 +101,8 @@ Google.Protobuf、KcpSharp 等依赖。
 
 ### 生成物来源（模板仓 descriptor set）
 
-本 SDK **不携带任何手写协议副本**：帧常量、会话 stub/DTO 全部由生成脚本从
-**模板仓**（`atlas-game-layout`）导出的 descriptor set 生成：
+本 SDK **不携带任何手写协议副本**：帧常量、会话 stub/DTO 与契约消息全部由生成脚本从
+**模板仓**（`atlas-game-layout`）与**框架仓**（`atlas`）导出的 descriptor set 生成：
 
 ```bash
 ATLAS_LAYOUT_DIR=../atlas-game-layout ATLAS_DIR=../atlas bash scripts/gen-dto.sh
@@ -111,9 +113,12 @@ ATLAS_LAYOUT_DIR=../atlas-game-layout ATLAS_DIR=../atlas bash scripts/gen-dto.sh
 | 产物 | 生成方式 | 用途 |
 |------|----------|------|
 | `src/Atlas/Frame/Gen/FrameGen.cs` | 复制框架 `transport/frame/gen/csharp/FrameGen.cs` | 帧协议常量（单一来源） |
-| `examples/Smoke/Proto/gen/imessage/*.cs` | `--csharp_out`（`IMessage`） | ver=2 protobuf 二进制路径 |
+| `examples/Smoke/Proto/gen/imessage/*.cs` | `--csharp_out`（`IMessage`） | ver=2 protobuf 二进制路径；**只含契约消息**（session / common / lockstep / route） |
 | `examples/Smoke/Proto/gen/api/**/opclient/*.client.g.cs` | `--atlas-client_out`（POCO + 强类型 stub + 协议描述符） | ver=1 protojson 路径、会话 op 与提取器 |
-| `src/Atlas/Battle/Gen/*.g.cs` | 从 `--atlas-client_out` 产物抽取 `ProtocolOps`/`PushOps` 常量类 | 战斗域请求 op 与推送 op 常量（SDK 侧零手写 op 字面量） |
+
+> **游戏域消息不在生成清单里**：battle/game/matcher 的 DTO 与 op 表由游戏协议包
+> （模板仓 `protocol/`，NuGet `HuangyuCN.AtlasGame.Protocol`）独立发布；本脚本的产出
+> 就是「契约消息」的边界（边界守卫用例会拦住往里加游戏域生成项的改动）。
 
 > **序列化经插槽注入**：生成的 stub 构造为 `(IAtlasInvoker inv, ISerializer ser)`，
 > DTO ↔ payload 一律走 `ISerializer.Serialize(object)` / `Deserialize(byte[], Type)`，
@@ -151,8 +156,7 @@ using System.Threading.Tasks;
 using Atlas.Client;
 using Atlas.Serialization;
 using Atlas.Transport;
-using Atlas.Gateway.V1;   // 生成物命名空间（模板 descriptor set 生成）
-using Atlas.Battle.V1;    // 同上：战斗域 stub
+using Atlas.Gateway.V1;   // 契约消息生成物命名空间（模板 descriptor set 生成）
 
 // 1) 拨号：构造 Channel（dial 工厂 + 选项），Connect 后即可收发。
 var channel = new Channel(
@@ -178,10 +182,11 @@ session.Bind(channel);                              // Channel 即 IAtlasInvoker
 var creds = await session.LoginAsync(ct, new LoginRequest { PlayerId = "p1", Password = "***" });
 Console.WriteLine($"登录成功: {creds.PlayerId}");
 
-// 4) 业务 op：用生成的强类型 stub（构造注入 IAtlasInvoker + ISerializer）；
-//    DTO 与 op 名均来自生成物，编解码走插槽，无 System.Text.Json 直调。
-var battle = new BattleService(channel, new JsonSerializer());
-var joined = await battle.JoinBattleAsync(new JoinBattleReq { BattleId = "b-1" });
+// 4) 业务 op：op 名与载荷由调用方给出（会话协议的 op 常量来自生成物；
+//    游戏域 op 用游戏协议包的常量与 DTO，SDK 不持这些类型）。
+var reply = await channel.InvokeRawAsync(
+    Atlas.Gateway.V1.SessionProtocolOps.Heartbeat,
+    new JsonSerializer().Serialize(new HeartbeatRequest { Ts = 1 }), ct);
 
 // 5) 优雅关闭（取消 in-flight、停心跳与读循环；幂等）。
 await channel.CloseAsync();
@@ -216,7 +221,7 @@ var client = new AtlasClient(
         KcpTransport.ConnectAsync("127.0.0.1", 9003, ct))
     {
         Options = new ChannelOptions { InvokeTimeoutMs = 1_000 }, // 战斗短超时
-        ReconnectHook = async () => await JoinBattleAsync(),      // 战斗重绑
+        ReconnectHook = async () => await RejoinBattleAsync(),    // 战斗重绑（调用方用协议包重放入局）
     });
 await client.ConnectAsync(CancellationToken.None);
 
@@ -242,17 +247,19 @@ var session = BattleSession.Create(plan, new BattleSessionOptions
 {
     PreferredTransport = EdgeTransport.Ws,   // 缺省优先级 ws → kcp → udp
 });
-// 3) 直连（hello 换票）→ 入局 → 补帧。
+// 3) 直连（hello 换票）→ 业务 op（op 常量与 DTO 来自游戏协议包；这里用裸字节示意）。
 await session.ConnectAsync(ct);
-await session.JoinBattleAsync();
-await session.SyncFramesAsync(session.LastSeenFrame);
+await session.InvokeAsync(GameOps.JoinBattle, GameWire.Join(plan.BattleId), ct);
+await session.InvokeAsync(GameOps.SendFrameInput, GameWire.Input(plan.BattleId, 1, step), ct);
+await session.InvokeAsync(GameOps.SyncFrames, GameWire.Sync(plan.BattleId, session.LastSeenFrame), ct);
 
-// 4) 统一推送出口：Push 事件（含未预设 op）+ OnPush 按 op 订阅 + 专用事件。
-session.Push += push => CountPush(push.Op, push.Version);              // 全部推送
-session.FrameBroadcast += push => TrackFrame(push.Payload, push.Version); // 帧广播（ver=1 自动推进 LastSeenFrame）
-session.BattleEnd += push => ShowResult(push.Payload);                 // 结算（同一局只触发一次）
-session.PlayerOut += push => ShowPlayerOut(push.Payload);              // 玩家出局
-using var off = session.OnPush(BattleOps.PlayerOutNotify, push => Log(push.Payload));
+// 4) 统一推送出口：Push 事件（含未预设 op）+ OnPush 按 op 订阅（载荷 + 帧头版本原样透传）。
+session.Push += push => CountPush(push.Op, push.Version);            // 全部推送
+using var frameSub = session.OnPush(GameOps.FrameBroadcast,
+    push => TrackFrame(push.Payload, push.Version));                 // 帧广播（帧号由 FrameNumberOf 钩子推进）
+using var endSub = session.OnPush(GameOps.BattleEndNotify,
+    push => ShowResult(push.Payload));                               // 结算（首投分发一次）
+var result = session.EndNotifyPayload;                               // 迟到订阅者直接取首投载荷副本
 
 // 5) 收尾（幂等）：停探针、取消收尾窗口、结算在途请求、关连接。
 await session.CloseAsync();
@@ -264,9 +271,9 @@ await session.CloseAsync();
 |------|------|
 | 面选择 | 只用成局通知下发的面与地址；优先面缺失或与支持集无交集 → `ProtocolException`（不猜端口、不静默换面） |
 | 逐帧带票 | 三面统一在帧会话槽携带 base64url 票（`ForceFrameSessionSlot`）：WS 长连接也逐帧带票（接入层透传后帧面按帧槽验票） |
-| 保活 | 无输入期间按 `HeartbeatInterval`（缺省 2s）发 `battle.v1.BattleService/Ping`（Tell），维持帧面活跃 |
-| 断线恢复 | 自动重连（退避）或显式 `ReconnectAsync`；重连后重新 `JoinBattle` + `SyncFrames(LastSeenFrame)` 补帧；并发 `ReconnectAsync` 单飞（只重连一轮） |
-| 载荷编码版本 | 推送把 `(payload, version)` 原样交给调用方：ver=1 为 protojson、ver=2 为 protobuf **二进制**（SDK 不预解游戏消息，由游戏侧生成包按版本解码）。补帧基准：ver=1 恒用内建解析；ver≠1 须注入 `BattleSessionOptions.FrameNumberOf`，未注入即**不推进、也不报错**。请求/响应版本白名单 `{1,2}` 且须与会话载荷编码一致（`Serializer`，缺省 ver=1），未知版本/失配一律明确抛 `ProtocolException`。边界：内置便捷载荷与保活探针仍按 protojson 组装，ver=2 目前只有 raw 载荷重载能带二进制（补帧/探针待契约 DTO 生成后整体切换） |
+| 保活 | 无输入期间按 `HeartbeatInterval`（缺省 2s）发 `ProbeOp/ProbePayload` 配置的探针（Tell）；**不配置则一个字节都不发**（SDK 不持游戏域消息，不裸空探） |
+| 断线恢复 | 自动重连（退避）或显式 `ReconnectAsync`；重连后按 `Replay` 配置的步骤重放（通常是入局 + 按 `LastSeenFrame` 补帧，载荷由游戏侧用协议包构造）；**不配置则不重放**；并发 `ReconnectAsync` 单飞（只重连一轮） |
+| 载荷编码版本 | 推送把 `(payload, version)` 原样交给调用方：ver=1 为 protojson、ver=2 为 protobuf **二进制**（SDK 不预解游戏消息，由游戏侧协议包按版本解码）。补帧基准：**任何版本**都只由 `BattleSessionOptions.FrameNumberOf` 钩子推进，未注入即**不推进、也不报错**（`LastSeenFrame` 恒 0，补帧退化为全量）。请求/响应版本白名单 `{1,2}` 且须与会话载荷编码一致（`Serializer`，缺省 ver=1），未知版本/失配一律明确抛 `ProtocolException`。边界：SDK 不再组装任何游戏域载荷，`InvokeAsync` 的裸字节与 `Probe`/`Replay` 的预编码字节都按会话版本原样上线 |
 | 重试有界 | 重连钩子连续失败到 `HookMaxAttempts`（缺省 10）即终止重连并上报 `Failed`（不无限退避重拨） |
 | 终态·对局结束 | `BATTLE_ENDED`（409）拒绝或结算结束通知 → `HasEnded`：停发一切上发（含探针），收尾窗口内继续收尾随推送 |
 | 终态·不可重试失败 | `BATTLE_NOT_FOUND`(404)、`BATTLE_FULL`(409)、`FRAME_TARGET_MISMATCH`(403)、`INVALID_PARAMS`、票类拒绝 → `HasFailed`：`Failed` 上报一次、不再重连、后续调用本地拒绝 |
@@ -276,15 +283,20 @@ await session.CloseAsync();
 | 可观测 | `session.Stats`：拨号尝试/失败、握手失败、重连轮次、钩子失败、心跳送达/失败/被拒/票类被拒（只读快照，零依赖） |
 
 终态语义分工（三 SDK 一致）：`HasEnded`（`BATTLE_ENDED` 拒绝或结算推送）表示**对局正常
-结束、有结算可展示**（读 `BattleEnd` 事件/推送载荷）；`HasFailed`（`BATTLE_NOT_FOUND`/
+结束、有结算可展示**（读结束通知推送 + `EndNotifyPayload`）；`HasFailed`（`BATTLE_NOT_FOUND`/
 `BATTLE_FULL`/`FRAME_TARGET_MISMATCH`/`INVALID_PARAMS`/票类）表示**无结算可展示的终态拒绝**
 （读 `Failed` 事件/`FailureCause`）——两者**互不置位**：入局被拒不是「结束」，上层不该去取
 不存在的结算。
 
-op 常量全部取自生成物（`src/Atlas/Battle/Gen/*.g.cs`，由 `scripts/gen-dto.sh` 从
-插件产物抽取）：`BattleOps.JoinBattle/SendFrameInput/SyncFrames/Ping`、
-`BattleOps.FrameBroadcast/BattleEndNotify/PlayerOutNotify/MatchStartedNotify`——
-SDK 侧不手写 op 字面量。
+op 的归属（游戏域消息迁出后的边界）：
+
+- **业务 op**（入局 / 发帧 / 补帧 / 探针 / 出局通知等）：由**游戏协议包**提供常量与 DTO，
+  调用方自行编码后经 `InvokeAsync` 发出、用协议包的 op 常量 `OnPush` 订阅；
+- **会话自身要认的两个寻址键**：帧广播（`/battle.v1.FrameBroadcast`，推进补帧基准）与
+  战斗结束通知（`/battle.v1.BattleEndNotify`，进入终态并留档首投载荷）——它们是 op 取值
+  本身即协议事实，故以内部常量固化（同 Go SDK 的 `direct.Op*` 口径），不对外导出；
+- **契约消息**（会话 / common / route / lockstep）仍由 `scripts/gen-dto.sh` 生成，
+  与游戏域生成物严格分开（边界守卫见 `tests/Atlas.Tests/Battle/BattleGameDomainBoundaryTest.cs`）。
 
 ## 编码语义（json = protojson）
 

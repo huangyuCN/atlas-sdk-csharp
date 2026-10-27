@@ -12,8 +12,8 @@ namespace Atlas.E2E;
 
 // BusinessOps 是业务链路的 op 名（模板 proto 的客户端面）：
 //   - 网关会话协议（/gateway.v1.Session/*）：网关自留接口，登录/心跳建立并续租连接绑定；
-//   - 玩家域撮合 op 与成局推送 op：本仓快照（与 BattleOps 同口径——protoc 生成物覆盖
-//     到 game 域后改为引用生成物；此处字面量以模板 proto 为准）。
+//   - 玩家域撮合 op 与成局推送 op：示例局部字面量（游戏域 op 已迁出 SDK，真实项目用
+//     游戏协议包的常量；此处以模板 proto 为准）。
 internal static class BusinessOps
 {
     public const string Register = "/gateway.v1.Session/Register";

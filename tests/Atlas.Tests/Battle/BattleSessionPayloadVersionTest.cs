@@ -16,10 +16,10 @@ namespace Atlas.Tests.Battle;
 
 // BattleSessionPayloadVersionTest 覆盖载荷编码版本（规范 §3.1 载荷编码协商）在直连战斗会话上
 // 的三条口径：
-//   ① 透传：推送把帧头 version 与原始载荷原样交给调用方（ver=2 二进制由游戏侧生成包自行解码，
+//   ① 透传：推送把帧头 version 与原始载荷原样交给调用方（ver=2 二进制由游戏协议包自行解码，
 //      SDK 不预解、也不猜编码）；
-//   ② 补帧基准：ver=1 恒走内建 protojson（注入钩子也不接管）；ver≠1 只走调用方注入的帧号钩子，
-//      未注入时不推进基准、也不报错（二进制载荷非自描述，猜编码会静默错帧）；
+//   ② 补帧基准：**任何版本**都只走调用方注入的帧号钩子（SDK 不再内建任何载荷解析），
+//      未注入时不推进基准、也不报错（载荷非自描述，猜编码会静默错帧）；
 //   ③ 请求/响应：白名单 {1,2} + 与本次会话的载荷编码一致，未知版本/失配一律明确抛协议错误；
 //      出站版本可配（缺省 ver=1），非法版本在装配期（Create）即拒绝。
 public sealed class BattleSessionPayloadVersionTest
@@ -74,37 +74,30 @@ public sealed class BattleSessionPayloadVersionTest
         return condition();
     }
 
-    // ② ver=2 推送：三个出口（专用事件 / 统一事件 / 按 op 订阅）都拿到 version=2 与逐字相同的
-    // 原始字节——SDK 只透传，不解码。
+    // ② ver=2 推送：统一出口（Push 事件 + 按 op 订阅）都拿到 version=2 与逐字相同的原始字节
+    //——SDK 只透传，不解码。游戏消息的专用事件已随游戏域消息迁出（调用方按 op 订阅）。
     [Fact]
-    public async Task FrameBroadcast_Ver2_DeliversRawPayloadAndVersionToAllExits()
+    public async Task FrameBroadcast_Ver2_DeliversRawPayloadAndVersionToUnifiedExits()
     {
         var transport = new BattleFakeTransport();
         var options = Options();
         await using var session = FakeSession(transport, options);
-        BattlePush? eventPush = null;
         BattlePush? unifiedPush = null;
         BattlePush? subscribedPush = null;
-        session.FrameBroadcast += push => Volatile.Write(ref eventPush, push);
         session.Push += push => Volatile.Write(ref unifiedPush, push);
         using var subscription = session.OnPush(
-            BattleOps.FrameBroadcast, push => Volatile.Write(ref subscribedPush, push));
+            TestOps.FrameBroadcast, push => Volatile.Write(ref subscribedPush, push));
         await session.ConnectAsync();
 
-        transport.QueueNotify(BattleOps.FrameBroadcast, Ver2Frame, FrameGen.Version2);
+        transport.QueueNotify(TestOps.FrameBroadcast, Ver2Frame, FrameGen.Version2);
 
-        // 专用事件排在统一出口之后分发：等到它就说明三个出口都已完成。
-        Assert.True(await WaitUntilAsync(() => Volatile.Read(ref eventPush) != null), "ver=2 帧广播应分发");
-        var pushes = new[]
-        {
-            Volatile.Read(ref eventPush),
-            Volatile.Read(ref unifiedPush),
-            Volatile.Read(ref subscribedPush),
-        };
-        foreach (var push in pushes)
+        Assert.True(await WaitUntilAsync(
+            () => Volatile.Read(ref unifiedPush) != null && Volatile.Read(ref subscribedPush) != null),
+            "ver=2 帧广播应分发到统一出口与订阅");
+        foreach (var push in new[] { Volatile.Read(ref unifiedPush), Volatile.Read(ref subscribedPush) })
         {
             Assert.NotNull(push);
-            Assert.Equal(BattleOps.FrameBroadcast, push!.Op);
+            Assert.Equal(TestOps.FrameBroadcast, push!.Op);
             Assert.Equal(FrameGen.Version2, push.Version); // 帧头版本原样透传。
             Assert.Equal(Ver2Frame, push.Payload); // 原始字节逐字一致（未经任何解码）。
         }
@@ -119,10 +112,10 @@ public sealed class BattleSessionPayloadVersionTest
         var transport = new BattleFakeTransport();
         await using var session = FakeSession(transport, Options());
         var signal = new TaskCompletionSource<bool>(TaskCreationOptions.RunContinuationsAsynchronously);
-        session.FrameBroadcast += _ => signal.TrySetResult(true);
+        session.OnPush(TestOps.FrameBroadcast, _ => signal.TrySetResult(true));
         await session.ConnectAsync();
 
-        transport.QueueNotify(BattleOps.FrameBroadcast, Ver2Frame, FrameGen.Version2);
+        transport.QueueNotify(TestOps.FrameBroadcast, Ver2Frame, FrameGen.Version2);
         await signal.Task.WaitAsync(TimeSpan.FromSeconds(3));
 
         Assert.Equal(0UL, session.LastSeenFrame); // 不推进（二进制载荷无从猜帧号）。
@@ -143,10 +136,10 @@ public sealed class BattleSessionPayloadVersionTest
             payload.Length == 2 && payload.Span[0] == 0x08 ? payload.Span[1] : (ulong?)null;
         await using var session = FakeSession(transport, options);
         var signal = new TaskCompletionSource<bool>(TaskCreationOptions.RunContinuationsAsynchronously);
-        session.FrameBroadcast += _ => signal.TrySetResult(true);
+        session.OnPush(TestOps.FrameBroadcast, _ => signal.TrySetResult(true));
         await session.ConnectAsync();
 
-        transport.QueueNotify(BattleOps.FrameBroadcast, Ver2Frame, FrameGen.Version2);
+        transport.QueueNotify(TestOps.FrameBroadcast, Ver2Frame, FrameGen.Version2);
         await signal.Task.WaitAsync(TimeSpan.FromSeconds(3));
 
         Assert.Equal(42UL, session.LastSeenFrame);
@@ -163,10 +156,10 @@ public sealed class BattleSessionPayloadVersionTest
         options.FrameNumberOf = _ => null;
         await using var session = FakeSession(transport, options);
         BattlePush? received = null;
-        session.FrameBroadcast += push => Volatile.Write(ref received, push);
+        session.OnPush(TestOps.FrameBroadcast, push => Volatile.Write(ref received, push));
         await session.ConnectAsync();
 
-        transport.QueueNotify(BattleOps.FrameBroadcast, Ver2Frame, FrameGen.Version2);
+        transport.QueueNotify(TestOps.FrameBroadcast, Ver2Frame, FrameGen.Version2);
 
         Assert.True(await WaitUntilAsync(() => Volatile.Read(ref received) != null), "取不到帧号也必须分发推送");
         Assert.Equal(0UL, session.LastSeenFrame);
@@ -175,9 +168,10 @@ public sealed class BattleSessionPayloadVersionTest
         await session.CloseAsync();
     }
 
-    // ver=1 恒走内建 protojson 解析：即使注入了钩子也不接管（既有行为逐字不变）。
+    // ver=1 也走注入的帧号钩子：SDK 不再内建 protojson 解析（游戏域消息已迁出，载荷编码由
+    // 调用方用协议包解码后再交给钩子）——同一份钩子对 ver=1/ver=2 一视同仁。
     [Fact]
-    public async Task FrameBroadcast_Ver1_BuiltInExtractionIgnoresInjectedHook()
+    public async Task FrameBroadcast_Ver1_UsesInjectedHook_NoBuiltInParsing()
     {
         var transport = new BattleFakeTransport();
         var options = Options();
@@ -189,15 +183,15 @@ public sealed class BattleSessionPayloadVersionTest
         };
         await using var session = FakeSession(transport, options);
         var signal = new TaskCompletionSource<bool>(TaskCreationOptions.RunContinuationsAsynchronously);
-        session.FrameBroadcast += _ => signal.TrySetResult(true);
+        session.OnPush(TestOps.FrameBroadcast, _ => signal.TrySetResult(true));
         await session.ConnectAsync();
 
         var json = Encoding.UTF8.GetBytes("{\"battleId\":\"b-1\",\"frame\":{\"frameId\":\"9\"}}");
-        transport.QueueNotify(BattleOps.FrameBroadcast, json, FrameGen.Version);
+        transport.QueueNotify(TestOps.FrameBroadcast, json, FrameGen.Version);
         await signal.Task.WaitAsync(TimeSpan.FromSeconds(3));
 
-        Assert.Equal(9UL, session.LastSeenFrame); // 内建解析结果，不是钩子返回的 99。
-        Assert.Equal(0, Volatile.Read(ref hookCalls)); // ver=1 不调用钩子。
+        Assert.Equal(99UL, session.LastSeenFrame); // 钩子返回值（不是载荷里的 9：SDK 不解载荷）。
+        Assert.Equal(1, Volatile.Read(ref hookCalls)); // ver=1 同样调用钩子。
 
         await session.CloseAsync();
     }
@@ -209,7 +203,7 @@ public sealed class BattleSessionPayloadVersionTest
         var transport = new BattleFakeTransport();
         await using var session = FakeSession(transport, Options());
         await session.ConnectAsync();
-        var invoke = session.JoinBattleAsync();
+        var invoke = session.InvokeAsync(TestOps.JoinBattle, TestWire.Join("b-1"));
         await transport.WaitForWritesAsync(1);
 
         transport.QueueSuccessVersion(transport.WrittenHeaders[^1].Seq, Array.Empty<byte>(), 3);
@@ -230,7 +224,7 @@ public sealed class BattleSessionPayloadVersionTest
         await session.ConnectAsync();
 
         var request = new byte[] { 0x0A, 0x03, (byte)'b', (byte)'-', (byte)'1' }; // protobuf 二进制
-        var invoke = session.JoinBattleAsync(request);
+        var invoke = session.InvokeAsync(TestOps.JoinBattle, request);
         await transport.WaitForWritesAsync(1);
         Assert.Equal(FrameGen.Version2, transport.WrittenHeaders[^1].Version);
 
@@ -250,7 +244,7 @@ public sealed class BattleSessionPayloadVersionTest
         options.Serializer = new ProtobufSerializer();
         await using var session = FakeSession(transport, options);
         await session.ConnectAsync();
-        var invoke = session.JoinBattleAsync(Array.Empty<byte>());
+        var invoke = session.InvokeAsync(TestOps.JoinBattle, Array.Empty<byte>());
         await transport.WaitForWritesAsync(1);
 
         transport.QueueSuccessVersion(transport.WrittenHeaders[^1].Seq, Array.Empty<byte>(), FrameGen.Version);
@@ -269,17 +263,18 @@ public sealed class BattleSessionPayloadVersionTest
         Assert.Throws<ArgumentException>(() => BattleSession.Create(Plan(7102), options));
     }
 
-    // ⑤ 既有形态：默认配置（不注入序列化器与钩子）仍是 ver=1 线格式，旧 API 逐字工作。
+    // ⑤ 默认配置（不注入序列化器与钩子）：仍是 ver=1 线格式；补帧基准不推进（没有内建解析），
+    // 但推送照常分发——「不解载荷」是 SDK 的边界，不是故障。
     [Fact]
-    public async Task DefaultSession_KeepsVer1WireAndBuiltInBaseline()
+    public async Task DefaultSession_KeepsVer1Wire_AndLeavesBaselineToHook()
     {
         var transport = new BattleFakeTransport();
         await using var session = FakeSession(transport, Options());
         var signal = new TaskCompletionSource<bool>(TaskCreationOptions.RunContinuationsAsynchronously);
-        session.FrameBroadcast += _ => signal.TrySetResult(true);
+        session.OnPush(TestOps.FrameBroadcast, _ => signal.TrySetResult(true));
         await session.ConnectAsync();
 
-        var invoke = session.SyncFramesAsync(11);
+        var invoke = session.InvokeAsync(TestOps.SyncFrames, TestWire.Sync("b-1", 11));
         await transport.WaitForWritesAsync(1);
         Assert.Equal(FrameGen.Version, transport.WrittenHeaders[^1].Version);
 
@@ -288,11 +283,11 @@ public sealed class BattleSessionPayloadVersionTest
         await invoke;
 
         transport.QueueNotify(
-            BattleOps.FrameBroadcast,
+            TestOps.FrameBroadcast,
             Encoding.UTF8.GetBytes("{\"frame\":{\"frameId\":\"5\"}}"),
             FrameGen.Version);
         await signal.Task.WaitAsync(TimeSpan.FromSeconds(3));
-        Assert.Equal(5UL, session.LastSeenFrame);
+        Assert.Equal(0UL, session.LastSeenFrame); // 未注入钩子：不猜载荷编码、不推进基准。
 
         await session.CloseAsync();
     }

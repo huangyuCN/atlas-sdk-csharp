@@ -6,13 +6,16 @@ using Atlas.Errors;
 
 namespace Atlas.Battle;
 
-// BattleSession 的直连保活心跳（battle 域探针）：无输入期间按 HeartbeatInterval 周期
-// 发送 battle.v1.BattleService/Ping（Tell：服务端不回业务回执），让帧面保持活跃——
-// 数据报面（UDP/KCP）的活跃判定靠帧面空闲读超时发现（服务端取 offline_timeout/3），
-// 长时间静默会被判掉线，且 NAT 映射失效后下行帧收不到（「连接还在但没数据」）。
+// BattleSession 的直连保活心跳：无输入期间按 HeartbeatInterval 周期发送
+// `ProbeOp/ProbePayload` 配置的探针（op 与载荷由游戏侧用协议包给出；服务端语义是 Tell，
+// 不回业务回执），让帧面保持活跃——数据报面（UDP/KCP）的活跃判定靠帧面空闲读超时发现
+//（服务端取 offline_timeout/3），长时间静默会被判掉线，且 NAT 映射失效后下行帧收不到
+//（「连接还在但没数据」）。
 //
 // 语义要点：
 //   - 周期到点才发（不是连接即发）；TimeSpan.Zero = 关闭（不发、不建定时器）；
+//   - **未配置 ProbeOp = 不发**：SDK 不持游戏域消息，不会裸发一个空载荷探针（那会被服务端
+//     按目标一致性判为拒绝）；周期开着但没配探针时一个字节都不写；
 //   - 失败只记账（HeartbeatStats + 事件），**不终止会话**、不影响正常发帧；
 //   - 未连接（重连窗口内）本拍静默跳过：无连接时心跳无事可证，重连编排负责恢复；
 //   - 被业务拒绝三分类处置（见 HandleHeartbeatRejectionAsync）：终态类入终态、票类报
@@ -38,19 +41,12 @@ public sealed partial class BattleSession
     // 重新取票；会话不因此终态（票能换新的，链路是好的）。同一 reason 只上报一次。
     public event Action<Exception>? TicketRejected;
 
-    // PingPayload 组装探针请求载荷（protojson：{"battleId":"..."}）：只带客体寻址字段，
-    // 不承载任何对局参数——探针语义就是「我还在」（加参数即越界）。
-    public byte[] PingPayload()
-    {
-        return Utf8("{\"battleId\":" + Quote(_plan.BattleId) + "}");
-    }
-
     // StartHeartbeat 启动保活心跳（连接成功后调用；幂等：已在跑即复用；非正周期 = 关闭）。
     private void StartHeartbeat()
     {
-        if (_options.HeartbeatInterval <= TimeSpan.Zero)
+        if (_options.HeartbeatInterval <= TimeSpan.Zero || string.IsNullOrEmpty(_options.ProbeOp))
         {
-            return;
+            return; // 周期关闭，或未配置探针（SDK 不持游戏域消息，不裸发现空载荷探针）。
         }
         lock (_heartbeatGate)
         {
@@ -109,7 +105,7 @@ public sealed partial class BattleSession
             {
                 await SendPingAsync(token).ConfigureAwait(false);
                 NoteHeartbeatSent();
-                _logger.Debugf("heartbeat ok op={0}", BattleOps.Ping);
+                _logger.Debugf("heartbeat ok op={0}", _options.ProbeOp);
             }
             catch (OperationCanceledException)
             {
@@ -199,12 +195,13 @@ public sealed partial class BattleSession
             return; // 同一状态重复出现：只计数，不重复打日志/事件。
         }
         _logger.Warnf("heartbeat rejected op={0} reason={1} code={2}: {3}",
-            BattleOps.Ping, exception.Reason, exception.Code, exception.Message);
+            _options.ProbeOp, exception.Reason, exception.Code, exception.Message);
         RaiseHandler(ticketRejected ? TicketRejected : HeartbeatFailed, exception);
     }
 
-    // SendPingAsync 发一拍探针：终态（对局已结束/终态失败）拒发；未连接（重连窗口内）跳过；
-    // 直通路径不排队（死链/重连期间排队无意义，探针不是业务请求），与正常发帧共用通道写锁。
+    // SendPingAsync 发一拍探针（op 与载荷来自 `ProbeOp/ProbePayload`）：终态（对局已结束/
+    // 终态失败）拒发；未连接（重连窗口内）跳过；直通路径不排队（死链/重连期间排队无意义，
+    // 探针不是业务请求），与正常发帧共用通道写锁。
     private Task<byte[]> SendPingAsync(CancellationToken token)
     {
         ThrowIfClosed();
@@ -214,14 +211,14 @@ public sealed partial class BattleSession
         {
             return Task.FromResult(Array.Empty<byte>());
         }
-        return channel.InvokeRawFailFastAsync(BattleOps.Ping, PingPayload(), token);
+        return channel.InvokeRawFailFastAsync(_options.ProbeOp, _options.ProbePayload, token);
     }
 
     // RecordHeartbeatFailure 记一次网络/超时类探针失败：Warn 日志 + 事件（回调异常隔离）。
     private void RecordHeartbeatFailure(Exception exception)
     {
         SetHeartbeatError(exception);
-        _logger.Warnf("heartbeat failed op={0}: {1}", BattleOps.Ping, exception.Message);
+        _logger.Warnf("heartbeat failed op={0}: {1}", _options.ProbeOp, exception.Message);
         RaiseHandler(HeartbeatFailed, exception);
     }
 

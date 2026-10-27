@@ -9,7 +9,7 @@ namespace Atlas.Battle;
 // BattleSession 的终态面：会话有两种终态，共同不变量是「零写线 + 在途立即结算 + 不再重连」。
 // **语义分工（三 SDK 钉死）**：
 //   1. **对局正常结束**（HasEnded；BATTLE_ENDED 业务拒绝或结算结束通知，见 BattleSession.Ended.cs）
-//      ⇒ **有结算可展示**（BattleEnd 事件/推送载荷）；收尾窗口内连接仍可读，**不上报 Failed**
+//      ⇒ **有结算可展示**（统一出口的结束通知 + EndNotifyPayload）；收尾窗口内连接仍可读，**不上报 Failed**
 //      （否则上层会被误导去重新匹配）；
 //   2. **无结算可展示的终态拒绝**（HasFailed；BATTLE_NOT_FOUND/BATTLE_FULL/FRAME_TARGET_MISMATCH/
 //      INVALID_PARAMS、票类）⇒ 会话已无用——停心跳、关通道（打断重连）并以 Failed 上报一次。

@@ -11,7 +11,7 @@ using Xunit;
 
 namespace Atlas.Tests.Battle;
 
-// BattleSessionHeartbeatTest 覆盖直连保活心跳（battle.v1.BattleService/Ping）的行为口径：
+// BattleSessionHeartbeatTest 覆盖直连保活心跳的行为口径：显式配置 ProbeOp/ProbePayload 后
 // 周期到点发探针、CloseAsync 停表、失败只记/事件不终止会话、周期配置生效、可用 0 关闭。
 // 探针是 Tell（服务端不回业务回执）：帧层往返成功即可，SDK 不解析回执载荷。
 public sealed class BattleSessionHeartbeatTest
@@ -36,6 +36,9 @@ public sealed class BattleSessionHeartbeatTest
             BackoffBaseMs = 50,
             BackoffMaxMs = 200,
             HeartbeatInterval = interval,
+            // 保活探针显式配置（SDK 不再内建 PingReq 探针）。
+            ProbeOp = TestOps.Ping,
+            ProbePayload = TestWire.Probe("b-1"),
         };
     }
 
@@ -56,7 +59,7 @@ public sealed class BattleSessionHeartbeatTest
 
     private static int PingCount(BattleEdgeUdpServer server)
     {
-        return server.RequestsOf(BattleOps.Ping).Length;
+        return server.RequestsOf(TestOps.Ping).Length;
     }
 
     [Fact]
@@ -92,7 +95,7 @@ public sealed class BattleSessionHeartbeatTest
 
         Assert.True(await WaitUntilAsync(() => PingCount(server) >= 2), "周期到点应发出 Ping");
 
-        var request = server.RequestsOf(BattleOps.Ping)[0];
+        var request = server.RequestsOf(TestOps.Ping)[0];
         Assert.Equal(Atlas.Frame.FrameGen.FlagSession, request.Flags & Atlas.Frame.FrameGen.FlagSession);
         Assert.Equal(EdgeWire.TicketSlot(Ticket), request.Slot);
         using var document = JsonDocument.Parse(request.Payload);
@@ -120,7 +123,7 @@ public sealed class BattleSessionHeartbeatTest
     public async Task Heartbeat_BusinessRejection_ToleratedAndSessionStaysUsable()
     {
         await using var server = new BattleEdgeUdpServer();
-        server.FailWith(BattleOps.Ping, 500, "INTERNAL", "探针失败");
+        server.FailWith(TestOps.Ping, 500, "INTERNAL", "探针失败");
         await using var session = BattleSession.Create(
             Plan(server.Port), Options(TimeSpan.FromMilliseconds(100)));
         var failures = 0;
@@ -137,8 +140,8 @@ public sealed class BattleSessionHeartbeatTest
 
         // 失败只记/事件：会话不终止、连接仍可用，正常发帧不受影响。
         Assert.Equal(ClientState.Connected, session.State);
-        var reply = await session.SendFrameInputAsync(1, new byte[] { 0x01 });
-        Assert.Equal(BattleEdgeDefaults.ReplyJson(BattleOps.SendFrameInput), Encoding.UTF8.GetString(reply));
+        var reply = await session.InvokeAsync(TestOps.SendFrameInput, TestWire.Input("b-1", 1, new byte[] { 0x01 }));
+        Assert.Equal(BattleEdgeDefaults.ReplyJson(TestOps.SendFrameInput), Encoding.UTF8.GetString(reply));
         Assert.True(await WaitUntilAsync(() => PingCount(server) >= 3), "失败后心跳应继续按周期尝试");
     }
 
