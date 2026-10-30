@@ -11,6 +11,10 @@ namespace Atlas.Battle;
 // 「传输面 → 接入层地址」列表。票与地址都只来自服务端下发——缺票/空票/缺面一律明确报错，
 // 绝不猜端口、不静默换面（票为空连不上接入层，只会把服务端问题伪装成网络问题）。
 //
+// 地址取值顺序：**优先**本人票条目（BattleTicketEntry.endpoints）里的逐人实例地址——多实例
+// 接入层按 player_id 哈希选实例，同一玩家恒定同址（数据报面会话状态因此不跨实例漂移）；
+// 票条目缺失/为空（旧服务端）才回落回执（事件）级 endpoints（= 首实例）。
+//
 // 载荷口径（规范形态唯一）：
 //   - 客户端收到的是帧 Notify：operation = 推送 op（消息完整名 /game.v1.MatchStartedNotify），
 //     payload = **protojson 通知本体**——帧 operation 由调用方按协议包里的成局推送 op
@@ -39,7 +43,7 @@ public sealed class DirectPlan
     // Ticket 是本人入场票据密文（接入层 hello 与帧会话槽都用它）。
     public byte[] Ticket { get; }
 
-    // Endpoints 是「传输面 → host:port」只读快照。
+    // Endpoints 是「传输面 → host:port」只读快照：本人票条目里的实例地址优先，缺失才取回执级列表。
     public IReadOnlyDictionary<EdgeTransport, string> Endpoints { get; }
 
     // FromNotify 解析推送载荷文本（protojson 或推送信封 JSON）。
@@ -112,7 +116,8 @@ public sealed class DirectPlan
         }
         var matchId = ReadString(root, "match_id", "matchId");
         var battleId = ReadString(root, "battle_id", "battleId");
-        return new DirectPlan(matchId, battleId, ReadTicket(root), ReadEndpoints(root));
+        var ticket = ReadTicket(root);
+        return new DirectPlan(matchId, battleId, ticket, ResolveEndpoints(root, ticket));
     }
 
     // ReadTicket 读取 battle_ticket：缺失或空串即报错；base64 带填充/无填充都接受。
@@ -124,8 +129,19 @@ public sealed class DirectPlan
         {
             throw new ProtocolException($"{DirectErrors.NotifyNoTicket}: 字段缺失或为空");
         }
-        var text = node.GetString()!;
-        // protojson 的 bytes 为标准 base64（带填充）；无填充与 url-safe 变体一并容忍。
+        try
+        {
+            return DecodeBase64(node.GetString()!);
+        }
+        catch (FormatException exception)
+        {
+            throw new ProtocolException($"{DirectErrors.NotifyMalformed}: battle_ticket 不是合法 base64", exception);
+        }
+    }
+
+    // DecodeBase64 解码 protojson 的 bytes 取值：标准 base64（带填充），无填充与 url-safe 变体一并容忍。
+    private static byte[] DecodeBase64(string text)
+    {
         var normalized = text.Replace('-', '+').Replace('_', '/');
         switch (normalized.Length % 4)
         {
@@ -136,41 +152,115 @@ public sealed class DirectPlan
                 normalized += "=";
                 break;
         }
-        try
-        {
-            return Convert.FromBase64String(normalized);
-        }
-        catch (FormatException exception)
-        {
-            throw new ProtocolException($"{DirectErrors.NotifyMalformed}: battle_ticket 不是合法 base64", exception);
-        }
+        return Convert.FromBase64String(normalized);
     }
 
-    // ReadEndpoints 读取 endpoints 列表：未知面/空地址条目跳过，一个可用面都没有即报错。
-    private static IReadOnlyDictionary<EdgeTransport, string> ReadEndpoints(JsonElement root)
+    // TicketListKeys 是逐人票条目列表的键名：回执（IssueEntryTicketReply.tickets）与事件
+    //（MatchStartedEvent.battle_tickets）同形，两套命名口径都认。
+    private static readonly string[] TicketListKeys = { "tickets", "battle_tickets", "battleTickets" };
+
+    // ResolveEndpoints 返回本玩家实际要拨的面地址表：**优先**本人票条目里的逐人 endpoints
+    //（多实例接入层按 player_id 哈希选实例，同一玩家恒定同址）；条目缺失/为空/对不上本人票
+    // 即回落到回执（事件）级列表——旧服务端只下发该列表，兼容路径行为不变。
+    private static IReadOnlyDictionary<EdgeTransport, string> ResolveEndpoints(JsonElement root, byte[] ticket)
     {
-        var endpoints = new Dictionary<EdgeTransport, string>();
-        if (TryGetProperty(root, "endpoints", out var list) && list.ValueKind == JsonValueKind.Array)
+        var perPlayer = ReadTicketEntryEndpoints(root, ticket);
+        return perPlayer.Count > 0 ? new ReadOnlyDictionary<EdgeTransport, string>(perPlayer) : ReadEndpoints(root);
+    }
+
+    // ReadTicketEntryEndpoints 在逐人票条目列表里找本人那张票，返回其面地址表（无匹配即空表）。
+    // 条目按票密文逐字节匹配（身份由票本身确定，**不取第一条**、不猜）。
+    private static Dictionary<EdgeTransport, string> ReadTicketEntryEndpoints(JsonElement root, byte[] ticket)
+    {
+        foreach (var name in TicketListKeys)
         {
-            foreach (var entry in list.EnumerateArray())
+            if (!TryGetProperty(root, name, out var list) || list.ValueKind != JsonValueKind.Array)
             {
-                var face = ReadFace(entry);
-                if (face == null)
-                {
-                    continue;
-                }
-                var address = ReadAddress(entry);
-                if (address.Length > 0)
-                {
-                    endpoints[face.Value] = address;
-                }
+                continue;
+            }
+            var found = EntryEndpointsOf(list, ticket);
+            if (found.Count > 0)
+            {
+                return found;
             }
         }
+        return new Dictionary<EdgeTransport, string>();
+    }
+
+    // EntryEndpointsOf 遍历票条目：票密文与本人票逐字节相等才取它的面地址表（坏编码按「不是本人」处理）。
+    private static Dictionary<EdgeTransport, string> EntryEndpointsOf(JsonElement list, byte[] ticket)
+    {
+        foreach (var entry in list.EnumerateArray())
+        {
+            if (entry.ValueKind != JsonValueKind.Object
+                || !TryGetProperty(entry, "ticket", out var node)
+                || node.ValueKind != JsonValueKind.String
+                || !IsOwnTicket(node.GetString()!, ticket))
+            {
+                continue;
+            }
+            var endpoints = ReadEndpointDict(entry);
+            if (endpoints.Count > 0)
+            {
+                return endpoints;
+            }
+        }
+        return new Dictionary<EdgeTransport, string>();
+    }
+
+    // IsOwnTicket 判断票条目里的票密文是否就是本人那张（base64 解码后逐字节比较）。坏编码一律
+    // 视为「不是本人」而不抛错：回落路径仍能连上旧服务端，别让脏条目把整条上线链路打死。
+    private static bool IsOwnTicket(string encoded, byte[] ticket)
+    {
+        if (encoded.Length == 0)
+        {
+            return false;
+        }
+        byte[] decoded;
+        try
+        {
+            decoded = DecodeBase64(encoded);
+        }
+        catch (FormatException)
+        {
+            return false;
+        }
+        return decoded.Length == ticket.Length && decoded.AsSpan().SequenceEqual(ticket);
+    }
+
+    // ReadEndpoints 读取回执（事件）级 endpoints 列表：未知面/空地址条目跳过，一个可用面都没有即报错。
+    private static IReadOnlyDictionary<EdgeTransport, string> ReadEndpoints(JsonElement root)
+    {
+        var endpoints = ReadEndpointDict(root);
         if (endpoints.Count == 0)
         {
             throw new ProtocolException($"{DirectErrors.NotifyNoEndpoint}: 未下发任何可用面地址");
         }
         return new ReadOnlyDictionary<EdgeTransport, string>(endpoints);
+    }
+
+    // ReadEndpointDict 读取给定容器下的 endpoints 列表：未知面/空地址条目跳过（缺失即空表）。
+    private static Dictionary<EdgeTransport, string> ReadEndpointDict(JsonElement container)
+    {
+        var endpoints = new Dictionary<EdgeTransport, string>();
+        if (!TryGetProperty(container, "endpoints", out var list) || list.ValueKind != JsonValueKind.Array)
+        {
+            return endpoints;
+        }
+        foreach (var entry in list.EnumerateArray())
+        {
+            var face = ReadFace(entry);
+            if (face == null)
+            {
+                continue;
+            }
+            var address = ReadAddress(entry);
+            if (address.Length > 0)
+            {
+                endpoints[face.Value] = address;
+            }
+        }
+        return endpoints;
     }
 
     // ReadFace 读取一个 endpoint 条目的传输面（未知面名返回 null = 跳过该条目）。
