@@ -16,19 +16,29 @@ jobs:
         with:
           fetch-depth: 0
 
+      # 跨仓检出凭证：首选 GitHub App 安装令牌（只读、1 小时过期、不绑个人），
+      # 未配置 APP_ID / APP_PRIVATE_KEY 或签发失败时回退旧 PAT 链路。
+      - name: 签发 GitHub App 安装令牌（跨仓只读）
+        id: app-token
+        continue-on-error: true
+        uses: actions/create-github-app-token@v1
+        with:
+          app-id: ${{ secrets.APP_ID }}
+          private-key: ${{ secrets.APP_PRIVATE_KEY }}
+          owner: ${{ github.repository_owner }}
+          repositories: atlas,atlas-game-layout,atlas-sdk-go,cow
+
       # golden vectors 由主仓生成（transport/frame -update），本仓消费同一份
       # manifest + 向量——协议一致性锚点（规范 §8.1）。atlas 为私有仓：检出用
-      # 只读 PAT（fine-grained，仅授 atlas 仓 Contents:Read），经
-      # secrets.ATLAS_CI_TOKEN 注入（对齐 sdk-go/sdk-ts CI）；未配置时守卫步骤
-      # 给出配置指引后失败。
+      # 只读 App 令牌（App 装到 atlas 与模板仓，权限仅 Contents: Read）。
       - name: 校验向量源仓访问凭证
         env:
-          TOKEN_SET: ${{ secrets.ATLAS_CI_TOKEN != '' }}
+          APP_TOKEN_OK: ${{ steps.app-token.outcome == 'success' }}
+          PAT_SET: ${{ secrets.ATLAS_CI_TOKEN != '' }}
         run: |
-          if [ "$TOKEN_SET" != "true" ]; then
-            echo "::error::缺少 secrets.ATLAS_CI_TOKEN（只读 PAT，授 atlas 仓 Contents:Read）。"
-            echo "配置指引：GitHub 仓 Settings → Secrets and variables → Actions →"
-            echo "New repository secret → 名称 ATLAS_CI_TOKEN → 值 PAT。"
+          if [ "$APP_TOKEN_OK" != "true" ] && [ "$PAT_SET" != "true" ]; then
+            echo "::error::跨仓检出无可用凭证：App 令牌未签发，且 ATLAS_CI_TOKEN 未配置。"
+            echo "检查本仓 Secrets 的 APP_ID / APP_PRIVATE_KEY，以及 App 是否已安装到 huangyuCN/atlas 与 huangyuCN/atlas-game-layout（Contents: Read）。"
             exit 1
           fi
 
@@ -40,7 +50,7 @@ jobs:
           # 「我们忘了重生成」与「上游动了」。bump 时改这里（三仓同步）。
           ref: 08933f9ae854f66e196c38d2dead789511153e89
           path: atlas
-          token: ${{ secrets.ATLAS_CI_TOKEN }}
+          token: ${{ steps.app-token.outputs.token || secrets.ATLAS_CI_TOKEN }}
 
       # 会话协议唯一来源是模板仓（R13）：descriptor set 从模板导出，帧常量与生成器
       # 取自框架仓——「重生成无 diff」门禁需要三个检出（同一只读 PAT）。
@@ -54,7 +64,7 @@ jobs:
           # pin 固定 sha（同 atlas）：bump 时与 atlas 的 ref 一起改。
           ref: d0b0451a782428f4ae77b8bc3a16629b9b8269a8
           path: atlas-game-layout
-          token: ${{ secrets.ATLAS_CI_TOKEN }}
+          token: ${{ steps.app-token.outputs.token || secrets.ATLAS_CI_TOKEN }}
 
       - name: Set up Go (构建 protoc-gen-atlas-client)
         uses: actions/setup-go@v5

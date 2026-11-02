@@ -34,17 +34,29 @@ jobs:
       id-token: write # OIDC：向 nuget.org 换取临时 API key 必需
     steps:
       - uses: actions/checkout@v4
+      # 跨仓检出凭证：首选 GitHub App 安装令牌（只读、1 小时过期、不绑个人），
+      # 未配置 APP_ID / APP_PRIVATE_KEY 或签发失败时回退旧 PAT 链路。
+      - name: 签发 GitHub App 安装令牌（跨仓只读）
+        id: app-token
+        continue-on-error: true
+        uses: actions/create-github-app-token@v1
+        with:
+          app-id: ${{ secrets.APP_ID }}
+          private-key: ${{ secrets.APP_PRIVATE_KEY }}
+          owner: ${{ github.repository_owner }}
+          repositories: atlas,atlas-game-layout,atlas-sdk-go,cow
+
       # golden 向量源仓 = atlas 主仓（与 ci.yml 同款检出）：golden 对齐测试经
-      # ATLAS_GOLDEN_DIR 读该检出。atlas 为私有仓，检出用只读 PAT（fine-grained，
-      # 仅授 atlas 仓 Contents:Read），经 secrets.ATLAS_CI_TOKEN 注入。
+      # ATLAS_GOLDEN_DIR 读该检出。atlas 为私有仓，检出用只读 App 令牌
+      # （App 装到 atlas 与模板仓，权限仅 Contents: Read）。
       - name: 校验向量源仓访问凭证
         env:
-          TOKEN_SET: ${{ secrets.ATLAS_CI_TOKEN != '' }}
+          APP_TOKEN_OK: ${{ steps.app-token.outcome == 'success' }}
+          PAT_SET: ${{ secrets.ATLAS_CI_TOKEN != '' }}
         run: |
-          if [ "$TOKEN_SET" != "true" ]; then
-            echo "::error::缺少 secrets.ATLAS_CI_TOKEN（只读 PAT，授 atlas 仓 Contents:Read）。"
-            echo "::error::GitHub → Settings → Developer settings → Fine-grained tokens 新建（仅 atlas 仓，Contents: Read）"
-            echo "::error::再到本仓 Settings → Secrets and variables → Actions 添加 ATLAS_CI_TOKEN，然后重跑本工作流。"
+          if [ "$APP_TOKEN_OK" != "true" ] && [ "$PAT_SET" != "true" ]; then
+            echo "::error::跨仓检出无可用凭证：App 令牌未签发，且 ATLAS_CI_TOKEN 未配置。"
+            echo "::error::检查本仓 Secrets 的 APP_ID / APP_PRIVATE_KEY，以及 App 是否已安装到 huangyuCN/atlas 与 huangyuCN/atlas-game-layout（Contents: Read）。"
             exit 1
           fi
       - uses: actions/checkout@v4
@@ -54,14 +66,14 @@ jobs:
           # 「我们忘了重生成」与「上游动了」。bump 时改这里（三仓同步）。
           ref: 08933f9ae854f66e196c38d2dead789511153e89
           path: atlas
-          token: ${{ secrets.ATLAS_CI_TOKEN }}
+          token: ${{ steps.app-token.outputs.token || secrets.ATLAS_CI_TOKEN }}
       - uses: actions/checkout@v4
         with:
           repository: huangyuCN/atlas-game-layout
           # pin 固定 sha（同 atlas）：bump 时与 atlas 的 ref 一起改。
           ref: d0b0451a782428f4ae77b8bc3a16629b9b8269a8
           path: atlas-game-layout
-          token: ${{ secrets.ATLAS_CI_TOKEN }}
+          token: ${{ steps.app-token.outputs.token || secrets.ATLAS_CI_TOKEN }}
       - uses: actions/setup-dotnet@v4
         with:
           dotnet-version: '8.0.x'
