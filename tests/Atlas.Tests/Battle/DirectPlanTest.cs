@@ -49,6 +49,27 @@ public sealed class DirectPlanTest
     }
 
     [Fact]
+    public void FromNotify_ReadsMaxNetworkGap_BothKeyAndNumberForms()
+    {
+        // protojson 的 int64 默认按字符串下发（保精度）；数字与 snake/camel 两套键名都容错。
+        var payload = "{\"battle_id\":\"b-1\",\"battle_ticket\":\"AAECAwQ=\","
+            + "\"max_network_gap_ms\":\"30000\","
+            + "\"endpoints\":[{\"transport\":\"EDGE_TRANSPORT_WS\",\"address\":\"h:1\"}]}";
+        Assert.Equal(TimeSpan.FromSeconds(30), DirectPlan.FromNotify(payload).MaxNetworkGap);
+
+        var camel = "{\"battleId\":\"b-1\",\"battleTicket\":\"AAECAwQ=\",\"maxNetworkGapMs\":30000,"
+            + "\"endpoints\":[{\"transport\":\"EDGE_TRANSPORT_WS\",\"address\":\"h:1\"}]}";
+        Assert.Equal(TimeSpan.FromSeconds(30), DirectPlan.FromNotify(camel).MaxNetworkGap);
+    }
+
+    [Fact]
+    public void FromNotify_MissingMaxNetworkGap_IsZero()
+    {
+        // 旧服务端/未启用：保持 TimeSpan.Zero（调用方沿用既有缺省，不猜）。
+        Assert.Equal(TimeSpan.Zero, DirectPlan.FromNotify(NotifySnake).MaxNetworkGap);
+    }
+
+    [Fact]
     public void FromNotify_AcceptsPushEnvelope_DefensiveCompatibility()
     {
         // 规范形态是帧 Notify（op = 消息完整名，payload = protojson 本体）；信封只存在于

@@ -26,12 +26,13 @@ namespace Atlas.Battle;
 public sealed class DirectPlan
 {
     private DirectPlan(string matchId, string battleId, byte[] ticket,
-        IReadOnlyDictionary<EdgeTransport, string> endpoints)
+        IReadOnlyDictionary<EdgeTransport, string> endpoints, TimeSpan maxNetworkGap)
     {
         MatchId = matchId;
         BattleId = battleId;
         Ticket = ticket;
         Endpoints = endpoints;
+        MaxNetworkGap = maxNetworkGap;
     }
 
     // MatchId 是对局 ID（protojson 字符串字段，缺省空串）。
@@ -45,6 +46,10 @@ public sealed class DirectPlan
 
     // Endpoints 是「传输面 → host:port」只读快照：本人票条目里的实例地址优先，缺失才取回执级列表。
     public IReadOnlyDictionary<EdgeTransport, string> Endpoints { get; }
+
+    // MaxNetworkGap 是服务端下发的「玩家最多断网多久还能回来」（0 = 未下发/旧服务端）。
+    // 它同时是服务端的会话静默窗口：客户端自建的空闲判定必须大于它，否则客户端先重建、无感切网失效。
+    public TimeSpan MaxNetworkGap { get; }
 
     // FromNotify 解析推送载荷文本（protojson 或推送信封 JSON）。
     public static DirectPlan FromNotify(string payload)
@@ -117,7 +122,31 @@ public sealed class DirectPlan
         var matchId = ReadString(root, "match_id", "matchId");
         var battleId = ReadString(root, "battle_id", "battleId");
         var ticket = ReadTicket(root);
-        return new DirectPlan(matchId, battleId, ticket, ResolveEndpoints(root, ticket));
+        return new DirectPlan(matchId, battleId, ticket, ResolveEndpoints(root, ticket),
+            ReadMaxNetworkGap(root));
+    }
+
+    // ReadMaxNetworkGap 读取服务端「玩家最多断网多久还能回来」（毫秒；缺失/0 = 未下发）：
+    // protojson 的 int64 默认按字符串下发，也接受 JSON 数字；负数按 0（时长没有负语义）。
+    private static TimeSpan ReadMaxNetworkGap(JsonElement root)
+    {
+        if (!TryGetProperty(root, "max_network_gap_ms", "maxNetworkGapMs", out var node))
+        {
+            return TimeSpan.Zero;
+        }
+        long milliseconds;
+        if (node.ValueKind == JsonValueKind.String)
+        {
+            if (!long.TryParse(node.GetString(), out milliseconds))
+            {
+                return TimeSpan.Zero;
+            }
+        }
+        else if (node.ValueKind != JsonValueKind.Number || !node.TryGetInt64(out milliseconds))
+        {
+            return TimeSpan.Zero;
+        }
+        return milliseconds > 0 ? TimeSpan.FromMilliseconds(milliseconds) : TimeSpan.Zero;
     }
 
     // ReadTicket 读取 battle_ticket：缺失或空串即报错；base64 带填充/无填充都接受。
