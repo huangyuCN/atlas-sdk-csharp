@@ -114,10 +114,17 @@ internal sealed class BattleFakeTransport : ITransport
         }
     }
 
-    public Task CloseAsync()
+    // BeforeClose 是关闭前的测试钩子（默认 null）：挂起即把「终态标记已置位、Failed 回调尚未
+    // 分发」的窗口固定住，供「回调迟到仍只上报一次」的用例复现真实异步窗口。
+    internal Func<Task>? BeforeClose { get; set; }
+
+    public async Task CloseAsync()
     {
+        if (BeforeClose != null)
+        {
+            await BeforeClose().ConfigureAwait(false);
+        }
         _incoming.Writer.TryComplete();
-        return Task.CompletedTask;
     }
 
     public ValueTask DisposeAsync()

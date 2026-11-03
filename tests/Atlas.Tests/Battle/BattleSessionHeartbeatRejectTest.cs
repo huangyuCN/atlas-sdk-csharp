@@ -7,6 +7,7 @@ using System.Threading.Tasks;
 using Atlas.Battle;
 using Atlas.Client;
 using Atlas.Errors;
+using Atlas.Transport;
 using Xunit;
 
 namespace Atlas.Tests.Battle;
@@ -47,7 +48,7 @@ public sealed class BattleSessionHeartbeatRejectTest
         };
     }
 
-    private static async Task<bool> WaitUntilAsync(Func<bool> condition, int timeoutMs = 3000)
+    private static async Task<bool> WaitUntilAsync(Func<bool> condition, int timeoutMs = 5000)
     {
         var watch = Stopwatch.StartNew();
         while (watch.ElapsedMilliseconds < timeoutMs)
@@ -61,9 +62,88 @@ public sealed class BattleSessionHeartbeatRejectTest
         return condition();
     }
 
+    // Describe 汇总会话即时状态与心跳计数（超时诊断）：下次偶发失败能直接看出是「回调还没到」
+    // 还是「真的没发生」。
+    private static string Describe(BattleSession session, params (string Name, long Value)[] extra)
+    {
+        var heartbeat = session.Stats.Heartbeat;
+        var parts = new List<string>
+        {
+            $"state={session.State}",
+            $"hasFailed={session.HasFailed}",
+            $"hasEnded={session.HasEnded}",
+            $"failureCause={(session.FailureCause as BusinessException)?.Reason ?? session.FailureCause?.GetType().Name ?? "null"}",
+            $"hb(sent={heartbeat.Sent},rejected={heartbeat.Rejected},ticketRejected={heartbeat.TicketRejected},"
+                + $"lastError={heartbeat.LastError ?? "null"})",
+        };
+        foreach (var (name, value) in extra)
+        {
+            parts.Add($"{name}={value}");
+        }
+        return string.Join(" ", parts);
+    }
+
+    // AwaitStateAsync 等待条件成立（默认 5s 上限，超时即失败并打印诊断快照）：
+    // 不赌固定时长；也不接受「先等状态位成立、再立刻断言事件/计数」——两步之间是异步窗口
+    // （终态标记先置位，Failed 回调要等通道关闭完毕才分发，CI 上该窗口会被调度拉长）。
+    private static async Task AwaitStateAsync(
+        string what, Func<bool> condition, Func<string> describe, int timeoutMs = 5000)
+    {
+        if (await WaitUntilAsync(condition, timeoutMs))
+        {
+            return;
+        }
+        throw new Xunit.Sdk.XunitException(
+            $"超时 {timeoutMs}ms 仍未满足：{what}；实际：{describe()}");
+    }
+
     private static int PingCount(BattleEdgeUdpServer server)
     {
         return server.RequestsOf(TestOps.Ping).Length;
+    }
+
+    // FakeSession 装配一个走假传输的会话（DialOverride 仅供测试注入，不碰网络）。
+    private static BattleSession FakeSession(BattleFakeTransport transport, TimeSpan interval)
+    {
+        var session = BattleSession.Create(Plan(7103), Options(interval));
+        session.DialOverride = _ => Task.FromResult<ITransport>(transport);
+        return session;
+    }
+
+    // Heartbeat_TerminalRejection_FailedCallbackDelayed_StillReportsOnce 复现 CI 偶发（1/345）的根因：
+    // 终态标记（HasFailed 背后的 _failed）在 EnterTerminalFailure 里**先行置位**，Failed 回调要等
+    // 通道关闭（CloseAndReportAsync → CloseChannelAsync → transport.CloseAsync）**之后**才分发——
+    // 两步之间是一段纯异步窗口，CI 上该窗口常被线程池排队/调度拉长（本地快机器上几乎不可见）。
+    // 用例用假传输的 BeforeClose 闸门把这个窗口撑到远超轮询间隔，固化「等状态位成立就断言事件计数」
+    // 必读不到（红），改后按事件计数等待（绿）。
+    [Fact]
+    public async Task Heartbeat_TerminalRejection_FailedCallbackDelayed_StillReportsOnce()
+    {
+        var transport = new BattleFakeTransport();
+        var gate = new TaskCompletionSource<bool>(TaskCreationOptions.RunContinuationsAsynchronously);
+        transport.BeforeClose = () => gate.Task;
+        await using var session = FakeSession(transport, TimeSpan.FromMilliseconds(50));
+        var failures = 0;
+        session.Failed += _ => Interlocked.Increment(ref failures);
+
+        await session.ConnectAsync();
+        await transport.WaitForWritesAsync(1); // 第一拍探针已写线。
+        transport.QueueBusinessError(
+            transport.WrittenHeaders[0].Seq, 403, DirectErrors.FrameTargetMismatchReason, "探针被拒");
+
+        // 模拟 CI 的慢关闭：闸门先关着，Failed 回调因此迟到（远超 10ms 轮询间隔）。
+        // 旧写法（CI 上偶发红）：等到终态标记成立就立刻读事件计数——状态位先置位、回调后到，必读 0。
+        Assert.True(await WaitUntilAsync(() => session.HasFailed), "终态类拒绝应终态化");
+        var atFlagTime = Volatile.Read(ref failures); // 旧写法在这一刻断言 == 1。
+
+        gate.TrySetResult(true); // 放行慢关闭（避免关闭在途时 Dispose 卡住）。
+        await AwaitStateAsync(
+            "Failed 应上报一次（回调迟到也要等到）",
+            () => Volatile.Read(ref failures) == 1,
+            () => Describe(session, ("failures", Volatile.Read(ref failures))));
+        Assert.Equal(0, atFlagTime); // 根因固化：状态位成立瞬间回调尚未到达。
+        Assert.Equal(1, Volatile.Read(ref failures)); // 等到回调到达：只上报一次。
+        Assert.Equal(DirectErrors.FrameTargetMismatchReason, (session.FailureCause as BusinessException)?.Reason);
     }
 
     // 终态类拒绝（入局被拒/目标失配）：探针一拍即入终态并上报 Failed 一次，探针停发。
@@ -81,13 +161,18 @@ public sealed class BattleSessionHeartbeatRejectTest
         session.Failed += _ => Interlocked.Increment(ref failures);
 
         await session.ConnectAsync();
-        Assert.True(await WaitUntilAsync(() => session.HasFailed), "终态类拒绝应终态化");
+        // 等「终态化 + Failed 上报一次」同时成立（超时带诊断）：只等 HasFailed 会在 CI 上抢跑。
+        await AwaitStateAsync(
+            "终态类拒绝应终态化并上报 Failed 一次",
+            () => session.HasFailed && Volatile.Read(ref failures) == 1,
+            () => Describe(session, ("failures", Volatile.Read(ref failures)), ("pings", PingCount(server))));
         Assert.Equal(1, Volatile.Read(ref failures)); // 上报一次。
         Assert.Equal(reason, (session.FailureCause as BusinessException)?.Reason);
 
-        await Task.Delay(150); // 排空终态瞬间在途的一拍。
+        // 停表是「不再发生」的负向断言：只能给窗口，窗口按心跳周期（80ms）导出，不猜绝对时长。
+        await Task.Delay(160); // 2 个周期：排空终态瞬间在途的一拍。
         var pings = PingCount(server);
-        await Task.Delay(350); // ≥ 4 个心跳周期。
+        await Task.Delay(320); // 再 4 个周期。
         Assert.Equal(pings, PingCount(server)); // 停表：不再发探针。
         Assert.True(session.Stats.Heartbeat.Rejected >= 1, "被拒探针应计数");
         Assert.False(session.HasEnded); // 不是「对局已结束」：终态失败另有标记。
@@ -115,7 +200,17 @@ public sealed class BattleSessionHeartbeatRejectTest
         session.HeartbeatFailed += _ => Interlocked.Increment(ref failures);
 
         await session.ConnectAsync();
-        Assert.True(await WaitUntilAsync(() => PingCount(server) >= 3), "票类拒绝后应继续探测");
+        // 等「持续探测 + 信号只报一次 + 计数逐拍累加」同时成立（事件与计数都是异步分发）。
+        await AwaitStateAsync(
+            "票类拒绝后应继续探测（信号一次、计数逐拍累加）",
+            () => PingCount(server) >= 3
+                && Volatile.Read(ref tickets) == 1
+                && session.Stats.Heartbeat.TicketRejected >= 2,
+            () => Describe(
+                session,
+                ("pings", PingCount(server)),
+                ("tickets", Volatile.Read(ref tickets)),
+                ("failures", Volatile.Read(ref failures))));
         Assert.Equal(1, Volatile.Read(ref tickets)); // 信号只上报一次（状态未变化）。
         Assert.Equal(0, Volatile.Read(ref failures)); // 票类走专用出口，不混进通用失败。
         Assert.False(session.HasFailed);
@@ -124,8 +219,12 @@ public sealed class BattleSessionHeartbeatRejectTest
         Assert.True(session.Stats.Heartbeat.TicketRejected >= 2, "每拍都被拒：计数逐拍累加");
         Assert.True(session.Stats.Heartbeat.Rejected >= 2);
 
-        // 日志只在状态首次变化时打一条：不随每拍刷屏。
-        await Task.Delay(300); // ≥ 3 个周期。
+        // 日志只在状态首次变化时打一条：再等 ≥ 3 个探针周期（按计数等待，不赌固定时长）。
+        var rejectedBaseline = session.Stats.Heartbeat.Rejected;
+        await AwaitStateAsync(
+            "再被拒 ≥ 3 拍（日志仍只有一条）",
+            () => session.Stats.Heartbeat.Rejected >= rejectedBaseline + 3,
+            () => Describe(session, ("rejected", session.Stats.Heartbeat.Rejected)));
         lock (logs)
         {
             Assert.Equal(1, logs.Count(line => line.Contains("heartbeat rejected", StringComparison.Ordinal)));
@@ -152,12 +251,27 @@ public sealed class BattleSessionHeartbeatRejectTest
         session.HeartbeatFailed += _ => Interlocked.Increment(ref failures);
 
         await session.ConnectAsync();
-        Assert.True(await WaitUntilAsync(() => PingCount(server) >= 3), "其它业务拒绝后应继续探测");
+        // 等「继续探测 + 失败出口只报一次 + 计数逐拍累加 + 最近错误可读」同时成立。
+        await AwaitStateAsync(
+            "其它业务拒绝后应继续探测（失败出口一次、计数逐拍累加）",
+            () => PingCount(server) >= 3
+                && Volatile.Read(ref failures) == 1
+                && session.Stats.Heartbeat.Rejected >= 3
+                && "探针失败" == session.Stats.Heartbeat.LastError,
+            () => Describe(
+                session,
+                ("pings", PingCount(server)),
+                ("failures", Volatile.Read(ref failures))));
         Assert.Equal(1, Volatile.Read(ref failures)); // 事件只在状态首次变化时一条。
         Assert.True(session.Stats.Heartbeat.Rejected >= 3, "每拍都被拒：计数逐拍累加");
         Assert.Equal("探针失败", session.Stats.Heartbeat.LastError);
 
-        await Task.Delay(300);
+        // 日志只在状态首次变化时打一条：再等 ≥ 3 拍（按计数等待，不赌固定时长）。
+        var rejectedBaseline = session.Stats.Heartbeat.Rejected;
+        await AwaitStateAsync(
+            "再被拒 ≥ 3 拍（日志仍只有一条）",
+            () => session.Stats.Heartbeat.Rejected >= rejectedBaseline + 3,
+            () => Describe(session, ("rejected", session.Stats.Heartbeat.Rejected)));
         lock (logs)
         {
             Assert.Equal(1, logs.Count(line => line.Contains("heartbeat rejected", StringComparison.Ordinal)));
