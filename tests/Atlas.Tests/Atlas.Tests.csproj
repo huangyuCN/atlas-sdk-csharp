@@ -25,4 +25,10 @@
       <Link>Generated/GatewaySessionProtocol.cs</Link>
     </Compile>
   </ItemGroup>
+  <!-- 跨语言 golden 夹具（模板仓 lib/downlink 生成）：测试按 BaseDirectory/Downlink 读取。 -->
+  <ItemGroup>
+    <None Update="Downlink/delta-golden.json">
+      <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
+    </None>
+  </ItemGroup>
 </Project>

@@ -107,7 +107,7 @@ public sealed class KcpTransportTest
         var badVersion = new Header
         {
             Magic = FrameGen.Magic,
-            Version = 3,
+            Version = 4, // 未定义的未来版本（ver=3 下行增量已进白名单，不再用它做非法样本）
             Type = MsgType.Request,
             Seq = 1,
         };

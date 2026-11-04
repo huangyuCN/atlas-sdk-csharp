@@ -35,6 +35,10 @@ public sealed partial class BattleSession : IAsyncDisposable
     private Channel? _channel;
     private int _closed;
 
+    // _downlink 是每会话一份的 ver=3 增量解码器：帧广播先合并成全量再走统一出口；
+    // 失步时经构造注入的端口发一次关键帧请求（与模板仓 lib/downlink 的状态机同构）。
+    private readonly Atlas.Downlink.DownlinkDecoder _downlink;
+
     // _connectGate 串行化首连与显式重连（单飞）：并发 Connect/Reconnect 不得各拨一代——
     // 否则后到者会摘掉/关掉先到者刚装的通道，两代都不完整（会话不可用）。
     private readonly SemaphoreSlim _connectGate = new(1, 1);
@@ -53,6 +57,7 @@ public sealed partial class BattleSession : IAsyncDisposable
         _logger = options.LogSilence
             ? SDKLoggerFactory.Silent()
             : options.Logger ?? SDKLoggerFactory.Of(LogLevel.Error, options.LogSink);
+        _downlink = new Atlas.Downlink.DownlinkDecoder(OnRequestKeyframe);
     }
 
     // Create 装配直连战斗会话：校验选项 + 按 endpoints 选面（可配置优先面）；

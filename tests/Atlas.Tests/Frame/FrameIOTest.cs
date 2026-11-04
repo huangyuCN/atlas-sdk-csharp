@@ -132,7 +132,7 @@ public sealed class FrameIOTest
 
     [Theory]
     [InlineData((byte)0)]
-    [InlineData((byte)3)]
+    [InlineData((byte)4)] // 未定义的未来版本（ver=3 是下行增量广播，已进白名单）
     public void Decode_InvalidVersion_ThrowsProtocol(byte version)
     {
         var header = new Header

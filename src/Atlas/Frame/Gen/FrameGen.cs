@@ -14,6 +14,8 @@ public static class FrameGen
     public const byte Version = 1;
     /// <summary>Version2 载荷编码 ver=2（protobuf 二进制）</summary>
     public const byte Version2 = 2;
+    /// <summary>Version3 载荷编码 ver=3（下行增量广播）</summary>
+    public const byte Version3 = 3;
     /// <summary>MaxBodySize 单帧 body 绝对上限（2MiB）</summary>
     public const int MaxBodySize = 2097152;
     /// <summary>MaxOperationLen operation 名长度上限（4096 字节）</summary>
@@ -32,6 +34,9 @@ public static class FrameGen
     public const byte FlagSession = 1;
     /// <summary>FlagRequestID body 携带请求幂等键</summary>
     public const byte FlagRequestID = 2;
+
+    /// <summary>PayloadVersions 解码器接受的帧头载荷版本全集（升序；由 transport/frame 派生，勿手改）。</summary>
+    public static readonly byte[] PayloadVersions = { 1, 2, 3 };
 
     /// <summary>帧头固定布局：magic(4) | version(1) | msgType(1) | flags(1) | pad(1) | seq(4) | bodyLen(4)。</summary>
     public const string HeaderLayout = "magic(4)|version(1)|msgType(1)|flags(1)|pad(1)|seq(4)|bodyLen(4)";

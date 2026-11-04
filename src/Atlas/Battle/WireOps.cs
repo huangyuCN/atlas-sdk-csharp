@@ -12,6 +12,9 @@ internal static class WireOps
     // FrameBroadcast 是服务端帧广播推送的 op（会话据此推进补帧基准）。
     internal const string FrameBroadcast = "/battle.v1.FrameBroadcast";
 
+    // RequestFrameKeyframe 是关键帧请求 op（ver=3 增量失步时的快速修复）。
+    internal const string RequestFrameKeyframe = "/battle.v1.BattleService/RequestFrameKeyframe";
+
     // BattleEndNotify 是战斗结束通知推送的 op（会话据此进入终态、留档首投载荷）。
     internal const string BattleEndNotify = "/battle.v1.BattleEndNotify";
 }

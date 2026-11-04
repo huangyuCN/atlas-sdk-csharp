@@ -1,5 +1,10 @@
 using System;
 using System.Collections.Generic;
+using System.Threading;
+using System.Threading.Tasks;
+using Atlas.Client;
+using Atlas.Downlink;
+using Atlas.Frame;
 
 namespace Atlas.Battle;
 
@@ -71,6 +76,13 @@ public sealed partial class BattleSession
     {
         if (op == WireOps.FrameBroadcast)
         {
+            var decoded = _downlink.Apply(payload, version);
+            if (decoded == null)
+            {
+                return; // 失步/迟到：不交付、也不推进补帧基准（与 Go 的 Decoder.Apply 同口径）。
+            }
+            payload = decoded.Value.Payload;
+            version = decoded.Value.Version;
             TrackLastSeenFrame(payload);
         }
         else if (op == WireOps.BattleEndNotify)
@@ -122,6 +134,33 @@ public sealed partial class BattleSession
         catch (Exception)
         {
             // 上层回调异常隔离（不影响读循环与其余出口）。
+        }
+    }
+
+    // OnRequestKeyframe 发一次关键帧请求（ver=3 失步的快速修复）：Tell 语义、不带幂等键，
+    // 回执由服务端下一 tick 的全量帧代替；失败只记日志（周期关键帧兜底），不终止会话。
+    private void OnRequestKeyframe(ulong lastSeq)
+    {
+        var channel = Volatile.Read(ref _channel);
+        if (channel == null)
+        {
+            return;
+        }
+        var payload = KeyframeRequest.Encode(_plan.BattleId, lastSeq, _options.Serializer.Version);
+        _ = SendKeyframeRequestAsync(channel, payload);
+    }
+
+    // SendKeyframeRequestAsync 尽力发一次关键帧请求：连接失效由读循环/重连统一处理。
+    private async Task SendKeyframeRequestAsync(Channel channel, byte[] payload)
+    {
+        try
+        {
+            await channel.InvokeRawFailFastAsync(WireOps.RequestFrameKeyframe, payload, CancellationToken.None)
+                .ConfigureAwait(false);
+        }
+        catch (Exception exception)
+        {
+            _logger.Debugf("keyframe request failed: {0}", exception.Message);
         }
     }
 

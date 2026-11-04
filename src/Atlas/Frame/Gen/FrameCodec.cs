@@ -52,6 +52,20 @@ public static class FrameCodec
         return maxBodySize > 0 ? maxBodySize : FrameGen.MaxBodySize;
     }
 
+    /// <summary>判定帧头 version 位是否在解码器接受的白名单内（白名单取自同产物 FrameGen.PayloadVersions，
+    /// 不再写死 ver=1/2 字面量——否则「能声明」与「能解」会各自漂移）。</summary>
+    public static bool IsPayloadVersion(byte ver)
+    {
+        foreach (var v in FrameGen.PayloadVersions)
+        {
+            if (v == ver)
+            {
+                return true;
+            }
+        }
+        return false;
+    }
+
     /// <summary>校验帧头合法性：magic / seq≠0 / type 白名单 / version 白名单 / flags 保留位 / 长度上限。</summary>
     public static void CheckHeader(FrameHeader header, int maxBodySize)
     {
@@ -69,7 +83,7 @@ public static class FrameCodec
         {
             throw new FrameCodecException(FrameErrorKind.Protocol, $"frame: invalid type: {header.Type:x}");
         }
-        if (header.Version != FrameGen.Version && header.Version != FrameGen.Version2)
+        if (!IsPayloadVersion(header.Version))
         {
             throw new FrameCodecException(FrameErrorKind.Protocol, $"frame: invalid version: {header.Version:x}");
         }
