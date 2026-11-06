@@ -1,0 +1,20 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <ItemGroup>
+    <ProjectReference Include="..\..\src\Atlas\Atlas.csproj" />
+    <!-- 复用示例侧的线上载荷构造（GameOps/GameWire）：SDK 本身不持游戏域消息。 -->
+    <Compile Include="..\E2E\GameWire.cs" Link="GameWire.cs" />
+  </ItemGroup>
+
+  <PropertyGroup>
+    <OutputType>Exe</OutputType>
+    <TargetFramework>net8.0</TargetFramework>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <Nullable>enable</Nullable>
+    <!-- 示例工程不产出 NuGet 包。 -->
+    <IsPackable>false</IsPackable>
+    <AssemblyName>Load</AssemblyName>
+    <RootNamespace>Atlas.Load</RootNamespace>
+  </PropertyGroup>
+
+</Project>
